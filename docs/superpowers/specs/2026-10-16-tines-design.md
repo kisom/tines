@@ -111,10 +111,21 @@ Decisions:
 - `id` is a hash over `(observer, time, topic, payload)`. Two robots that
   observe the same thing produce two observations; de-duplication is
   by identity, not by meaning. Union is therefore idempotent and
-  order-independent.
-- `time` is the observer's local clock. `tines` does not attempt clock
-  sync. Cross-observer recency comparison is a memory-layer policy
-  question and must tolerate skew.
+  order-independent. An observation is an *event*, not a fact: the same
+  robot seeing the same chair twice is two observations. Nothing in the
+  design requires an ID to be reproducible across reboots.
+- `observer` (`NodeId`) is a 128-bit value supplied by the application
+  when the node is constructed. It must be stable across reboots; the
+  core does not provision or persist it. Adapters may derive it from a
+  hardware unique ID (MCU chip UID, Jetson serial) or read it from
+  config. *(My call.)*
+- `time` is the observer's local clock, as `u64` milliseconds since the
+  Unix epoch, plus a `ClockQuality` tag: `Synced` (GPS/NTP), `FreeRunning`
+  (set once, drifting), or `BootRelative` (no RTC; ms since boot). The
+  tag travels with the observation so the memory layer can decide how
+  much to trust cross-observer recency. `tines` does not attempt clock
+  sync. *(My call: the tag is the minimum needed to make a
+  `BootRelative` MCU observation honest rather than silently wrong.)*
 - `topic` is a short byte string. Its structure (hierarchy, separators)
   is application-defined but `tines` supports prefix matching for
   trimming and queries.
@@ -205,6 +216,10 @@ Decisions:
   no async in the core.)*
 - Contact detection is the transport's job (beacon heard, link up, sim
   says "in range"). The core reacts to `Contact` and `Lost`.
+- `Addr` is a routing handle only; the core never maps it to a `NodeId`.
+  Every protocol frame carries the sender's `NodeId` in its header, and
+  per-peer exchange state is keyed by `NodeId`. An address that changes
+  mid-contact (DHCP, roaming) therefore costs nothing. *(My call.)*
 - Adapters planned: UDP broadcast/unicast over ad-hoc Wi-Fi (Jetson),
   serial-attached LoRa/packet radio, in-process simulator.
 
@@ -239,6 +254,13 @@ Decisions:
   discarded, never stored.
 - Rate: the core emits at most one frame per `poll` so the application
   controls pacing and duty cycle.
+- **Convergence is best-effort per contact and eventual over repeated
+  contacts.** A single contact makes no completeness promise; it may be
+  cut off at any frame. The guarantee is: given enough cumulative
+  contact time and non-permanent loss, two nodes' stores converge
+  (modulo trimming). No "final authoritative diff" or end-of-contact
+  handshake exists. This follows directly from sharing being
+  non-load-bearing. *(My call, consistent with the stated intent.)*
 
 #### Simulator
 
@@ -259,14 +281,33 @@ The simulator is also the test harness for the protocol.
 ```
 tines/
   tines-core/      no_std; Observation, Store trait, Transport trait,
-                   BeliefPolicy trait, exchange state machine,
-                   in-memory Store, reference policies
+                   BeliefPolicy trait, exchange state machine, Node
+                   facade, in-memory Store, reference policies
   tines-sim/       std; simulator, contact traces, property tests
   tines-udp/       std; UDP adapter (Jetson)
   tines-serial/    no_std-compatible; framed serial adapter
   tines-sqlite/    std; SQLite Store
   tines-cli/       std; inspect a store, replay a trace, run a node
 ```
+
+The `Node` facade — the thing that owns a `Store`, a `Transport`, and the
+exchange state machine, and exposes `observe()`, `poll()`, and
+`belief()` — is core, not application glue. An application on any
+target should need only: construct a `Node` with its `NodeId`, store,
+and transport; call `poll()` in its loop; call `observe()` when it sees
+something.
+
+## v1 scope (my call)
+
+Ships: `tines-core`, `tines-sim`, `tines-udp`, `tines-sqlite`,
+`tines-cli`. The simulator's convergence property tests pass; two Jetsons
+(or two Linux processes) on one Wi-Fi segment exchange observations via
+UDP and persist them in SQLite.
+
+Deferred: `tines-serial` and the MCU flash store. The `no_std` guarantee
+is enforced in v1 by building `tines-core` for a `thumbv7em-none-eabihf`
+target in CI with the in-memory store, so the MCU path is not an
+afterthought even though no MCU adapter ships.
 
 ## Left to the builder
 
