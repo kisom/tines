@@ -13,6 +13,7 @@ pub mod observation;
 pub mod store;
 #[cfg(feature = "alloc")]
 pub mod mem_store;
+pub mod node;
 pub mod transport;
 pub mod wire;
 
@@ -20,6 +21,7 @@ pub use belief::{BeliefPolicy, LatestWins, SelfFirst};
 pub use bloom::Bloom;
 pub use exchange::{Exchange, Peer};
 pub use frag::{fragment, Reassembler};
+pub use node::{Node, ObserveError};
 pub use observation::{Observation, NodeId, ObservationId, Payload, Tick, Topic};
 pub use store::{Store, TrimPolicy, StoreError};
 pub use transport::{Event, FrameBuf, SendError, Transport};
