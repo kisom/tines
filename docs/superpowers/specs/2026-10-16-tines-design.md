@@ -98,17 +98,19 @@ plus a policy.
 
 ```
 Observation {
-    id:        ObservationId   // content-derived hash of the fields below
-    observer:  NodeId          // who saw it
-    time:      Timestamp       // when they saw it (observer's clock)
-    topic:     Topic           // key for grouping/trimming, e.g. "door/3"
-    payload:   bytes           // opaque to tines
+    id:          ObservationId   // content-derived hash (see below)
+    observer:    NodeId          // who saw it
+    seq:         u64             // observer-local, never repeats
+    age_ms:      u64             // time since observed; mutable, grows per hop
+    observed_at: Option<u64>     // absolute ms since epoch, if observer had a clock
+    topic:       Topic           // key for grouping/trimming, e.g. "door/3"
+    payload:     bytes           // opaque to tines
 }
 ```
 
 Decisions:
 
-- `id` is a hash over `(observer, time, topic, payload)`. Two robots that
+- `id` is a hash over `(observer, seq, topic, payload)`. Two robots that
   observe the same thing produce two observations; de-duplication is
   by identity, not by meaning. Union is therefore idempotent and
   order-independent. An observation is an *event*, not a fact: the same
@@ -119,13 +121,20 @@ Decisions:
   core does not provision or persist it. Adapters may derive it from a
   hardware unique ID (MCU chip UID, Jetson serial) or read it from
   config. *(My call.)*
-- `time` is the observer's local clock, as `u64` milliseconds since the
-  Unix epoch, plus a `ClockQuality` tag: `Synced` (GPS/NTP), `FreeRunning`
-  (set once, drifting), or `BootRelative` (no RTC; ms since boot). The
-  tag travels with the observation so the memory layer can decide how
-  much to trust cross-observer recency. `tines` does not attempt clock
-  sync. *(My call: the tag is the minimum needed to make a
-  `BootRelative` MCU observation honest rather than silently wrong.)*
+- `time` is carried as **age, not a timestamp**, following RFC 9171's
+  Bundle Age Block. Every observation carries `age_ms: u64`, the elapsed
+  time since it was observed. Each holder increments it by its own
+  holding time (monotonic tick; every target has one) before forwarding.
+  An observer that has a real clock may additionally set
+  `observed_at: Option<u64>` (ms since Unix epoch). A receiver with a
+  clock can pin a clockless observation at `now − age_ms`. Precision
+  degrades by each hop's tick error; `tines` does not attempt clock
+  sync. *(Kyle's suggestion; the RFC mapping and the optional absolute
+  field are my call.)*
+- Because `age_ms` is mutable, it is **not** in the identity hash. The
+  hash covers `(observer, seq, topic, payload)` where `seq` is an
+  observer-local monotonic counter that must not repeat across reboots
+  (persisted, or `boot_count << 32 | counter`). *(My call.)*
 - `topic` is a short byte string. Its structure (hierarchy, separators)
   is application-defined but `tines` supports prefix matching for
   trimming and queries.
