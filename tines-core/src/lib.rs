@@ -4,6 +4,7 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+pub mod bloom;
 pub mod consts;
 pub mod observation;
 pub mod store;
@@ -11,6 +12,7 @@ pub mod store;
 pub mod mem_store;
 pub mod wire;
 
+pub use bloom::Bloom;
 pub use observation::{Observation, NodeId, ObservationId, Payload, Tick, Topic};
 pub use store::{Store, TrimPolicy, StoreError};
 pub use wire::{Frame, WireError};
