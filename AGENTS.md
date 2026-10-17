@@ -87,7 +87,7 @@ call `poll()` in its loop, and `observe()` when it sees something.
 `BLOOM_K=3`, `SUMMARY_INTERVAL_MS=2000`, `REASSEMBLY_TIMEOUT_MS=5000`,
 `SEND_QUEUE_CAP=256`, `MAX_FRAME=1500`. Match the exact values above.
 
-## Crate layout and current state
+## Crate layout
 
 ```
 tines/
@@ -96,20 +96,6 @@ tines/
                 policies
   tines-sim/    std: simulator, contact traces, convergence property tests
 ```
-
-State of the plan (`docs/superpowers/plans/...tines-core-and-sim.md`):
-
-- **Done & committed:** Tasks 1–6 (workspace + Observation identity, wire
-  frames, Store/MemStore, salted Bloom summary, Transport trait, fragmentation
-  and reassembly).
-- **Implemented, not committed:** Task 7 — `tines-core/src/exchange.rs` plus the
-  `lib.rs` changes. Commit it with the Task 7 message before starting Task 8.
-- **Pending:** Task 8 (belief policies), 9 (`PairTransport` test helper),
-  10 (Node facade + `tests/pair.rs` convergence test), 11–13 (simulator world,
-  harness, property tests), 14 (`scripts/ci.sh` + README).
-
-The `std` simulator is the test harness for the protocol; its convergence and
-order-independence property tests are the main correctness evidence.
 
 ## Not in scope for this plan
 
