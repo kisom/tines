@@ -2,3 +2,10 @@
 name = "tines-sim"
 version = "0.1.0"
 edition = "2021"
+
+[dependencies]
+tines-core = { path = "../tines-core" }
+rand = "0.8"
+
+[dev-dependencies]
+proptest = "1"
