@@ -1,0 +1,3 @@
+[workspace]
+members = ["tines-core", "tines-sim"]
+resolver = "2"
