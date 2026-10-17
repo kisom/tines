@@ -9,7 +9,12 @@ use heapless::Vec;
 use serde::{Deserialize, Serialize};
 
 /// A single frame carried on the wire.
+///
+/// `Frag` intentionally carries a full `MAX_FRAME` (1500 byte) payload inline to
+/// avoid per-frame heap allocation in the `no_std` core; this keeps the enum
+/// large, so the informative `large_enum_variant` lint is suppressed here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum Frame {
     Summary {
         from: NodeId,
