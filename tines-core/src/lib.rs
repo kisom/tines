@@ -4,6 +4,7 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+pub mod belief;
 pub mod bloom;
 pub mod consts;
 pub mod exchange;
@@ -15,6 +16,7 @@ pub mod mem_store;
 pub mod transport;
 pub mod wire;
 
+pub use belief::{BeliefPolicy, LatestWins, SelfFirst};
 pub use bloom::Bloom;
 pub use exchange::{Exchange, Peer};
 pub use frag::{fragment, Reassembler};
