@@ -11,6 +11,7 @@ the API.
 - Package metadata only: `repository`, `documentation`, `readme`,
   `keywords` and `categories`, shared through `[workspace.package]`. The
   README now appears on crates.io.
+- Each crate now ships the Apache-2.0 `LICENSE` text.
 
 ## 0.2.0 — 2026-10-18
 
