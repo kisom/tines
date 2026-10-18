@@ -117,7 +117,7 @@
 
 **Interfaces:**
 - Consumes: `Exchange::drain_events` (Task 3).
-- Produces: `pub fn drain_events(&mut self) -> impl Iterator<Item = ConfidenceEvent> + '_` on `Node`, draining the exchange's queue.
+- Produces: `pub fn drain_events(&mut self) -> heapless::Vec<ConfidenceEvent, { consts::EVENT_QUEUE_CAP }>` on `Node`, draining the exchange's queue (returns the owned drained Vec — `Exchange::drain_events` returns by value, so an iterator contract is unsatisfiable).
 
 - [ ] **Step 1: Write the failing test** — `confidence_event_surfaces_on_node`: two nodes on a `PairTransport`; A `observe`s a broadcast, both poll until B stores it; assert `a_node.drain_events()` yields a `ConfidenceEvent` with `peer == b.id()` and the obs id (note: B receives from A, so A's node surfaces the event). If order is ambiguous, assert the set of events contains it.
 - [ ] **Step 2: Run test to verify it fails** — Expected: FAIL (`drain_events` missing).
