@@ -1,0 +1,25 @@
+[package]
+name = "tines"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone tines service: hosts a tines Node over a Unix-domain-socket IPC for robots without ROS2."
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords = ["robotics", "delay-tolerant", "science::robotics", "ipc", "ble"]
+categories = ["science::robotics", "network-programming"]
+
+[dependencies]
+tines-core = { path = "../tines-core", version = "0.3.0" }
+tines-store = { path = "../tines-store", version = "0.3.0" }
+tines-bt = { path = "../tines-bt", version = "0.3.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tines-core = { path = "../tines-core", version = "0.3.0" }
+tines-store = { path = "../tines-store", version = "0.3.0" }
+heapless = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
