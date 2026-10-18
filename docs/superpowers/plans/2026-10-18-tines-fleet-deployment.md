@@ -39,7 +39,8 @@
 - Modify: `tines-core/src/store.rs`
 - Modify: `tines-core/src/mem_store.rs`
 - Test: `tines-core/src/mem_store.rs` (inline `#[cfg(test)]`)
-- Modify: `tines-core/Cargo.toml` (bump version to `0.3.0`)
+- Modify: `Cargo.toml` (workspace root — `[workspace.package] version` `0.2.1` → `0.3.0`)
+- Modify: `tines-sim/Cargo.toml` (`tines-core` dep `version = "0.2.1"` → `"0.3.0"`)
 - Create: `CHANGELOG.md` (workspace root; "0.3.0 — `Store` gains `release`/`is_released` (breaking)")
 
 **Interfaces:**
@@ -50,8 +51,8 @@
 - [ ] **Step 2: Run test to verify it fails** — `cargo test -p tines-core release_` — Expected: FAIL (method not found).
 - [ ] **Step 3: Implement `release`/`is_released`** in `store.rs` (trait, no default) and `mem_store.rs` (set/read the `released` flag; unknown id is a no-op; `MemStore::for_each_addressed_id` skips released ids — an optimization, the exchange predicate is the load-bearing check).
 - [ ] **Step 4: Run test to verify it passes** — Expected: PASS; full `cargo test -p tines-core` still green.
-- [ ] **Step 5: Bump version and CHANGELOG** — `tines-core/Cargo.toml` `version = "0.3.0"`; create `CHANGELOG.md` with the 0.3.0 entry.
-- [ ] **Step 6: Commit** — `git add tines-core/src/store.rs tines-core/src/mem_store.rs tines-core/Cargo.toml CHANGELOG.md && git commit -m "feat(core): Store::release and is_released (0.3.0)"`
+- [ ] **Step 5: Bump version and CHANGELOG** — root `Cargo.toml` `[workspace.package] version = "0.3.0"`; `tines-sim/Cargo.toml` `tines-core` dep `version = "0.3.0"`; create `CHANGELOG.md` with the 0.3.0 entry.
+- [ ] **Step 6: Commit** — `git add tines-core/src/store.rs tines-core/src/mem_store.rs Cargo.toml tines-sim/Cargo.toml CHANGELOG.md && git commit -m "feat(core): Store::release and is_released (0.3.0)"`
 
 ### Task 2: Ack wire frame
 
