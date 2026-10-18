@@ -1037,6 +1037,86 @@ mod tests {
     }
 
     #[test]
+    fn valid_addressed_obs_is_accepted() {
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        // A well-formed, non-expired addressed obs addressed to us IS stored.
+        let mut o = obs([2; 16], 7, 0, None, b"t", b"hi");
+        o.to = Some(ME);
+        o.lifetime_ms = Some(1000);
+        let id = o.id();
+        let frame = Frame::Obs {
+            from: [2; 16],
+            obs: o.clone(),
+        };
+        assert!(
+            ex.on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0)
+                .is_some(),
+            "a valid addressed obs must be accepted"
+        );
+        assert!(store.contains(&id));
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn addressing_invariant_violation_reverse_is_dropped() {
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        // to = None but lifetime_ms = Some: the invariant is violated in the
+        // reverse direction, so this frame is malformed and must be dropped.
+        let mut o = obs([2; 16], 7, 0, None, b"t", b"hi");
+        o.to = None;
+        o.lifetime_ms = Some(100);
+        let frame = Frame::Obs {
+            from: [2; 16],
+            obs: o.clone(),
+        };
+        assert!(ex
+            .on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0)
+            .is_none());
+        assert_eq!(
+            store.len(),
+            0,
+            "an invariant-violating frame must not be stored"
+        );
+    }
+
+    #[test]
+    fn expired_addressed_obs_is_not_forwarded() {
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        // An addressed obs already past its lifetime, inserted directly so it
+        // bypasses the receive-side reject (this tests the FORWARD path).
+        let mut o = obs([2; 16], 7, 0, None, b"t", b"hi");
+        o.to = Some([3; 16]);
+        o.lifetime_ms = Some(100);
+        o.age_ms = 200;
+        let id = o.id();
+        store.insert(o, 0).unwrap();
+
+        // A peer whose NodeId we learn (not the recipient, so epidemic applies).
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        let bits = heapless::Vec::from_slice(&[0u8; consts::SUMMARY_BYTES]).unwrap();
+        let sum = Frame::Summary {
+            from: [2; 16],
+            salt: 0,
+            bits,
+        };
+        ex.on_event(Event::Frame(1, frame_bytes(&sum)), &mut store, 0);
+
+        // The expired obs must never be forwarded to any peer.
+        assert!(
+            drain_addressed_obs(&mut ex, &store, Some([3; 16])).is_none(),
+            "an expired addressed obs must not be forwarded"
+        );
+        // It is still held (expiry is checked at select/forward time, not
+        // retroactively removed here).
+        assert!(store.contains(&id));
+    }
+
+    #[test]
     fn addressed_obs_not_in_summary() {
         let mut ex = Exchange::new(ME);
         let mut store = MemStore::new();

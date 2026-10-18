@@ -275,3 +275,33 @@ fn belief_excludes_addressed_to_others() {
     );
     assert_eq!(belief.observer, [1; 16]);
 }
+
+#[test]
+fn observe_to_rejects_oversized_payload() {
+    let (a, _b) = PairTransport::pair(1500);
+    let mut node = Node::new([1u8; 16], 0, MemStore::new(), a);
+
+    let oversized_payload = vec![0u8; consts::MAX_PAYLOAD + 1];
+    assert_eq!(
+        node.observe_to([2; 16], 5000, b"task", &oversized_payload, None, 0),
+        Err(ObserveError::TooLarge)
+    );
+    assert_eq!(node.store().len(), 0);
+    assert_eq!(node.next_seq(), 0);
+}
+
+#[test]
+fn belief_includes_addressed_to_me() {
+    let (a, _b) = PairTransport::pair(1500);
+    let mut node = Node::new([1u8; 16], 0, MemStore::new(), a);
+
+    // An addressed message *to me* is part of my app-facing view.
+    node.observe_to([1; 16], 10_000, b"door", b"for-me", None, 10)
+        .unwrap();
+
+    let belief = node
+        .belief(b"door", &LatestWins, 100_000)
+        .expect("door belief exists");
+    assert_eq!(belief.payload, Payload::from_slice(b"for-me").unwrap());
+    assert_eq!(belief.observer, [1; 16]);
+}

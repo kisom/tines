@@ -419,5 +419,15 @@ mod tests {
         // The broadcast survives even though it shares topic/observer with the
         // dropped addressed observations.
         assert!(s.contains(&broadcast_id));
+        // The three youngest addressed (seq 0..2, ages 10/20/30) survive along
+        // with the broadcast (seq 100); seq 3..9 are dropped.
+        let mut seqs = std::collections::BTreeSet::new();
+        s.for_each_topic(b"t", 0, &mut |o| {
+            seqs.insert(o.seq);
+        });
+        assert_eq!(
+            seqs,
+            std::collections::BTreeSet::from_iter([0u64, 1, 2, 100])
+        );
     }
 }
