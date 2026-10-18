@@ -402,11 +402,7 @@ fn select_addressed<S: Store, A: PartialEq>(
 /// Returns `true` when `(id, addr)` has been recorded in the bounce table —
 /// i.e. `id` was received from, or forwarded to, `addr`. A message addressed to
 /// such a peer would just bounce back, so it is skipped.
-fn is_sourced<A: PartialEq>(
-    bounce: &[(ObservationId, A)],
-    id: ObservationId,
-    addr: &A,
-) -> bool {
+fn is_sourced<A: PartialEq>(bounce: &[(ObservationId, A)], id: ObservationId, addr: &A) -> bool {
     for &(bid, ref baddr) in bounce {
         if bid == id && baddr == addr {
             return true;
@@ -929,13 +925,20 @@ mod tests {
         o.to = Some(ME);
         o.lifetime_ms = Some(100);
         o.age_ms = 200;
-        let frame = Frame::Obs { from: [2; 16], obs: o.clone() };
+        let frame = Frame::Obs {
+            from: [2; 16],
+            obs: o.clone(),
+        };
         assert!(
             ex.on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0)
                 .is_none(),
             "an expired addressed obs must not be delivered"
         );
-        assert_eq!(store.len(), 0, "an expired addressed obs must not be stored");
+        assert_eq!(
+            store.len(),
+            0,
+            "an expired addressed obs must not be stored"
+        );
     }
 
     #[test]
@@ -972,11 +975,13 @@ mod tests {
         let mut o = obs([2; 16], 7, 0, None, b"t", b"hi");
         o.to = Some(ME);
         o.lifetime_ms = None;
-        let frame = Frame::Obs { from: [2; 16], obs: o.clone() };
-        assert!(
-            ex.on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0)
-                .is_none()
-        );
+        let frame = Frame::Obs {
+            from: [2; 16],
+            obs: o.clone(),
+        };
+        assert!(ex
+            .on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0)
+            .is_none());
         assert_eq!(
             store.len(),
             0,
@@ -1106,7 +1111,10 @@ mod tests {
         let mut o = obs([2; 16], 7, 0, None, b"t", b"hi");
         o.to = Some([3; 16]);
         o.lifetime_ms = Some(consts::SUMMARY_INTERVAL_MS * 10);
-        let frame = Frame::Obs { from: [2; 16], obs: o };
+        let frame = Frame::Obs {
+            from: [2; 16],
+            obs: o,
+        };
         ex.on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0);
 
         // Draining must never bounce the addressed obs back to its source (addr

@@ -226,7 +226,9 @@ fn observe_to_creates_addressed_message() {
     let (a, _b) = PairTransport::pair(1500);
     let mut node = Node::new([1u8; 16], 0, MemStore::new(), a);
 
-    let id = node.observe_to([2; 16], 5000, b"task", b"go", None, 0).unwrap();
+    let id = node
+        .observe_to([2; 16], 5000, b"task", b"go", None, 0)
+        .unwrap();
     assert_eq!(node.next_seq(), 1);
 
     let obs = node.store().get(&id, 0).expect("observation stored");
@@ -259,7 +261,8 @@ fn belief_excludes_addressed_to_others() {
     // A broadcast observation and an addressed-to-other observation on the
     // same topic. `me` = [1;16]; the addressed one is for [2;16] (≠ me).
     node.observe(b"door", b"broadcast", None, 0).unwrap();
-    node.observe_to([2; 16], 10_000, b"door", b"addressed", None, 10).unwrap();
+    node.observe_to([2; 16], 10_000, b"door", b"addressed", None, 10)
+        .unwrap();
 
     let now = 100_000u64;
     let belief = node
