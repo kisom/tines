@@ -32,6 +32,10 @@ pub enum Frame {
         count: u8,
         data: Vec<u8, { consts::MAX_FRAME }>,
     },
+    Ack {
+        from: NodeId,
+        ids: Vec<ObservationId, { consts::ACK_IDS_CAP }>,
+    },
 }
 
 impl Frame {
@@ -41,6 +45,7 @@ impl Frame {
             Frame::Summary { from, .. } => *from,
             Frame::Obs { from, .. } => *from,
             Frame::Frag { from, .. } => *from,
+            Frame::Ack { from, .. } => *from,
         }
     }
 
@@ -146,6 +151,82 @@ mod tests {
         let n = f.encode(&mut buf).unwrap();
         let decoded = Frame::decode(&buf[..n]).unwrap();
         assert_eq!(f, decoded);
+    }
+
+    #[test]
+    fn ack_frame_roundtrip() {
+        // Ack carrying 3 content-IDs must roundtrip through encode/decode.
+        let ids = Vec::<ObservationId, { consts::ACK_IDS_CAP }>::from_slice(&[
+            [1u8; 16], [2u8; 16], [3u8; 16],
+        ])
+        .unwrap();
+        let f = Frame::Ack { from: [5; 16], ids };
+        // sender() must return `from` for an Ack.
+        assert_eq!(f.sender(), [5; 16]);
+        let mut buf = [0u8; consts::MAX_FRAME];
+        let n = f.encode(&mut buf).unwrap();
+        let decoded = Frame::decode(&buf[..n]).unwrap();
+        assert_eq!(f, decoded);
+    }
+
+    #[test]
+    fn summary_golden_vector() {
+        // Pinned wire bytes for the exact Summary frame below. postcard tags are
+        // positional, so any future reorder of the existing Frame variants changes
+        // what these bytes decode to and fails this assertion.
+        const GOLDEN: [u8; 536] = [
+            0u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8,
+            239u8, 253u8, 182u8, 245u8, 13u8, 128u8, 4u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8,
+        ];
+        let expected = Frame::Summary {
+            from: [3; 16],
+            salt: 0xdeadbeef,
+            bits: Vec::from_slice(&[0xAAu8; consts::SUMMARY_BYTES]).unwrap(),
+        };
+        assert_eq!(Frame::decode(&GOLDEN).unwrap(), expected);
     }
 
     #[test]

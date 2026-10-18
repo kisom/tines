@@ -492,6 +492,10 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                 let obs = peer.reassembler.feed(id, index, count, &data, now)?;
                 self.accept(obs, addr, store, now)
             }
+            // Ack carries a handoff receipt of content-IDs; it produces no
+            // Observation here (ack handling in the exchange layer is out of
+            // scope for this wire-frame task).
+            Frame::Ack { .. } => None,
         }
     }
 

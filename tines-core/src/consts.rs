@@ -29,3 +29,6 @@ pub const SEND_QUEUE_CAP: usize = 256;
 
 /// Maximum UDP frame size in bytes.
 pub const MAX_FRAME: usize = 1500;
+
+/// Maximum number of content-IDs an `Ack` receipt may carry.
+pub const ACK_IDS_CAP: usize = 90;
