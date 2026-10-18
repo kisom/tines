@@ -13,7 +13,7 @@ use crate::world::{SimWorld, WorldConfig};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
-use tines_core::{MemStore, Node, ObservationId, Store};
+use tines_core::{MemStore, Node, NodeId, ObservationId, Store};
 
 /// A single node as seen through the simulation transport.
 pub type SimNode = Node<MemStore, SimTransport>;
@@ -65,6 +65,19 @@ impl Sim {
         self.nodes[node]
             .observe(topic, payload, None, self.t)
             .expect("observe")
+    }
+
+    pub fn observe_to(
+        &mut self,
+        node: usize,
+        to: NodeId,
+        lifetime_ms: u64,
+        topic: &[u8],
+        payload: &[u8],
+    ) -> ObservationId {
+        self.nodes[node]
+            .observe_to(to, lifetime_ms, topic, payload, None, self.t)
+            .expect("observe_to")
     }
 
     pub fn id_set(&self, node: usize) -> BTreeSet<ObservationId> {

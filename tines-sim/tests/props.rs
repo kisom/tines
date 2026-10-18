@@ -11,6 +11,11 @@
 //!   advances (no trimming).
 //! * [`garbage_frames_never_panic`] — malformed wire frames are dropped, never
 //!   panic the node.
+//! * [`addressed_reaches_recipient_along_connected_path`] — an addressed task
+//!   handed off hop-by-hop along a connected contact path reaches the
+//!   recipient. Addressed messages diverge by design (the recipient holds a
+//!   tasking the carriers no longer need), so this asserts only that the
+//!   recipient eventually holds the id, never whole-graph convergence.
 
 use proptest::prelude::*;
 use tines_core::{FrameBuf, Store};
@@ -113,6 +118,40 @@ fn permute3(perm: u64) -> [usize; 3] {
         [2, 1, 0],
     ];
     bases[(perm % 6) as usize]
+}
+
+/// The forward stride between consecutive edges of [`chain_trace`]: each edge
+/// `(i-1, i)` is shifted a full stride past the last, keeping the windows
+/// ordered so a task can hop forward along the path.
+const PATH_STRIDE: u64 = 4_000;
+
+/// The length of each edge's contact window in [`chain_trace`], leaving a
+/// 1_000 ms gap to the next edge for frames to land before that contact closes.
+const PATH_WINDOW: u64 = 3_000;
+
+/// A forward path over `nodes` nodes: edges `(0,1),(1,2),...,(n-2,n-1)` with
+/// ordered, non-overlapping contact windows. The contact graph is connected and
+/// a task observed before the first contact can be relayed hop-by-hop to the
+/// max-id node.
+fn chain_trace(nodes: usize) -> ContactTrace {
+    let mut trace = ContactTrace::default();
+    for j in 1..nodes {
+        trace.contacts.push(Contact {
+            start_ms: j as u64 * PATH_STRIDE,
+            end_ms: j as u64 * PATH_STRIDE + PATH_WINDOW,
+            a: j - 1,
+            b: j,
+        });
+    }
+    trace
+}
+
+/// A scenario with a connected path trace and a random tasker node:
+/// `(tasker, nodes, trace)`.
+fn addressed_scenario() -> impl Strategy<Value = (usize, usize, ContactTrace)> {
+    (2..=6usize).prop_flat_map(|nodes| {
+        (0usize..nodes).prop_map(move |tasker| (tasker, nodes, chain_trace(nodes)))
+    })
 }
 
 proptest! {
@@ -258,5 +297,39 @@ proptest! {
         let stored = node.poll(0);
         prop_assert_eq!(stored, 0, "a garbage frame must not be stored");
         prop_assert_eq!(node.store().len(), 0, "store must be unchanged by a garbage frame");
+    }
+
+    /// An addressed task handed off hop-by-hop along a connected contact path
+    /// reaches the recipient.
+    ///
+    /// The trace is a forward path (see [`chain_trace`]) over `2..=6` nodes, so
+    /// it is always connected; a random node issues the task and the max-id
+    /// node is the recipient. Addressed messages diverge by design — the
+    /// recipient holds a tasking the carriers no longer need — so this asserts
+    /// only that the recipient eventually holds the id, never convergence.
+    #[test]
+    fn addressed_reaches_recipient_along_connected_path(
+        (tasker, nodes, trace) in addressed_scenario(),
+    ) {
+        let end = trace.end();
+        let cfg = WorldConfig {
+            nodes,
+            mtu: 512,
+            loss: 0.0,
+            dup: 0.0,
+            seed: 1,
+        };
+        let mut sim = Sim::new(cfg, trace);
+        // The max-id node's id is its index replicated to 16 bytes, matching
+        // how `Sim` assigns node ids.
+        let recipient = [nodes.saturating_sub(1) as u8; 16];
+        let id = sim.observe_to(tasker, recipient, 600_000, b"task", b"investigate");
+        sim.run_until(end + 1_000);
+
+        let recipient_idx = nodes.saturating_sub(1);
+        prop_assert!(
+            sim.nodes[recipient_idx].store().contains(&id),
+            "addressed task from node {tasker} did not reach the max-id node {recipient_idx}"
+        );
     }
 }
