@@ -60,6 +60,10 @@ pub trait Store {
     /// Visit every stored observation id.
     fn for_each_id(&self, f: &mut dyn FnMut(&ObservationId));
 
+    /// Visit the ids of observations that are not addressed to anyone
+    /// (`to == None`), i.e. broadcasts. Order is unspecified.
+    fn for_each_broadcast_id(&self, f: &mut dyn FnMut(&ObservationId));
+
     /// Visit every stored observation whose topic starts with `prefix`
     /// (an empty prefix matches all), each age-adjusted to `now`.
     fn for_each_topic(&self, prefix: &[u8], now: Tick, f: &mut dyn FnMut(&Observation));

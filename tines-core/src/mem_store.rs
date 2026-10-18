@@ -102,6 +102,14 @@ impl Store for MemStore {
         }
     }
 
+    fn for_each_broadcast_id(&self, f: &mut dyn FnMut(&ObservationId)) {
+        for (id, held) in self.map.iter() {
+            if held.obs.to.is_none() {
+                f(id);
+            }
+        }
+    }
+
     fn for_each_topic(&self, prefix: &[u8], now: Tick, f: &mut dyn FnMut(&Observation)) {
         for held in self.map.values() {
             if held.obs.topic.starts_with(prefix) {
@@ -368,5 +376,48 @@ mod tests {
             seqs.insert(o.seq);
         });
         assert_eq!(seqs, std::collections::BTreeSet::from_iter([2u64, 3]));
+    }
+
+    #[test]
+    fn for_each_broadcast_id_skips_addressed() {
+        let mut s = MemStore::new();
+        let broadcast = obs([1; 16], 1, 0, None, b"door/1");
+        let broadcast_id = broadcast.id();
+        let mut addressed = obs([1; 16], 2, 0, None, b"door/1");
+        addressed.to = Some([2; 16]);
+        s.insert(broadcast, 0).unwrap();
+        s.insert(addressed, 0).unwrap();
+
+        let mut ids = std::collections::BTreeSet::new();
+        s.for_each_broadcast_id(&mut |id| {
+            ids.insert(*id);
+        });
+        assert_eq!(ids, std::collections::BTreeSet::from_iter([broadcast_id]));
+    }
+
+    #[test]
+    fn trim_max_count_drops_oldest_addressed() {
+        let mut s = MemStore::new();
+        // 10 addressed observations with increasing current age.
+        for i in 0..10u64 {
+            let mut addressed = obs([1; 16], i, (i + 1) * 10, None, b"t");
+            addressed.to = Some([2; 16]);
+            s.insert(addressed, 0).unwrap();
+        }
+        // One broadcast, youngest of all, so the count trim keeps it.
+        let broadcast = obs([1; 16], 100, 0, None, b"t");
+        let broadcast_id = broadcast.id();
+        s.insert(broadcast, 0).unwrap();
+
+        let policy = TrimPolicy {
+            keep_per_topic: None,
+            max_age_ms: None,
+            max_count: Some(4),
+        };
+        assert_eq!(s.trim(&policy, 0), 7);
+        assert_eq!(s.len(), 4);
+        // The broadcast survives even though it shares topic/observer with the
+        // dropped addressed observations.
+        assert!(s.contains(&broadcast_id));
     }
 }
