@@ -3,9 +3,11 @@ name = "tines-sim"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
+description = "Discrete-time simulator for tines: contact traces, convergence scenarios, and property tests."
+authors = ["K. Isom"]
 
 [dependencies]
-tines-core = { path = "../tines-core" }
+tines-core = { path = "../tines-core", version = "0.1.0" }
 rand = "0.8"
 
 [dev-dependencies]
