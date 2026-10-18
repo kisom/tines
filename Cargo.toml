@@ -1,5 +1,5 @@
 [workspace]
-members = ["tines-core", "tines-sim", "tines-store"]
+members = ["tines-core", "tines-sim", "tines-store", "tines-bt"]
 resolver = "2"
 
 [workspace.package]

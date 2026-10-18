@@ -1,0 +1,19 @@
+[package]
+name = "tines-bt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BLE transport for tines over BlueZ via the bluer crate: identity-preserving (Addr = NodeId) messaging with testable radio I/O."
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/tines-bt"
+keywords = ["robotics", "gossip", "delay-tolerant", "ble", "bluer"]
+categories = ["science::robotics", "network-programming"]
+
+[dependencies]
+tines-core = { path = "../tines-core", version = "0.3.0" }
+bluer = { version = "0.17", features = ["bluetoothd", "l2cap"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "sync", "net", "time", "signal"] }
+futures = "0.3"
+log = "0.4"
