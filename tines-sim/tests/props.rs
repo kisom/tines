@@ -19,14 +19,7 @@ use tines_sim::{Contact, ContactTrace, Sim, WorldConfig};
 /// A fixed set of short observation topics the tests reuse so the generated
 /// observations round-trip cleanly through the core (`MAX_TOPIC` is 64 bytes).
 const TOPICS: [&[u8]; 8] = [
-    b"temp",
-    b"humid",
-    b"door",
-    b"motion",
-    b"light",
-    b"batt",
-    b"press",
-    b"power",
+    b"temp", b"humid", b"door", b"motion", b"light", b"batt", b"press", b"power",
 ];
 
 /// A single contact window over `nodes` nodes. `start` is bounded well below the
@@ -44,28 +37,28 @@ fn contact(nodes: usize) -> impl Strategy<Value = Contact> {
         0usize..nodes,
         0usize..nodes.saturating_sub(1),
     )
-    .prop_map(|(start, duration, a, b_prime)| {
-        let mut b = b_prime;
-        if b >= a {
-            b += 1;
-        }
-        Contact {
-            start_ms: start,
-            end_ms: start + duration,
-            a,
-            b,
-        }
-    })
+        .prop_map(|(start, duration, a, b_prime)| {
+            let mut b = b_prime;
+            if b >= a {
+                b += 1;
+            }
+            Contact {
+                start_ms: start,
+                end_ms: start + duration,
+                a,
+                b,
+            }
+        })
 }
 
 /// A single observation: a topic drawn from [`TOPICS`] and a random 1..=64 byte
 /// payload.
 fn observation() -> impl Strategy<Value = (Vec<u8>, Vec<u8>)> {
-(
-    0u32..8u32,
-    proptest::collection::vec(any::<u8>(), 1..=64usize),
-)
-.prop_map(|(topic_idx, payload)| (TOPICS[topic_idx as usize].to_vec(), payload))
+    (
+        0u32..8u32,
+        proptest::collection::vec(any::<u8>(), 1..=64usize),
+    )
+        .prop_map(|(topic_idx, payload)| (TOPICS[topic_idx as usize].to_vec(), payload))
 }
 
 /// A generated scenario: a node count, a contact trace over those nodes, and a
@@ -93,8 +86,13 @@ fn scenario() -> impl Strategy<Value = Scenario> {
 
 /// A 3-node observation list, reused by the order-independence test.
 fn observations_3nodes() -> impl Strategy<Value = Vec<(usize, Vec<u8>, Vec<u8>)>> {
-    proptest::collection::vec(observation(), 3..=3)
-        .prop_map(|per_node| per_node.into_iter().enumerate().map(|(n, o)| (n, o.0, o.1)).collect())
+    proptest::collection::vec(observation(), 3..=3).prop_map(|per_node| {
+        per_node
+            .into_iter()
+            .enumerate()
+            .map(|(n, o)| (n, o.0, o.1))
+            .collect()
+    })
 }
 
 /// Maps a `u64` seed to one of the six permutations of three slots.

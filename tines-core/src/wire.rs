@@ -4,7 +4,7 @@
 //! — `tines-core` is `#![no_std]` and never panics on untrusted bytes.
 
 use crate::consts;
-use crate::{Observation, NodeId, ObservationId};
+use crate::{NodeId, Observation, ObservationId};
 use heapless::Vec;
 use serde::{Deserialize, Serialize};
 

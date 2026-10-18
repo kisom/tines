@@ -11,8 +11,8 @@
 //! transport frames are dropped by the [`Exchange`].
 
 use crate::{
-    BeliefPolicy, consts, Exchange, NodeId, Observation, ObservationId, Payload, Store, StoreError,
-    TrimPolicy, Tick, Topic, Transport,
+    consts, BeliefPolicy, Exchange, NodeId, Observation, ObservationId, Payload, Store, StoreError,
+    Tick, Topic, Transport, TrimPolicy,
 };
 
 /// Errors returned by [`Node::observe`].
@@ -115,7 +115,10 @@ impl<S: Store, T: Transport> Node<S, T> {
         // Hoist the MTU, then borrow `exchange`/`store`, then borrow
         // `transport` for the send — disjoint field borrows, never overlapping.
         let mtu = self.transport.mtu();
-        if let Some((addr, n)) = self.exchange.next_frame(&self.store, mtu, now, &mut self.out) {
+        if let Some((addr, n)) = self
+            .exchange
+            .next_frame(&self.store, mtu, now, &mut self.out)
+        {
             let _ = self.transport.send(&addr, &self.out[..n]);
         }
         stored
@@ -134,11 +137,10 @@ impl<S: Store, T: Transport> Node<S, T> {
         now: Tick,
     ) -> Option<P::Belief> {
         let mut acc: Option<P::Belief> = None;
-        self.store
-            .for_each_topic(topic_prefix, now, &mut |obs| {
-                let prev = acc.take();
-                acc = policy.step(self.me, prev, obs);
-            });
+        self.store.for_each_topic(topic_prefix, now, &mut |obs| {
+            let prev = acc.take();
+            acc = policy.step(self.me, prev, obs);
+        });
         acc
     }
 

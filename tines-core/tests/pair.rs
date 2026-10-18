@@ -1,10 +1,10 @@
 mod common;
 use common::PairTransport;
 
+use std::collections::BTreeSet;
 use tines_core::observation::Payload;
 use tines_core::transport::{Event, FrameBuf, Transport};
 use tines_core::{consts, LatestWins, MemStore, Node, ObserveError, Store};
-use std::collections::BTreeSet;
 
 #[test]
 fn pair_transport_connect_then_frame() {
@@ -111,15 +111,23 @@ fn belief_latest_wins_across_nodes() {
     // observe stores at `now` (b's stored_at=500, a's stored_at=0), so b's
     // is younger everywhere it is held; a re-received copy has a slightly
     // different age, so compare by identity, not byte-equality.
-    let belief = nb.belief(b"door", &LatestWins, now).expect("door belief exists");
-    assert_eq!(belief.observer, [2; 16], "nb belief should be b's observation");
+    let belief = nb
+        .belief(b"door", &LatestWins, now)
+        .expect("door belief exists");
+    assert_eq!(
+        belief.observer, [2; 16],
+        "nb belief should be b's observation"
+    );
     assert_eq!(belief.seq, 0);
     assert_eq!(belief.payload, Payload::from_slice(b"late").unwrap());
     assert_eq!(belief.observed_at, Some(500));
 
     // a's node, looking at the same topic, agrees on the same observation.
     let belief_a = na.belief(b"door", &LatestWins, now).unwrap();
-    assert_eq!(belief_a.observer, [2; 16], "na belief should be b's observation");
+    assert_eq!(
+        belief_a.observer, [2; 16],
+        "na belief should be b's observation"
+    );
     assert_eq!(belief_a.payload, Payload::from_slice(b"late").unwrap());
     assert_eq!(belief_a.observed_at, Some(500));
 }
@@ -192,6 +200,9 @@ fn third_party_observation_propagates_within_contact() {
         nb.poll(t);
         t += 10;
     }
-    assert!(nb.store().contains(&id), "fresh observation must propagate to b");
+    assert!(
+        nb.store().contains(&id),
+        "fresh observation must propagate to b"
+    );
     assert_eq!(nb.store().len(), 1);
 }

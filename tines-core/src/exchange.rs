@@ -80,7 +80,12 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
     ///
     /// Returns `Some(obs)` when an inbound observation is newly stored (the
     /// caller may react); otherwise `None`.
-    pub fn on_event<S: Store>(&mut self, ev: Event<A>, store: &mut S, now: Tick) -> Option<Observation> {
+    pub fn on_event<S: Store>(
+        &mut self,
+        ev: Event<A>,
+        store: &mut S,
+        now: Tick,
+    ) -> Option<Observation> {
         match ev {
             Event::Contact(addr) => {
                 self.add_peer(addr);
@@ -99,7 +104,13 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
     ///
     /// Priority: (1) send a Summary to any peer due for one, then (2) emit one
     /// Obs/Frag frame from a peer via round-robin.
-    pub fn next_frame<S: Store>(&mut self, store: &S, mtu: usize, now: Tick, out: &mut [u8]) -> Option<(A, usize)> {
+    pub fn next_frame<S: Store>(
+        &mut self,
+        store: &S,
+        mtu: usize,
+        now: Tick,
+        out: &mut [u8],
+    ) -> Option<(A, usize)> {
         let me = self.me;
         // Priority 1: a summary is due for some peer.
         for peer in self.peers.iter_mut() {
@@ -173,7 +184,13 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         None
     }
 
-    fn on_frame<S: Store>(&mut self, addr: A, bytes: &[u8], store: &mut S, now: Tick) -> Option<Observation> {
+    fn on_frame<S: Store>(
+        &mut self,
+        addr: A,
+        bytes: &[u8],
+        store: &mut S,
+        now: Tick,
+    ) -> Option<Observation> {
         let frame = match Frame::decode(bytes) {
             Ok(frame) => frame,
             Err(_) => return None,
@@ -194,7 +211,13 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                     Ok(false) | Err(_) => None,
                 };
             }
-            Frame::Frag { from: _, id, index, count, data } => {
+            Frame::Frag {
+                from: _,
+                id,
+                index,
+                count,
+                data,
+            } => {
                 if let Some(obs) = peer.reassembler.feed(id, index, count, &data, now) {
                     let returned = obs.clone();
                     return match store.insert(obs, now) {
@@ -220,7 +243,14 @@ fn summary_due<A>(peer: &Peer<A>, now: Tick) -> bool {
 /// Emits at most one frame for `peer`: continuing an in-flight fragment if one
 /// is pending, otherwise draining the send queue (skipping ids no longer
 /// stored).
-fn emit_one<A: Clone, S: Store>(me: NodeId, peer: &mut Peer<A>, store: &S, mtu: usize, now: Tick, out: &mut [u8]) -> Option<(A, usize)> {
+fn emit_one<A: Clone, S: Store>(
+    me: NodeId,
+    peer: &mut Peer<A>,
+    store: &S,
+    mtu: usize,
+    now: Tick,
+    out: &mut [u8],
+) -> Option<(A, usize)> {
     // in_flight takes precedence: continue the current fragmentation.
     if let Some((id, index)) = peer.in_flight {
         match store.get(&id, now) {
@@ -333,13 +363,19 @@ fn rebuild_send_queue<A, S: Store>(peer: &mut Peer<A>, store: &S, now: Tick) {
 
     peer.send_queue.clear();
     for (id, _) in heap {
-        peer.send_queue.push(id).expect("heap is capped at SEND_QUEUE_CAP");
+        peer.send_queue
+            .push(id)
+            .expect("heap is capped at SEND_QUEUE_CAP");
     }
 }
 
 /// Inserts `(id, age)` into the age-ascending top-K buffer, keeping it sorted
 /// and capped at `SEND_QUEUE_CAP`.
-fn insert_youngest(heap: &mut Vec<(ObservationId, u64), { consts::SEND_QUEUE_CAP }>, id: ObservationId, age: u64) {
+fn insert_youngest(
+    heap: &mut Vec<(ObservationId, u64), { consts::SEND_QUEUE_CAP }>,
+    id: ObservationId,
+    age: u64,
+) {
     if heap.len() < consts::SEND_QUEUE_CAP {
         let pos = insert_pos(heap, age);
         let _ = heap.insert(pos, (id, age));
@@ -372,7 +408,14 @@ mod tests {
 
     const ME: NodeId = [42; 16];
 
-    fn obs(observer: [u8; 16], seq: u64, age: u64, at: Option<u64>, topic: &[u8], payload: &[u8]) -> Observation {
+    fn obs(
+        observer: [u8; 16],
+        seq: u64,
+        age: u64,
+        at: Option<u64>,
+        topic: &[u8],
+        payload: &[u8],
+    ) -> Observation {
         Observation {
             observer,
             seq,
@@ -397,7 +440,9 @@ mod tests {
         ex.on_event(Event::Contact(1), &mut store, 0);
 
         let mut buf = [0u8; consts::MAX_FRAME];
-        let (addr, n) = ex.next_frame(&store, consts::MAX_FRAME, 0, &mut buf).expect("summary on contact");
+        let (addr, n) = ex
+            .next_frame(&store, consts::MAX_FRAME, 0, &mut buf)
+            .expect("summary on contact");
         assert_eq!(addr, 1);
         match Frame::decode(&buf[..n]).unwrap() {
             Frame::Summary { from, .. } => assert_eq!(from, ME),
@@ -450,10 +495,14 @@ mod tests {
         assert_obs_id(&emitted[1], id_c);
         assert_obs_id(&emitted[2], id_a);
         assert!(
-            !emitted.iter().any(|f| matches!(f, Frame::Obs { obs, .. } if obs.id() == id_b)),
+            !emitted
+                .iter()
+                .any(|f| matches!(f, Frame::Obs { obs, .. } if obs.id() == id_b)),
             "B must be omitted"
         );
-        assert!(ex.next_frame(&store, consts::MAX_FRAME, 0, &mut [0u8; consts::MAX_FRAME]).is_none());
+        assert!(ex
+            .next_frame(&store, consts::MAX_FRAME, 0, &mut [0u8; consts::MAX_FRAME])
+            .is_none());
     }
 
     fn assert_obs_id(frame: &Frame, id: ObservationId) {
@@ -473,7 +522,9 @@ mod tests {
             from: [2; 16],
             obs: obs.clone(),
         };
-        let returned = ex.on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0).expect("obs returned");
+        let returned = ex
+            .on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0)
+            .expect("obs returned");
         assert_eq!(returned, obs);
         assert!(store.contains(&obs.id()));
     }
@@ -488,12 +539,16 @@ mod tests {
             from: [2; 16],
             obs: obs.clone(),
         };
-        assert!(ex.on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0).is_some());
+        assert!(ex
+            .on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0)
+            .is_some());
         let dup = Frame::Obs {
             from: [2; 16],
             obs: obs.clone(),
         };
-        assert!(ex.on_event(Event::Frame(1, frame_bytes(&dup)), &mut store, 0).is_none());
+        assert!(ex
+            .on_event(Event::Frame(1, frame_bytes(&dup)), &mut store, 0)
+            .is_none());
     }
 
     #[test]
@@ -504,7 +559,11 @@ mod tests {
         let before = store.len();
         let bogus = Event::Frame(1, heapless::Vec::from_slice(&[0xFFu8; 50]).unwrap());
         assert_eq!(ex.on_event(bogus, &mut store, 0), None);
-        assert_eq!(store.len(), before, "store must be unchanged by a malformed frame");
+        assert_eq!(
+            store.len(),
+            before,
+            "store must be unchanged by a malformed frame"
+        );
     }
 
     #[test]
@@ -554,7 +613,9 @@ mod tests {
         ex.on_event(Event::Contact(1), &mut store, 0);
 
         let mut buf = [0u8; consts::MAX_FRAME];
-        let (_, n) = ex.next_frame(&store, consts::MAX_FRAME, 0, &mut buf).expect("first summary");
+        let (_, n) = ex
+            .next_frame(&store, consts::MAX_FRAME, 0, &mut buf)
+            .expect("first summary");
         match Frame::decode(&buf[..n]).unwrap() {
             Frame::Summary { salt, .. } => assert_eq!(salt, 0),
             other => panic!("expected a Summary, got {other:?}"),
@@ -568,7 +629,12 @@ mod tests {
         // After the interval: another Summary, now rotated to salt 1.
         let mut buf = [0u8; consts::MAX_FRAME];
         let (_, n) = ex
-            .next_frame(&store, consts::MAX_FRAME, consts::SUMMARY_INTERVAL_MS, &mut buf)
+            .next_frame(
+                &store,
+                consts::MAX_FRAME,
+                consts::SUMMARY_INTERVAL_MS,
+                &mut buf,
+            )
             .expect("second summary");
         match Frame::decode(&buf[..n]).unwrap() {
             Frame::Summary { salt, .. } => assert_eq!(salt, 1),
@@ -589,7 +655,9 @@ mod tests {
 
     fn summary_salt(ex: &mut Exchange<u8>, store: &MemStore, now: Tick) -> u32 {
         let mut buf = [0u8; consts::MAX_FRAME];
-        let (_, n) = ex.next_frame(store, consts::MAX_FRAME, now, &mut buf).expect("summary");
+        let (_, n) = ex
+            .next_frame(store, consts::MAX_FRAME, now, &mut buf)
+            .expect("summary");
         match Frame::decode(&buf[..n]).unwrap() {
             Frame::Summary { salt, .. } => salt,
             other => panic!("expected a Summary, got {other:?}"),
@@ -629,15 +697,25 @@ mod tests {
             }
         }
 
-        assert!(!indices.is_empty(), "the large observation must be fragmented");
+        assert!(
+            !indices.is_empty(),
+            "the large observation must be fragmented"
+        );
         let count = indices[0].1;
-        assert!(count >= 2, "a 1024-byte payload must span multiple fragments");
+        assert!(
+            count >= 2,
+            "a 1024-byte payload must span multiple fragments"
+        );
         for (i, &(index, c)) in indices.iter().enumerate() {
             assert_eq!(index, i as u8, "fragments must carry increasing indices");
             assert_eq!(c, count, "all fragments share the same count");
         }
         let last = indices.last().copied().unwrap();
-        assert_eq!(last.0 + 1, last.1, "fragment indices are contiguous to count");
+        assert_eq!(
+            last.0 + 1,
+            last.1,
+            "fragment indices are contiguous to count"
+        );
         assert_eq!(indices.len(), count as usize);
         // After draining, in_flight clears and the queue drops the id.
         assert!(ex.peers()[0].in_flight.is_none());

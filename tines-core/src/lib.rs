@@ -9,11 +9,11 @@ pub mod bloom;
 pub mod consts;
 pub mod exchange;
 pub mod frag;
-pub mod observation;
-pub mod store;
 #[cfg(feature = "alloc")]
 pub mod mem_store;
 pub mod node;
+pub mod observation;
+pub mod store;
 pub mod transport;
 pub mod wire;
 
@@ -22,8 +22,8 @@ pub use bloom::Bloom;
 pub use exchange::{Exchange, Peer};
 pub use frag::{fragment, Reassembler};
 pub use node::{Node, ObserveError};
-pub use observation::{Observation, NodeId, ObservationId, Payload, Tick, Topic};
-pub use store::{Store, TrimPolicy, StoreError};
+pub use observation::{NodeId, Observation, ObservationId, Payload, Tick, Topic};
+pub use store::{Store, StoreError, TrimPolicy};
 pub use transport::{Event, FrameBuf, SendError, Transport};
 pub use wire::{Frame, WireError};
 

@@ -9,10 +9,10 @@
 
 #![deny(warnings)]
 
-pub mod trace;
-pub mod world;
-pub mod transport;
 pub mod sim;
+pub mod trace;
+pub mod transport;
+pub mod world;
 
 pub use sim::{Sim, SimNode};
 pub use trace::{Contact, ContactTrace};

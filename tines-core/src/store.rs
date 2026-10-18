@@ -62,12 +62,7 @@ pub trait Store {
 
     /// Visit every stored observation whose topic starts with `prefix`
     /// (an empty prefix matches all), each age-adjusted to `now`.
-    fn for_each_topic(
-        &self,
-        prefix: &[u8],
-        now: Tick,
-        f: &mut dyn FnMut(&Observation),
-    );
+    fn for_each_topic(&self, prefix: &[u8], now: Tick, f: &mut dyn FnMut(&Observation));
 
     /// Apply [`TrimPolicy`] rules in order (per-topic, age, count) and return
     /// the number of observations removed. Trimmed ids are not tombstoned:

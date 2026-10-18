@@ -142,7 +142,10 @@ mod tests {
             bloom.insert(&id);
         }
         for id in ids {
-            assert!(bloom.might_contain(&id), "inserted id must be reported present");
+            assert!(
+                bloom.might_contain(&id),
+                "inserted id must be reported present"
+            );
         }
     }
 
@@ -152,7 +155,10 @@ mod tests {
         let mut rng = Rng::new(2);
         let ids: [ObservationId; 100] = std::array::from_fn(|_| rng.id());
         for id in ids {
-            assert!(!bloom.might_contain(&id), "empty filter must report nothing");
+            assert!(
+                !bloom.might_contain(&id),
+                "empty filter must report nothing"
+            );
         }
     }
 

@@ -14,7 +14,12 @@ pub trait BeliefPolicy {
     /// Streaming fold: called once per matching observation (already
     /// age-adjusted to `now`), in no particular order. `acc` is `None` before
     /// the first call. Return the new accumulator.
-    fn step(&self, me: NodeId, acc: Option<Self::Belief>, obs: &Observation) -> Option<Self::Belief>;
+    fn step(
+        &self,
+        me: NodeId,
+        acc: Option<Self::Belief>,
+        obs: &Observation,
+    ) -> Option<Self::Belief>;
 }
 
 /// Latest observation wins: the observation with the smallest `age_ms`; ties
@@ -29,12 +34,18 @@ pub struct SelfFirst;
 impl BeliefPolicy for LatestWins {
     type Belief = Observation;
 
-    fn step(&self, _me: NodeId, acc: Option<Self::Belief>, obs: &Observation) -> Option<Self::Belief> {
+    fn step(
+        &self,
+        _me: NodeId,
+        acc: Option<Self::Belief>,
+        obs: &Observation,
+    ) -> Option<Self::Belief> {
         match acc {
             None => Some(obs.clone()),
             Some(cur) => {
                 if obs.age_ms < cur.age_ms
-                    || (obs.age_ms == cur.age_ms && (obs.observer, obs.seq) < (cur.observer, cur.seq))
+                    || (obs.age_ms == cur.age_ms
+                        && (obs.observer, obs.seq) < (cur.observer, cur.seq))
                 {
                     Some(obs.clone())
                 } else {
@@ -48,7 +59,12 @@ impl BeliefPolicy for LatestWins {
 impl BeliefPolicy for SelfFirst {
     type Belief = Observation;
 
-    fn step(&self, me: NodeId, acc: Option<Self::Belief>, obs: &Observation) -> Option<Self::Belief> {
+    fn step(
+        &self,
+        me: NodeId,
+        acc: Option<Self::Belief>,
+        obs: &Observation,
+    ) -> Option<Self::Belief> {
         match acc {
             None => Some(obs.clone()),
             Some(cur) => {

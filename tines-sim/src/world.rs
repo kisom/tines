@@ -150,9 +150,12 @@ mod tests {
             seed,
         };
         let mut trace = ContactTrace::default();
-        trace
-            .contacts
-            .push(Contact { start_ms: start, end_ms: end, a: 0, b: 1 });
+        trace.contacts.push(Contact {
+            start_ms: start,
+            end_ms: end,
+            a: 0,
+            b: 1,
+        });
         SimWorld::new(cfg, trace)
     }
 
@@ -163,9 +166,7 @@ mod tests {
 
     /// The number of `Frame` events queued in `node`'s inbox.
     fn frame_count(world: &Rc<RefCell<SimWorld>>, node: usize) -> usize {
-        world
-            .borrow()
-            .inboxes[node]
+        world.borrow().inboxes[node]
             .iter()
             .filter(|e| matches!(e, Event::Frame(_, _)))
             .count()
@@ -244,9 +245,12 @@ mod tests {
         };
         let make_trace = || {
             let mut trace = ContactTrace::default();
-            trace
-                .contacts
-                .push(Contact { start_ms: 0, end_ms: 1000, a: 0, b: 1 });
+            trace.contacts.push(Contact {
+                start_ms: 0,
+                end_ms: 1000,
+                a: 0,
+                b: 1,
+            });
             trace
         };
         let w1 = SimWorld::new(cfg.clone(), make_trace());

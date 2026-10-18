@@ -49,8 +49,7 @@ impl Transport for SimTransport {
         if !w.trace.in_contact(self.me, *to, w.prev_t) {
             return Err(SendError::Unreachable);
         }
-        if frame.len() > w.cfg.mtu
-            && !matches!(Frame::decode(frame), Ok(Frame::Summary { .. })) {
+        if frame.len() > w.cfg.mtu && !matches!(Frame::decode(frame), Ok(Frame::Summary { .. })) {
             return Err(SendError::TooLarge);
         }
         if w.rng.gen::<f64>() < w.cfg.loss {

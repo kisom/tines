@@ -1,7 +1,7 @@
 //! Fragmentation and reassembly of `Observation`s over a byte-oriented link.
 
 use crate::consts;
-use crate::{Frame, Observation, NodeId, ObservationId, Tick, WireError};
+use crate::{Frame, NodeId, Observation, ObservationId, Tick, WireError};
 use heapless::Vec;
 
 /// Header allowance per fragment (bytes), pinned.
@@ -85,7 +85,14 @@ impl Reassembler {
         }
     }
 
-    pub fn feed(&mut self, id: ObservationId, index: u8, count: u8, data: &[u8], now: Tick) -> Option<Observation> {
+    pub fn feed(
+        &mut self,
+        id: ObservationId,
+        index: u8,
+        count: u8,
+        data: &[u8],
+        now: Tick,
+    ) -> Option<Observation> {
         // 1. Drop malformed indices: count must be in 1..=64 and index < count.
         //    `index >= 64` is guarded too so the `1 << index` bitmap never
         //    shifts out of bounds on adversarial wire input.
@@ -115,13 +122,19 @@ impl Reassembler {
         if self.buf.len().saturating_add(data.len()) > self.buf.capacity() {
             return None;
         }
-        self.buf.extend_from_slice(data).expect("buf capacity check above");
+        self.buf
+            .extend_from_slice(data)
+            .expect("buf capacity check above");
         self.offs[index as usize] = start as u16;
         self.lens[index as usize] = data.len() as u16;
         self.received |= 1u64 << index;
 
         // 4. Not all fragments have arrived yet.
-        let complete: u64 = if count >= 64 { u64::MAX } else { (1u64 << count) - 1 };
+        let complete: u64 = if count >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << count) - 1
+        };
         if self.received != complete {
             return None;
         }
@@ -219,12 +232,22 @@ mod tests {
         let mut r = Reassembler::new();
         let mut last: Option<Observation> = None;
         for f in frames.iter() {
-            if let Frame::Frag { id, index, count, data, .. } = Frame::decode(f).unwrap() {
+            if let Frame::Frag {
+                id,
+                index,
+                count,
+                data,
+                ..
+            } = Frame::decode(f).unwrap()
+            {
                 last = r.feed(id, index, count, &data, 0);
             }
         }
         let reassembled = last.expect("reassembled obs");
-        assert_eq!(reassembled, obs, "reassembled observation must equal original");
+        assert_eq!(
+            reassembled, obs,
+            "reassembled observation must equal original"
+        );
     }
 
     #[test]
@@ -236,7 +259,14 @@ mod tests {
         let mut r = Reassembler::new();
         let mut last: Option<Observation> = None;
         for f in frames.iter().rev() {
-            if let Frame::Frag { id, index, count, data, .. } = Frame::decode(f).unwrap() {
+            if let Frame::Frag {
+                id,
+                index,
+                count,
+                data,
+                ..
+            } = Frame::decode(f).unwrap()
+            {
                 last = r.feed(id, index, count, &data, 0);
             }
         }
@@ -253,7 +283,14 @@ mod tests {
         let frags: Vec<(ObservationId, u8, u8, Vec<u8>)> = frames
             .iter()
             .map(|f| {
-                if let Frame::Frag { id, index, count, data, .. } = Frame::decode(f).unwrap() {
+                if let Frame::Frag {
+                    id,
+                    index,
+                    count,
+                    data,
+                    ..
+                } = Frame::decode(f).unwrap()
+                {
                     (id, index, count, data.to_vec())
                 } else {
                     panic!("expected Frag frames");
@@ -283,7 +320,14 @@ mod tests {
         let frags: Vec<(ObservationId, u8, u8, Vec<u8>)> = frames
             .iter()
             .map(|f| {
-                if let Frame::Frag { id, index, count, data, .. } = Frame::decode(f).unwrap() {
+                if let Frame::Frag {
+                    id,
+                    index,
+                    count,
+                    data,
+                    ..
+                } = Frame::decode(f).unwrap()
+                {
                     (id, index, count, data.to_vec())
                 } else {
                     panic!("expected Frag frames");
@@ -323,7 +367,14 @@ mod tests {
         let frags: Vec<(ObservationId, u8, u8, Vec<u8>)> = frames
             .iter()
             .map(|f| {
-                if let Frame::Frag { id, index, count, data, .. } = Frame::decode(f).unwrap() {
+                if let Frame::Frag {
+                    id,
+                    index,
+                    count,
+                    data,
+                    ..
+                } = Frame::decode(f).unwrap()
+                {
                     (id, index, count, data.to_vec())
                 } else {
                     panic!("expected Frag frames");
@@ -337,12 +388,18 @@ mod tests {
         r.feed(*id0, *idx0, *cnt0, data0, 0);
         // feed index 1 at now=timeout+1 -> slot restarts with only index 1, returns None
         let (id1, idx1, cnt1, data1) = &frags[1];
-        assert!(r.feed(*id1, *idx1, *cnt1, data1, consts::REASSEMBLY_TIMEOUT_MS + 1).is_none());
+        assert!(r
+            .feed(*id1, *idx1, *cnt1, data1, consts::REASSEMBLY_TIMEOUT_MS + 1)
+            .is_none());
         // re-feed index 0 late: proves index 0 from now=0 was discarded, but the
         // restarted slot now holds index 1, so the stream completes to the original
         let (idc, idxc, cntc, datac) = &frags[0];
         let late = r.feed(*idc, *idxc, *cntc, datac, consts::REASSEMBLY_TIMEOUT_MS + 2);
-        assert_eq!(late, Some(obs.clone()), "late re-feed must complete the restarted stream");
+        assert_eq!(
+            late,
+            Some(obs.clone()),
+            "late re-feed must complete the restarted stream"
+        );
         // sanity: a fresh feed of the whole set from now=0 also completes
         let mut r2 = Reassembler::new();
         let mut complete: Option<Observation> = None;
@@ -361,7 +418,14 @@ mod tests {
         let mut frags: Vec<(ObservationId, u8, u8, Vec<u8>)> = frames
             .iter()
             .map(|f| {
-                if let Frame::Frag { id, index, count, data, .. } = Frame::decode(f).unwrap() {
+                if let Frame::Frag {
+                    id,
+                    index,
+                    count,
+                    data,
+                    ..
+                } = Frame::decode(f).unwrap()
+                {
                     (id, index, count, data.to_vec())
                 } else {
                     panic!("expected Frag frames");

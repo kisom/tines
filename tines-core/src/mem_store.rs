@@ -9,13 +9,13 @@
 extern crate alloc;
 
 #[cfg(feature = "alloc")]
-use alloc::collections::{BTreeMap, BTreeSet};
-#[cfg(feature = "alloc")]
-use alloc::vec::Vec;
-#[cfg(feature = "alloc")]
 use crate::observation::{Observation, ObservationId, Tick};
 #[cfg(feature = "alloc")]
 use crate::store::{current_age, Store, StoreError, TrimPolicy};
+#[cfg(feature = "alloc")]
+use alloc::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
 
 #[cfg(feature = "alloc")]
 struct Held {
@@ -60,7 +60,13 @@ impl Store for MemStore {
             // Dedupe: keep the first-stored entry and its age lineage.
             return Ok(false);
         }
-        self.map.insert(id, Held { obs, stored_at: now });
+        self.map.insert(
+            id,
+            Held {
+                obs,
+                stored_at: now,
+            },
+        );
         Ok(true)
     }
 
@@ -84,12 +90,7 @@ impl Store for MemStore {
         }
     }
 
-    fn for_each_topic(
-        &self,
-        prefix: &[u8],
-        now: Tick,
-        f: &mut dyn FnMut(&Observation),
-    ) {
+    fn for_each_topic(&self, prefix: &[u8], now: Tick, f: &mut dyn FnMut(&Observation)) {
         for held in self.map.values() {
             if held.obs.topic.starts_with(prefix) {
                 let elapsed = now.saturating_sub(held.stored_at);
@@ -107,7 +108,10 @@ impl Store for MemStore {
             let mut groups: BTreeMap<&[u8], Vec<ObservationId>> = BTreeMap::new();
             for (id, held) in self.map.iter() {
                 if !removed.contains(id) {
-                    groups.entry(held.obs.topic.as_slice()).or_default().push(*id);
+                    groups
+                        .entry(held.obs.topic.as_slice())
+                        .or_default()
+                        .push(*id);
                 }
             }
             for member_ids in groups.values() {
@@ -116,8 +120,11 @@ impl Store for MemStore {
                 }
                 let mut ids = member_ids.clone();
                 ids.sort_by(|&a, &b| {
-                    current_age(&self.map[&a].obs, self.map[&a].stored_at, now)
-                        .cmp(&current_age(&self.map[&b].obs, self.map[&b].stored_at, now))
+                    current_age(&self.map[&a].obs, self.map[&a].stored_at, now).cmp(&current_age(
+                        &self.map[&b].obs,
+                        self.map[&b].stored_at,
+                        now,
+                    ))
                 });
                 for id in ids.into_iter().skip(keep) {
                     removed.insert(id);
@@ -128,9 +135,7 @@ impl Store for MemStore {
         // (b) max_age_ms: drop anything whose current age exceeds the cutoff.
         if let Some(max_age) = policy.max_age_ms {
             for (id, held) in self.map.iter() {
-                if !removed.contains(id)
-                    && current_age(&held.obs, held.stored_at, now) > max_age
-                {
+                if !removed.contains(id) && current_age(&held.obs, held.stored_at, now) > max_age {
                     removed.insert(*id);
                 }
             }
@@ -147,8 +152,11 @@ impl Store for MemStore {
                 .collect();
             if remaining.len() > max_count {
                 remaining.sort_by(|&a, &b| {
-                    current_age(&self.map[&a].obs, self.map[&a].stored_at, now)
-                        .cmp(&current_age(&self.map[&b].obs, self.map[&b].stored_at, now))
+                    current_age(&self.map[&a].obs, self.map[&a].stored_at, now).cmp(&current_age(
+                        &self.map[&b].obs,
+                        self.map[&b].stored_at,
+                        now,
+                    ))
                 });
                 let over = remaining.len() - max_count;
                 for id in remaining.into_iter().rev().take(over) {
@@ -255,7 +263,8 @@ mod tests {
     fn trim_keep_per_topic_keeps_youngest() {
         let mut s = MemStore::new();
         for (i, age) in [10u64, 20, 30, 40, 50].iter().enumerate() {
-            s.insert(obs([1; 16], i as u64, *age, None, b"t"), 0).unwrap();
+            s.insert(obs([1; 16], i as u64, *age, None, b"t"), 0)
+                .unwrap();
         }
         let policy = TrimPolicy {
             keep_per_topic: Some(2),
@@ -293,7 +302,8 @@ mod tests {
     fn trim_max_count_drops_oldest() {
         let mut s = MemStore::new();
         for i in 0..10u64 {
-            s.insert(obs([1; 16], i, (i + 1) * 10, None, b"t"), 0).unwrap();
+            s.insert(obs([1; 16], i, (i + 1) * 10, None, b"t"), 0)
+                .unwrap();
         }
         let policy = TrimPolicy {
             keep_per_topic: None,
@@ -306,7 +316,10 @@ mod tests {
         s.for_each_topic(b"t", 0, &mut |o| {
             ages.insert(o.age_ms);
         });
-        assert_eq!(ages, std::collections::BTreeSet::from_iter([10u64, 20, 30, 40]));
+        assert_eq!(
+            ages,
+            std::collections::BTreeSet::from_iter([10u64, 20, 30, 40])
+        );
     }
 
     #[test]

@@ -27,14 +27,25 @@ fn two_nodes_one_contact_converge() {
 
     let mut sim = Sim::new(cfg, trace);
     for i in 0..10 {
-        sim.observe(0, format!("n0-{}", i).as_bytes(), format!("p{}", i).as_bytes());
+        sim.observe(
+            0,
+            format!("n0-{}", i).as_bytes(),
+            format!("p{}", i).as_bytes(),
+        );
     }
     for i in 0..10 {
-        sim.observe(1, format!("n1-{}", i).as_bytes(), format!("p{}", i).as_bytes());
+        sim.observe(
+            1,
+            format!("n1-{}", i).as_bytes(),
+            format!("p{}", i).as_bytes(),
+        );
     }
     sim.run_until(5000);
 
-    assert!(sim.converged(&[0, 1]), "both nodes must hold every observation");
+    assert!(
+        sim.converged(&[0, 1]),
+        "both nodes must hold every observation"
+    );
     assert_eq!(sim.id_set(0).len(), 20, "each node stores 10 + 10 obs");
     assert_eq!(sim.id_set(1).len(), 20);
 }
@@ -66,7 +77,11 @@ fn relay_through_middle_node() {
 
     let mut sim = Sim::new(cfg, trace);
     for i in 0..5 {
-        sim.observe(0, format!("a-{}", i).as_bytes(), format!("a-p{}", i).as_bytes());
+        sim.observe(
+            0,
+            format!("a-{}", i).as_bytes(),
+            format!("a-p{}", i).as_bytes(),
+        );
     }
     sim.run_until(7000);
 
@@ -74,7 +89,10 @@ fn relay_through_middle_node() {
     let node_2 = sim.id_set(2);
     // 0 and 2 never shared a contact, yet 2 received everything through 1.
     for id in &from_0 {
-        assert!(node_2.contains(id), "node 2 is missing node 0's observation {id:?}");
+        assert!(
+            node_2.contains(id),
+            "node 2 is missing node 0's observation {id:?}"
+        );
     }
     assert_eq!(from_0.len(), 5, "node 0 observed 5 things");
 }
@@ -114,7 +132,10 @@ fn disconnected_component_does_not_converge() {
         vec![vec![0, 1], vec![2, 3]],
         "the contact graph splits into two pairs"
     );
-    assert!(!sim.converged(&[0, 1, 2, 3]), "cross-component never converges");
+    assert!(
+        !sim.converged(&[0, 1, 2, 3]),
+        "cross-component never converges"
+    );
     assert!(sim.converged(&[0, 1]), "component A converges");
     assert!(sim.converged(&[2, 3]), "component B converges");
 }
@@ -139,8 +160,16 @@ fn lossy_link_still_converges_given_time() {
 
     let mut sim = Sim::new(cfg, trace);
     for i in 0..50 {
-        sim.observe(0, format!("l0-{}", i).as_bytes(), format!("l0-p{}", i).as_bytes());
-        sim.observe(1, format!("l1-{}", i).as_bytes(), format!("l1-p{}", i).as_bytes());
+        sim.observe(
+            0,
+            format!("l0-{}", i).as_bytes(),
+            format!("l0-p{}", i).as_bytes(),
+        );
+        sim.observe(
+            1,
+            format!("l1-{}", i).as_bytes(),
+            format!("l1-p{}", i).as_bytes(),
+        );
     }
     sim.run_until(60_000);
 

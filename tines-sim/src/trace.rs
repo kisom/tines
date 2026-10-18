@@ -53,7 +53,12 @@ mod tests {
     #[test]
     fn in_contact_matches_both_orders() {
         let mut trace = ContactTrace::default();
-        trace.contacts.push(Contact { start_ms: 100, end_ms: 200, a: 3, b: 7 });
+        trace.contacts.push(Contact {
+            start_ms: 100,
+            end_ms: 200,
+            a: 3,
+            b: 7,
+        });
         assert!(!trace.in_contact(3, 7, 50)); // before the window
         assert!(trace.in_contact(3, 7, 100)); // at the start edge
         assert!(trace.in_contact(7, 3, 150)); // mid-window, either order
