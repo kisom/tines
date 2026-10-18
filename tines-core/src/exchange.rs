@@ -414,7 +414,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                     i += 1;
                 }
             }
-            // How many ids fit in `mtu`? Ids shrink monotonically as we drop.
+            // How many ids fit in `mtu`? Each id dropped shrinks the frame.
             for k in (1..=pulled.len()).rev() {
                 if Self::encode_ack(self.me, &pulled[..k], out, mtu).is_some() {
                     send_n = k;
@@ -422,9 +422,14 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                 }
             }
             if send_n == 0 {
-                // Even a single id overflows `mtu`: drop the oldest for this
-                // addr and let the next poll retry the rest rather than stall.
-                buffer.entries.remove(0);
+                // Even a single id overflows `mtu`: drop this addr's oldest
+                // pending ack and re-keep the rest for the next poll, so the
+                // remainder retries rather than stalling. The offending addr's
+                // entries were already pulled into `pulled`, so only they are
+                // touched here — never a *different* peer's oldest entry.
+                for id in &pulled[1..] {
+                    let _ = buffer.entries.push((*id, addr.clone()));
+                }
                 return None;
             }
         }
@@ -758,15 +763,13 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
     ) -> Option<Observation> {
         for id in ids.iter() {
             if was_sent(&self.bounce, *id, &addr) {
-                // Addressed: release custody for the local copy only when
-                // the Ack confirms delivery to the *intended* recipient. An
-                // Ack from a peer that merely holds an epidemic-forwarded
-                // copy must not release custody — the copy would then be
-                // ineligible to forward toward the recipient once the only
-                // contact to it has closed, so the observation could never be
-                // delivered.
-                let held_addressed = store.get(id, now).is_some_and(|obs| obs.to == Some(from));
-                if held_addressed {
+                // Addressed: release custody for the local copy on the first
+                // exact Ack from ANY peer the node dispatched it to — a relay
+                // that merely holds an epidemic-forwarded copy, or the intended
+                // recipient alike. The custody chain tracks that a copy left us,
+                // so we stop forwarding this id; final delivery to the recipient
+                // is best-effort, not guaranteed.
+                if store.get(id, now).is_some_and(|obs| obs.to.is_some()) {
                     store.release(id);
                 }
             } else if bcast_sent_contains(&self.bcast_sent, *id, &addr) {
@@ -1485,6 +1488,52 @@ mod tests {
         assert!(
             ack_for(&mut ex, &store, y_id),
             "duplicate reception is acked"
+        );
+    }
+
+    /// An mtu too small for even one id drops only the offending destination's
+    /// oldest pending ack and leaves a *different* peer's pending ack untouched.
+    #[test]
+    fn drain_ack_buffer_overflow_drops_only_target_peer() {
+        let a: NodeId = [2; 16];
+        let b: NodeId = [9; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        empty_summary(&mut ex, &mut store, 1, a);
+        empty_summary(&mut ex, &mut store, 2, b);
+
+        // One broadcast ack pending for addr 1 (a), one for addr 2 (b).
+        let y1 = obs(a, 1, 0, None, b"t", b"bc");
+        let y2 = obs(b, 1, 0, None, b"t", b"bc");
+        ex.on_event(
+            Event::Frame(1, frame_bytes(&Frame::Obs { from: a, obs: y1 })),
+            &mut store,
+            0,
+        );
+        ex.on_event(
+            Event::Frame(2, frame_bytes(&Frame::Obs { from: b, obs: y2 })),
+            &mut store,
+            0,
+        );
+        assert_eq!(ex.bcast_acks.len(), 2, "each broadcast has a pending ack");
+
+        // An mtu too small for even a single id: the first poll drops addr 1's
+        // oldest pending ack but must leave addr 2's untouched.
+        let mut buf = [0u8; consts::MAX_FRAME];
+        assert!(
+            ex.next_frame(&store, 4usize, 0, &mut buf).is_none(),
+            "no ack fits the tiny mtu"
+        );
+        assert_eq!(
+            ex.bcast_acks.len(),
+            1,
+            "only the offending destination's ack was dropped"
+        );
+        let remaining = ex.bcast_acks.entries.first().map(|(_, addr)| *addr);
+        assert_eq!(
+            remaining,
+            Some(2u8),
+            "addr 2's pending ack is preserved, not a dropped peer's"
         );
     }
 
@@ -2490,6 +2539,38 @@ mod tests {
         assert!(
             !reemitted,
             "a released id must not be selected again after a new contact"
+        );
+    }
+
+    /// The custody chain releases on the first Ack from ANY peer the node
+    /// dispatched the observation to — a relay (a non-recipient that merely
+    /// holds an epidemic-forwarded copy), not just the intended recipient. This
+    /// is the binding release semantics; release tracks that a copy left us, not
+    /// final delivery.
+    #[test]
+    fn ack_releases_custody_from_a_relay() {
+        let relay: NodeId = [2; 16];
+        let recipient: NodeId = [3; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        // ME holds X, addressed to `recipient`, and dispatched it to the relay.
+        let x = observed_addressed([7; 16], 1, recipient, b"t", b"hi");
+        let x_id = x.id();
+        store.insert(x.clone(), 0).unwrap();
+        deliver_to(&mut ex, &mut store, 1, x_id);
+        assert!(
+            !store.is_released(&x_id),
+            "custody is held until an ack from a peer we sent to"
+        );
+
+        // A relay (not the recipient) confirms it holds X.
+        let ids = heapless::Vec::from_slice(&[x_id]).unwrap();
+        let ack = Frame::Ack { from: relay, ids };
+        ex.on_event(Event::Frame(1, frame_bytes(&ack)), &mut store, 0);
+
+        assert!(
+            store.is_released(&x_id),
+            "an Ack from any peer we sent to (a relay here) releases custody"
         );
     }
 
