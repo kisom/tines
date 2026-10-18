@@ -1,0 +1,28 @@
+[package]
+name = "tines-ros2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Self-contained ROS2 node for tines: bridges tines topics to ROS2 topics with a /tines/receipts channel for confidence events. rclrs is an optional feature (off by default) so the crate builds without a ROS2 toolchain."
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/tines-ros2"
+keywords = ["robotics", "ros2", "gossip", "delay-tolerant", "science::robotics"]
+categories = ["science::robotics", "network-programming"]
+
+[features]
+# rclrs (the ROS2 client library) is optional and off by default: the crate's
+# pure tines-side pieces (topic naming, the Node/Store/Transport wiring) build
+# and are tested without a ROS2 toolchain. Enable `--features ros2` to compile
+# the rclrs-backed `TinesNode`.
+default = []
+ros2 = ["dep:rclrs"]
+
+[dependencies]
+tines-core = { path = "../tines-core", version = "0.3.0" }
+tines-store = { path = "../tines-store", version = "0.3.0" }
+tines-bt = { path = "../tines-bt", version = "0.3.0" }
+rclrs = { version = "0.8", optional = true }
+
+[dev-dependencies]
