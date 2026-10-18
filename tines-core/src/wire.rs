@@ -89,6 +89,8 @@ mod tests {
                 observed_at: Some(999),
                 topic: Topic::from_slice(b"door/3").unwrap(),
                 payload: Payload::from_slice(b"open").unwrap(),
+                to: None,
+                lifetime_ms: None,
             },
         }
     }
@@ -103,6 +105,8 @@ mod tests {
                 observed_at: None,
                 topic: Topic::from_slice(b"t").unwrap(),
                 payload: Payload::from_slice(&[0u8; 1024]).unwrap(),
+                to: None,
+                lifetime_ms: None,
             },
         }
     }

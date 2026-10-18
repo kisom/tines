@@ -91,6 +91,8 @@ impl<S: Store, T: Transport> Node<S, T> {
             observed_at,
             topic,
             payload,
+            to: None,
+            lifetime_ms: None,
         };
         self.next_seq += 1;
         let id = obs.id();

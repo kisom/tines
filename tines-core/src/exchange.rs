@@ -421,6 +421,8 @@ mod tests {
             observed_at: at,
             topic: Topic::from_slice(topic).unwrap(),
             payload: Payload::from_slice(payload).unwrap(),
+            to: None,
+            lifetime_ms: None,
         }
     }
 
