@@ -1,0 +1,17 @@
+[package]
+name = "tines-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Persistent append-only LogStore backend for tines: memory survives reboot with rebased ages and persisted release/sequence state."
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/tines-store"
+keywords = ["robotics", "gossip", "delay-tolerant", "store", "persistent"]
+categories = ["science::robotics"]
+
+[dependencies]
+tines-core = { path = "../tines-core", version = "0.3.0" }
+postcard = { version = "1", features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
