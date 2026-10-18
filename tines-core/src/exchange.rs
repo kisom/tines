@@ -519,7 +519,10 @@ fn rebuild_send_queue<A, S: Store>(peer: &mut Peer<A>, store: &S, now: Tick) {
     // capacity. When full, only a candidate younger than the current oldest
     // (last element) is admitted, dropping that oldest.
     let mut heap: Vec<(ObservationId, u64), { consts::SEND_QUEUE_CAP }> = Vec::new();
-    store.for_each_id(&mut |id| {
+    // Broadcasts only (`to == None`): addressed messages are delivered through
+    // `forward_addressed` and must never leak into the broadcast diff, mirroring
+    // the bloom-summary path in `next_frame` which also iterates broadcast ids.
+    store.for_each_broadcast_id(&mut |id| {
         if their.might_contain(id) {
             return;
         }
@@ -674,6 +677,50 @@ mod tests {
         assert!(ex
             .next_frame(&store, consts::MAX_FRAME, 0, &mut [0u8; consts::MAX_FRAME])
             .is_none());
+    }
+
+    #[test]
+    fn rebuild_send_queue_excludes_addressed() {
+        // A store with one broadcast (`to == None`) and one addressed
+        // (`to = Some([3; 16])`) observation. After a peer contacts us and
+        // sends an empty Summary (lacking everything), the broadcast diff must
+        // queue only the broadcast id and never leak in the addressed id.
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let b = obs([2; 16], 1, 0, None, b"t", b"b");
+        let a_id = {
+            let mut a = obs([2; 16], 2, 0, None, b"t", b"a");
+            a.to = Some([3; 16]);
+            a.id()
+        };
+        let b_id = b.id();
+        store.insert(b, 0).unwrap();
+        store
+            .insert(
+                {
+                    let mut a = obs([2; 16], 2, 0, None, b"t", b"a");
+                    a.to = Some([3; 16]);
+                    a
+                },
+                0,
+            )
+            .unwrap();
+
+        // Peer contacts us, then sends an empty Summary (holds nothing).
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        let bits = heapless::Vec::from_slice(&[0u8; consts::SUMMARY_BYTES]).unwrap();
+        let sum = Frame::Summary {
+            from: [2; 16],
+            salt: 0,
+            bits,
+        };
+        ex.on_event(Event::Frame(1, frame_bytes(&sum)), &mut store, 0);
+
+        let peer = &ex.peers()[0];
+        let q: std::vec::Vec<_> = peer.send_queue.iter().copied().collect();
+        assert!(q.contains(&b_id), "broadcast id must be queued: {q:?}");
+        assert!(!q.contains(&a_id), "addressed id must NOT be queued: {q:?}");
+        assert_eq!(q.len(), 1, "only the broadcast id should be queued");
     }
 
     fn assert_obs_id(frame: &Frame, id: ObservationId) {
