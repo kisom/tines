@@ -118,7 +118,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                 continue;
             }
             let mut bloom = Bloom::new(self.salt);
-            store.for_each_id(&mut |id| bloom.insert(id));
+            store.for_each_broadcast_id(&mut |id| bloom.insert(id));
             let bits = match Vec::<u8, { consts::SUMMARY_BYTES }>::from_slice(bloom.bits()) {
                 Ok(bits) => bits,
                 Err(_) => return None,
@@ -742,5 +742,37 @@ mod tests {
         }
         assert!(store.contains(&id), "reassembled obs must be stored");
         assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn addressed_obs_not_in_summary() {
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let b = obs([2; 16], 1, 0, None, b"t", b"b");
+        let b_id = b.id();
+        let mut a = obs([2; 16], 2, 0, None, b"t", b"a");
+        a.to = Some([2; 16]);
+        let a_id = a.id();
+        store.insert(b, 0).unwrap();
+        store.insert(a, 0).unwrap();
+
+        // Peer contacts us, so a summary is due on the next poll.
+        ex.on_event(Event::Contact(1), &mut store, 0);
+
+        let mut buf = [0u8; consts::MAX_FRAME];
+        let (_, n) = ex
+            .next_frame(&store, consts::MAX_FRAME, 0, &mut buf)
+            .expect("summary on contact");
+        match Frame::decode(&buf[..n]).unwrap() {
+            Frame::Summary { salt, bits, .. } => {
+                let bloom = Bloom::from_parts(salt, &bits).expect("valid summary bloom");
+                assert!(bloom.might_contain(&b_id), "broadcast id must be present");
+                assert!(
+                    !bloom.might_contain(&a_id),
+                    "addressed id must be absent from the summary"
+                );
+            }
+            other => panic!("expected a Summary frame, got {other:?}"),
+        }
     }
 }
