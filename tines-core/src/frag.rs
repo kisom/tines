@@ -120,6 +120,10 @@ impl Reassembler {
         //    record where this index's bytes live.
         let start = self.buf.len();
         if self.buf.len().saturating_add(data.len()) > self.buf.capacity() {
+            // No valid observation encodes to more than MAX_FRAME*2 bytes, so a
+            // fragment that cannot fit marks the stream as malformed: reset the
+            // slot rather than leaving it stuck holding an unreassemblable set.
+            self.reset_slot();
             return None;
         }
         self.buf
@@ -185,7 +189,7 @@ impl Reassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{Frame, WireError};
+    use crate::wire::Frame;
     use crate::{Payload, Topic};
     use std::vec::Vec;
 
@@ -451,9 +455,21 @@ mod tests {
     }
 
     #[test]
+    fn buffer_overflow_resets_slot() {
+        let mut r = Reassembler::new();
+        // Two max-sized fragments fill the 3000-byte buffer.
+        assert!(r.feed([0xA; 16], 0, 64, &[0u8; 1500], 0).is_none());
+        assert!(r.feed([0xA; 16], 1, 64, &[0u8; 1500], 0).is_none());
+        assert_eq!(r.buf.len(), 3000);
+        // A third fragment overflows; the slot must reset, not stay stuck.
+        assert!(r.feed([0xA; 16], 2, 64, &[0u8; 1], 0).is_none());
+        assert!(r.buf.is_empty(), "overflow must reset the slot buffer");
+        assert!(r.id.is_none(), "overflow must clear the slot id");
+    }
+
+    #[test]
     fn decode_garbage_is_not_a_frame() {
         // smoke check that wire decode of the module's dependency behaves
         assert!(Frame::decode(&[0xFFu8, 0xFF, 0xFF]).is_err());
-        assert!(WireError::Malformed == WireError::Malformed);
     }
 }
