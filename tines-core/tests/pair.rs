@@ -1,3 +1,6 @@
+// Every test here drives a `Node` over `MemStore`, which needs `alloc`.
+#![cfg(feature = "alloc")]
+
 mod common;
 use common::PairTransport;
 

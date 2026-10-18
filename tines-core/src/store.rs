@@ -2,9 +2,9 @@
 //!
 //! This module defines the [`Store`] trait plus its [`TrimPolicy`] and
 //! [`StoreError`] types. Everything here is `#![no_std]`-clean and does **not**
-//! require the `alloc` feature — only concrete backends (see
-//! [`mem_store`](crate::mem_store)) need allocation, so the trait, policy, and
-//! error types remain available on `no_std` targets as well.
+//! require the `alloc` feature — only concrete backends (such as `mem_store`,
+//! which is compiled only with `alloc`) need allocation, so the trait, policy,
+//! and error types remain available on `no_std` targets as well.
 
 use crate::observation::{Observation, ObservationId, Tick};
 

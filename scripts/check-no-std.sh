@@ -1,4 +1,7 @@
 #!/bin/sh
 set -e
-rustup target add thumbv7em-none-eabihf
-cargo build -p tines-core --no-default-features --target thumbv7em-none-eabihf
+target=thumbv7em-none-eabihf
+if ! rustup target list --installed | grep -qx "$target"; then
+    rustup target add "$target"
+fi
+cargo build --locked -p tines-core --no-default-features --target "$target"

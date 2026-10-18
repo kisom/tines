@@ -1,2 +1,6 @@
 [toolchain]
-channel = "stable"
+# Pinned so new clippy lints or rustfmt rules can't break CI without a code
+# change. Bump deliberately, together with the version in ci.yml.
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
+targets = ["thumbv7em-none-eabihf"]
