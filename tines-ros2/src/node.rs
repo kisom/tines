@@ -254,12 +254,19 @@ impl TinesNode {
             self.ensure(&tines_topic)?;
         }
 
-        // Publish the latest observation for every managed topic.
-        let managed: Vec<String> = self.managed.keys().cloned().collect();
-        for name in managed {
-            if let Some(topic) = self.managed.get_mut(&name) {
-                self.publish_one(&topic.tines_topic, name, now)?;
-            }
+        // Publish the latest observation for every managed topic. We only need
+        // each topic's `tines_topic` bytes to look up its latest observation,
+        // so clone them (and the name) into owned locals *before* calling
+        // `publish_one`. That drops the borrow of `self.managed` up front —
+        // holding `&mut self.managed` across the `&mut self` call is the
+        // sibling of the E0502 the reviewer flagged.
+        let managed: Vec<(String, Vec<u8>)> = self
+            .managed
+            .iter()
+            .map(|(name, t)| (name.clone(), t.tines_topic.clone()))
+            .collect();
+        for (name, tines_topic) in managed {
+            self.publish_one(&tines_topic, name, now)?;
         }
         Ok(())
     }
@@ -272,20 +279,23 @@ impl TinesNode {
         name: String,
         now: Tick,
     ) -> Result<(), TinesNodeError> {
-        let topic = self
-            .managed
-            .get_mut(&name)
-            .expect("managed topic still present");
-        if let (Some(publisher), Some(obs)) =
-            (topic.publisher.as_mut(), self.latest_obs(tines_topic, now))
-        {
+        // `latest_obs` takes `&self`, but `topic` below would hold a live
+        // `&mut self.managed` — the E0502 the reviewer flagged. Collect the
+        // latest observation on an immutable borrow that ends here, then take
+        // `&mut self.managed` for only the publish + bookkeeping that follows.
+        let Some(obs) = self.latest_obs(tines_topic, now) else {
+            return Ok(());
+        };
+        if let Some(topic) = self.managed.get_mut(&name) {
             if topic.last_pub == Some(obs.id()) {
                 return Ok(());
             }
             let payload = String::from_utf8_lossy(&obs.payload).into_owned();
             let msg = StrMsg { data: payload };
-            let _ = publisher.publish(&msg);
-            topic.last_pub = Some(obs.id());
+            if let Some(publisher) = topic.publisher.as_mut() {
+                let _ = publisher.publish(&msg);
+                topic.last_pub = Some(obs.id());
+            }
         }
         Ok(())
     }
