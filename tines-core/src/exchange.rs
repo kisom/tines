@@ -101,7 +101,6 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
     /// Obs/Frag frame from a peer via round-robin.
     pub fn next_frame<S: Store>(&mut self, store: &S, mtu: usize, now: Tick, out: &mut [u8]) -> Option<(A, usize)> {
         let me = self.me;
-
         // Priority 1: a summary is due for some peer.
         for peer in self.peers.iter_mut() {
             if !summary_due(peer, now) {

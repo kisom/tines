@@ -248,7 +248,7 @@ mod tests {
     fn duplicate_fragment_is_harmless() {
         let obs = obs_with_payload([4; 16], 1024);
         let mut frames: Vec<Vec<u8>> = Vec::new();
-        let n = fragment([4; 16], &obs, 200, &mut |b| frames.push(b.to_vec()))
+        let _ = fragment([4; 16], &obs, 200, &mut |b| frames.push(b.to_vec()))
             .expect("fragment large obs");
         let frags: Vec<(ObservationId, u8, u8, Vec<u8>)> = frames
             .iter()
@@ -266,8 +266,8 @@ mod tests {
         // feed index 0 twice
         r.feed(*id0, *idx0, *cnt0, data0, 0);
         r.feed(*id0, *idx0, *cnt0, data0, 0);
-        for i in 1..n as usize {
-            let (id, index, count, data) = &frags[i];
+        for item in &frags[1..] {
+            let (id, index, count, data) = item;
             last = r.feed(*id, *index, *count, data, 0);
         }
         let reassembled = last.expect("reassembled obs");
@@ -278,7 +278,7 @@ mod tests {
     fn wrong_count_is_dropped() {
         let obs = obs_with_payload([5; 16], 1024);
         let mut frames: Vec<Vec<u8>> = Vec::new();
-        let n = fragment([5; 16], &obs, 200, &mut |b| frames.push(b.to_vec()))
+        let _ = fragment([5; 16], &obs, 200, &mut |b| frames.push(b.to_vec()))
             .expect("fragment large obs");
         let frags: Vec<(ObservationId, u8, u8, Vec<u8>)> = frames
             .iter()
@@ -292,8 +292,7 @@ mod tests {
             .collect();
         let mut r = Reassembler::new();
         let mut got_some = false;
-        for i in 0..n as usize {
-            let (id, index, _count, data) = &frags[i];
+        for (id, index, _count, data) in &frags {
             // The changing count keeps resetting the slot, so fragments never
             // accumulate and the stream can never complete (no panic).
             let a = r.feed(*id, *index, 2, data, 0);
@@ -331,7 +330,7 @@ mod tests {
                 }
             })
             .collect();
-        assert_eq!(frags.len(), n as usize);
+        assert_eq!(frags.len(), n);
         let mut r = Reassembler::new();
         let (id0, idx0, cnt0, data0) = &frags[0];
         // feed index 0 at now=0 (incomplete)
@@ -357,7 +356,7 @@ mod tests {
     fn reassembled_bytes_must_match_id() {
         let obs = obs_with_payload([8; 16], 1024);
         let mut frames: Vec<Vec<u8>> = Vec::new();
-        let n = fragment([8; 16], &obs, 200, &mut |b| frames.push(b.to_vec()))
+        let _ = fragment([8; 16], &obs, 200, &mut |b| frames.push(b.to_vec()))
             .expect("fragment large obs");
         let mut frags: Vec<(ObservationId, u8, u8, Vec<u8>)> = frames
             .iter()
@@ -373,8 +372,7 @@ mod tests {
         frags[0].3[0] ^= 0xFF;
         let mut r = Reassembler::new();
         let mut last: Option<Observation> = None;
-        for i in 0..n as usize {
-            let (id, index, count, data) = &frags[i];
+        for (id, index, count, data) in &frags {
             last = r.feed(*id, *index, *count, data, 0);
         }
         assert!(last.is_none(), "corrupted reassembly must not yield an obs");

@@ -12,7 +12,9 @@
 pub mod trace;
 pub mod world;
 pub mod transport;
+pub mod sim;
 
+pub use sim::{Sim, SimNode};
 pub use trace::{Contact, ContactTrace};
 pub use transport::SimTransport;
 pub use world::{SimWorld, WorldConfig};

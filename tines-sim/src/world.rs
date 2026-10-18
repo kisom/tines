@@ -33,6 +33,12 @@ pub struct SimWorld {
     pub(crate) trace: ContactTrace,
     pub(crate) inboxes: Vec<VecDeque<Event<usize>>>,
     pub(crate) prev_t: u64,
+    /// Whether the world has been advanced at least once. Until the first
+    /// `advance`, contact windows that are already active at t=0 have no
+    /// transition to fire on, so the first advance emits a `Contact` for every
+    /// pair that is already in contact (a contact "alive" at sim start is
+    /// treated as having just made contact).
+    pub(crate) primed: bool,
     pub(crate) rng: StdRng,
     pub(crate) frames_sent: u64,
     pub(crate) frames_dropped: u64,
@@ -48,6 +54,7 @@ impl SimWorld {
             trace,
             inboxes,
             prev_t: 0,
+            primed: false,
             rng: StdRng::seed_from_u64(seed),
             frames_sent: 0,
             frames_dropped: 0,
@@ -57,7 +64,22 @@ impl SimWorld {
 
     /// Advance the world to time `t`, emitting `Contact`/`Lost` for every pair
     /// whose contact state changed since the previous advance.
+    ///
+    /// On the very first advance, every pair already in contact is seeded with
+    /// a `Contact`: a contact window that predates the first advance has no
+    /// transition to react to, so without this the peers would never be added.
     pub fn advance(&mut self, t: u64) {
+        if !self.primed {
+            self.primed = true;
+            for a in 0..self.cfg.nodes {
+                for b in (a + 1)..self.cfg.nodes {
+                    if self.trace.in_contact(a, b, self.prev_t) {
+                        self.inboxes[a].push_back(Event::Contact(b));
+                        self.inboxes[b].push_back(Event::Contact(a));
+                    }
+                }
+            }
+        }
         for a in 0..self.cfg.nodes {
             for b in (a + 1)..self.cfg.nodes {
                 let old = self.trace.in_contact(a, b, self.prev_t);
