@@ -1,10 +1,15 @@
 [package]
 name = "tines-core"
-version = "0.2.0"
-edition = "2021"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Opportunistic shared memory for mostly-offline robots: a no_std core of content-addressed observations, gossip, and store-and-forward exchange."
-authors = ["K. Isom"]
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/tines-core"
+keywords = ["robotics", "gossip", "delay-tolerant", "no-std", "sync"]
+categories = ["no-std", "embedded", "network-programming", "science::robotics"]
 
 [features]
 default = ["alloc"]

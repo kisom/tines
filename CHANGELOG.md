@@ -4,6 +4,14 @@ All notable changes to the tines crates. Versions follow
 [Semantic Versioning](https://semver.org/); before 1.0, a minor bump may break
 the API.
 
+## 0.2.1 — 2026-10-18
+
+### Changed
+
+- Package metadata only: `repository`, `documentation`, `readme`,
+  `keywords` and `categories`, shared through `[workspace.package]`. The
+  README now appears on crates.io.
+
 ## 0.2.0 — 2026-10-18
 
 Hardening from a full-codebase review. Wire-compatible with 0.1.0 except
