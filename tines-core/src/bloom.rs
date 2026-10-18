@@ -9,6 +9,12 @@
 //!
 //! This type is `core`-only: it owns a fixed `[u8; SUMMARY_BYTES]` array and
 //! never touches the heap, so it compiles in `no_std` without `alloc`.
+//!
+//! A filter can be *folded* to any power-of-two size up to `SUMMARY_BYTES` so a
+//! summary fits a narrow link's MTU. Folding ORs the upper half onto the lower
+//! half; because every capacity is a power of two, a bit index reduced modulo
+//! the full capacity and then modulo the folded one lands on the same bit, so
+//! a folded filter keeps every member at the cost of more false positives.
 
 use crate::consts;
 use crate::observation::ObservationId;
@@ -18,6 +24,8 @@ use crate::observation::ObservationId;
 pub struct Bloom {
     pub salt: u32,
     bits: [u8; consts::SUMMARY_BYTES],
+    /// Bytes in use: a power of two in `1..=SUMMARY_BYTES`.
+    len: usize,
 }
 
 impl Bloom {
@@ -26,37 +34,72 @@ impl Bloom {
         Bloom {
             salt,
             bits: [0u8; consts::SUMMARY_BYTES],
+            len: consts::SUMMARY_BYTES,
         }
     }
 
     /// Sets the `BLOOM_K` bits for `id`.
     pub fn insert(&mut self, id: &ObservationId) {
-        for idx in positions(self.salt, id) {
+        for idx in positions(self.salt, id, self.len) {
             self.bits[idx / 8] |= 1 << (idx % 8);
         }
     }
 
     /// Returns `true` if `id` may have been inserted (all of its bits are set).
     pub fn might_contain(&self, id: &ObservationId) -> bool {
-        positions(self.salt, id)
+        positions(self.salt, id, self.len)
             .iter()
             .all(|idx| self.bits[idx / 8] & (1 << (idx % 8)) != 0)
     }
 
     /// Rebuilds a `Bloom` from its raw parts.
     ///
-    /// Returns `None` unless `bits` is exactly `SUMMARY_BYTES` long, so a caller
-    /// deserializing from an untrusted source cannot construct a filter from a
-    /// truncated or oversized backing array.
+    /// Returns `None` unless `bits.len()` is a power of two no larger than
+    /// `SUMMARY_BYTES` (a full or folded filter), so a caller deserializing
+    /// from an untrusted source cannot construct a filter from a truncated or
+    /// oversized backing array.
     pub fn from_parts(salt: u32, bits: &[u8]) -> Option<Self> {
-        let bytes: [u8; consts::SUMMARY_BYTES] = bits.try_into().ok()?;
-        Some(Bloom { salt, bits: bytes })
+        if !valid_len(bits.len()) {
+            return None;
+        }
+        let mut bytes = [0u8; consts::SUMMARY_BYTES];
+        bytes[..bits.len()].copy_from_slice(bits);
+        Some(Bloom {
+            salt,
+            bits: bytes,
+            len: bits.len(),
+        })
+    }
+
+    /// Returns this filter folded down to `bytes` bytes, or `None` unless
+    /// `bytes` is a power of two no larger than the current size.
+    ///
+    /// Every id the filter contains is still contained after folding.
+    pub fn fold(&self, bytes: usize) -> Option<Bloom> {
+        if !valid_len(bytes) || bytes > self.len {
+            return None;
+        }
+        let mut out = [0u8; consts::SUMMARY_BYTES];
+        for (i, b) in self.bits[..self.len].iter().enumerate() {
+            out[i % bytes] |= b;
+        }
+        Some(Bloom {
+            salt: self.salt,
+            bits: out,
+            len: bytes,
+        })
     }
 
     /// Returns the raw backing bit array as a slice.
     pub fn bits(&self) -> &[u8] {
-        &self.bits
+        &self.bits[..self.len]
     }
+}
+
+/// Returns `true` for a filter size in bytes that `positions` supports: a power
+/// of two no larger than `SUMMARY_BYTES`.
+fn valid_len(bytes: usize) -> bool {
+    bytes.is_power_of_two() && bytes <= consts::SUMMARY_BYTES
 }
 
 /// Computes the `BLOOM_K` bit indices for `id` under `salt` using the pinned
@@ -72,9 +115,12 @@ impl Bloom {
 /// h1 = fmix64(a)
 /// h2 = fmix64(b) | 1
 /// capacity = SUMMARY_BYTES * 8
-/// bit_index = (h1 + k * h2) % capacity
+/// bit_index = ((h1 + k * h2) % capacity) % (len * 8)
 /// ```
-fn positions(salt: u32, id: &ObservationId) -> [usize; consts::BLOOM_K] {
+///
+/// `len` is the filter size in bytes; the second reduction is a no-op for a
+/// full-size filter and matches [`Bloom::fold`] for a folded one.
+fn positions(salt: u32, id: &ObservationId, len: usize) -> [usize; consts::BLOOM_K] {
     fn fmix64(mut x: u64) -> u64 {
         x ^= x >> 33;
         x = x.wrapping_mul(0xff51afd7ed558ccd);
@@ -95,7 +141,7 @@ fn positions(salt: u32, id: &ObservationId) -> [usize; consts::BLOOM_K] {
     let capacity = (consts::SUMMARY_BYTES * 8) as u64;
     let mut out = [0usize; consts::BLOOM_K];
     for (k, slot) in out.iter_mut().enumerate() {
-        *slot = ((h1.wrapping_add((k as u64).wrapping_mul(h2))) % capacity) as usize;
+        *slot = ((h1.wrapping_add((k as u64).wrapping_mul(h2))) % capacity) as usize % (len * 8);
     }
     out
 }
@@ -228,5 +274,32 @@ mod tests {
         let bloom = Bloom::from_parts(9, &raw).expect("correct-length bits must build");
         assert_eq!(bloom.salt, 9);
         assert_eq!(bloom.bits(), &raw[..]);
+    }
+
+    #[test]
+    fn folded_filter_keeps_members_and_round_trips() {
+        let mut bloom = Bloom::new(11);
+        let mut rng = Rng::new(6);
+        let ids: [ObservationId; 50] = std::array::from_fn(|_| rng.id());
+        for id in &ids {
+            bloom.insert(id);
+        }
+        for bytes in [consts::SUMMARY_BYTES, 256, 128, 64, 1] {
+            let folded = bloom.fold(bytes).expect("power-of-two fold");
+            assert_eq!(folded.bits().len(), bytes);
+            // A folded filter decoded from the wire answers the same way.
+            let wire = Bloom::from_parts(11, folded.bits()).expect("folded length accepted");
+            for id in &ids {
+                assert!(folded.might_contain(id), "fold to {bytes} lost a member");
+                assert!(
+                    wire.might_contain(id),
+                    "decoded fold to {bytes} lost a member"
+                );
+            }
+        }
+        // Folding is only defined for power-of-two sizes no larger than the filter.
+        assert!(bloom.fold(0).is_none());
+        assert!(bloom.fold(100).is_none());
+        assert!(bloom.fold(consts::SUMMARY_BYTES * 2).is_none());
     }
 }

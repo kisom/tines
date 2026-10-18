@@ -11,7 +11,6 @@ use rand::Rng;
 use std::cell::RefCell;
 use std::rc::Rc;
 use tines_core::transport::{Event, FrameBuf, SendError, Transport};
-use tines_core::Frame;
 
 /// A node's view of a shared `SimWorld`.
 pub struct SimTransport {
@@ -39,17 +38,12 @@ impl Transport for SimTransport {
     /// Order of checks: reachability, then MTU, then the loss roll. A frame that
     /// survives loss is enqueued; a surviving frame is duplicated with the dup
     /// roll (counting each enqueue toward `frames_sent`).
-    ///
-    /// Summary frames are control messages that carry no wire fragmentation: the
-    /// core emits a fixed-size bloom summary that can exceed a small link MTU,
-    /// so control frames are exempt from the per-frame MTU check that governs
-    /// data (`Obs`/`Frag`) frames.
     fn send(&mut self, to: &Self::Addr, frame: &[u8]) -> Result<(), SendError> {
         let mut w = self.world.borrow_mut();
         if !w.trace.in_contact(self.me, *to, w.prev_t) {
             return Err(SendError::Unreachable);
         }
-        if frame.len() > w.cfg.mtu && !matches!(Frame::decode(frame), Ok(Frame::Summary { .. })) {
+        if frame.len() > w.cfg.mtu {
             return Err(SendError::TooLarge);
         }
         if w.rng.gen::<f64>() < w.cfg.loss {

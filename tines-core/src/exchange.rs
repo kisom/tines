@@ -12,7 +12,9 @@
 //! turns any malformed input into an `Err` that the caller drops.
 
 use crate::consts;
-use crate::{Bloom, Event, Frame, NodeId, Observation, ObservationId, Reassembler, Store, Tick};
+use crate::{
+    Bloom, Event, Frame, NodeId, Observation, ObservationId, Reassembler, SendError, Store, Tick,
+};
 use heapless::Vec;
 
 /// The maximum number of fragments an observation may be split into.
@@ -20,6 +22,32 @@ use heapless::Vec;
 /// Matches [`crate::fragment`]: the reassembler tracks up to 64 indices via a
 /// bitset, so `count` is capped at 64 on both ends.
 const MAX_FRAGMENTS: usize = 64;
+
+/// Worst-case bytes a [`Frame::Summary`] adds around its bloom bits: the
+/// variant tag (1), `from` (16), `salt` as a varint (up to 5), and the bits
+/// length as a varint (up to 2).
+const SUMMARY_OVERHEAD: usize = 24;
+
+/// A fragmented observation part-way through transmission to one peer.
+///
+/// Every fragment of a stream is cut from the same encoding: the age is frozen
+/// when the first fragment goes out, and `len`/`count` let a later fragment
+/// detect that the stored observation no longer encodes the same way (or the
+/// MTU changed). The stream is then abandoned and restarted rather than
+/// sending bytes the receiver cannot reassemble.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InFlight {
+    /// The observation being fragmented.
+    pub id: ObservationId,
+    /// Index of the next fragment to send.
+    pub next: u8,
+    /// Total fragments in the stream.
+    pub count: u8,
+    /// `age_ms` the stream was encoded with.
+    pub age_ms: u64,
+    /// Length of the encoded observation the fragments are cut from.
+    pub len: usize,
+}
 
 /// A single peer the [`Exchange`] is tracking.
 pub struct Peer<A> {
@@ -36,8 +64,15 @@ pub struct Peer<A> {
     pub last_summary_sent: Option<Tick>,
     /// Reassembler for inbound fragmented streams from this peer.
     pub reassembler: Reassembler,
-    /// An observation currently mid-fragmentation: `(id, next fragment index)`.
-    pub in_flight: Option<(ObservationId, u8)>,
+    /// An observation currently mid-fragmentation to this peer. It is finished
+    /// before any other observation is sent to the peer.
+    pub in_flight: Option<InFlight>,
+    /// Whether the next new observation for this peer should come from the
+    /// broadcast diff rather than custody, so neither starves the other.
+    prefer_broadcast: bool,
+    /// The last addressed id started for this peer. Custody resumes after it,
+    /// so every candidate gets a turn even when the bounce table overflows.
+    custody_cursor: Option<ObservationId>,
 }
 
 impl<A> Peer<A> {
@@ -53,8 +88,26 @@ impl<A> Peer<A> {
             last_summary_sent: None,
             reassembler: Reassembler::new(),
             in_flight: None,
+            prefer_broadcast: false,
+            custody_cursor: None,
         }
     }
+}
+
+/// The bookkeeping [`Exchange::next_frame`] changed for the frame it last
+/// produced, kept so [`Exchange::on_send_error`] can put it back.
+struct Undo<A> {
+    addr: A,
+    salt: u32,
+    /// `Some(previous)` when the frame was a summary.
+    last_summary_sent: Option<Option<Tick>>,
+    in_flight: Option<InFlight>,
+    prefer_broadcast: bool,
+    custody_cursor: Option<ObservationId>,
+    /// `(position, id)` removed from the send queue.
+    requeue: Option<(usize, ObservationId)>,
+    /// Id whose `(id, addr)` bounce record this frame added.
+    bounce: Option<ObservationId>,
 }
 
 /// The exchange state machine, tracking up to [`consts::MAX_PEERS`] peers.
@@ -63,13 +116,17 @@ pub struct Exchange<A> {
     salt: u32,
     peers: Vec<Peer<A>, { consts::MAX_PEERS }>,
     rr: usize,
-    /// `(id, addr)` of each inbound-addressed message **or** each message
-    /// forwarded through this exchange: `(id, addr)`. [`Exchange::next_frame`]
-    /// uses it to stop an addressed message bouncing back to its source (or to
-    /// the peer it was just forwarded to, i.e. delivering it at most once).
-    /// Bounded at `SEND_QUEUE_CAP`: on overflow the oldest records drop, so
-    /// suppression only weakens — it never fails closed on a `no_std` target.
+    /// `(id, addr)` for each addressed message received from, or fully sent
+    /// to, `addr` during its current contact. [`Exchange::next_frame`] uses it
+    /// so an addressed message is offered to each peer at most once per contact
+    /// and never bounced straight back to its source. Records for an address
+    /// are dropped when its contact starts or ends. Bounded at
+    /// `SEND_QUEUE_CAP`: on overflow the oldest record is evicted, so
+    /// suppression only weakens (ID dedup absorbs a repeat) and never fails
+    /// closed on a `no_std` target.
     bounce: Vec<(ObservationId, A), { consts::SEND_QUEUE_CAP }>,
+    /// How to undo the last frame [`Exchange::next_frame`] produced.
+    undo: Option<Undo<A>>,
 }
 
 impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
@@ -81,6 +138,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
             peers: Vec::new(),
             rr: 0,
             bounce: Vec::new(),
+            undo: None,
         }
     }
 
@@ -108,10 +166,16 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
     }
 
     /// Produces at most one outbound frame, writing its bytes into `out` and
-    /// returning the destination address and byte count.
+    /// returning the destination address and byte count. The frame is never
+    /// longer than `mtu`.
     ///
     /// Priority: (1) send a Summary to any peer due for one, then (2) emit one
-    /// Obs/Frag frame from a peer via round-robin.
+    /// Obs/Frag frame from a peer via round-robin. Within a peer, a fragment
+    /// stream in flight is finished first; otherwise custody (addressed) and
+    /// broadcast observations take turns.
+    ///
+    /// The exchange's state assumes the frame is sent. If the transport
+    /// refuses it, call [`Exchange::on_send_error`] before the next call.
     pub fn next_frame<S: Store>(
         &mut self,
         store: &S,
@@ -119,24 +183,40 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         now: Tick,
         out: &mut [u8],
     ) -> Option<(A, usize)> {
+        self.undo = None;
         let me = self.me;
         // Priority 1: a summary is due for some peer.
         for peer in self.peers.iter_mut() {
             if !summary_due(peer, now) {
                 continue;
             }
+            // A link too narrow for even a 1-byte filter cannot carry summaries.
+            let Some(bytes) = summary_bytes(mtu) else {
+                break;
+            };
             let mut bloom = Bloom::new(self.salt);
             store.for_each_broadcast_id(&mut |id| bloom.insert(id));
-            let bits = match Vec::<u8, { consts::SUMMARY_BYTES }>::from_slice(bloom.bits()) {
-                Ok(bits) => bits,
-                Err(_) => return None,
-            };
+            let bloom = bloom.fold(bytes)?;
+            let bits = Vec::<u8, { consts::SUMMARY_BYTES }>::from_slice(bloom.bits()).ok()?;
             let frame = Frame::Summary {
                 from: me,
                 salt: self.salt,
                 bits,
             };
             let n = frame.encode(out).ok()?;
+            if n > mtu {
+                break;
+            }
+            self.undo = Some(Undo {
+                addr: peer.addr.clone(),
+                salt: self.salt,
+                last_summary_sent: Some(peer.last_summary_sent),
+                in_flight: peer.in_flight,
+                prefer_broadcast: peer.prefer_broadcast,
+                custody_cursor: peer.custody_cursor,
+                requeue: None,
+                bounce: None,
+            });
             peer.last_summary_sent = Some(now);
             self.salt = self.salt.wrapping_add(1);
             return Some((peer.addr.clone(), n));
@@ -150,88 +230,198 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         for _ in 0..len {
             let idx = self.rr % len;
             self.rr = self.rr.wrapping_add(1);
-            // Snapshot the peer's id/addr before the mutable borrow in
-            // `emit_one`/`forward_addressed`; the immutable bounce lookup below
-            // must not conflict with the mutable peer borrow.
-            let recipient = self.peers[idx].id;
-            let addr = self.peers[idx].addr.clone();
-            // Addressed store-and-forward (one frame): deliver to a known
-            // recipient, else epidemic-forward — attempted before broadcast so
-            // the broadcast diff is never starved when there is no addressed
-            // work to do.
-            if let Some(res) =
-                self.forward_addressed(me, idx, recipient, addr, store, mtu, now, out)
-            {
-                return Some(res);
-            }
-            let peer = &mut self.peers[idx];
-            if let Some(res) = emit_one(me, peer, store, mtu, now, out) {
+            if let Some(res) = self.emit_for_peer(idx, store, mtu, now, out) {
                 return Some(res);
             }
         }
         None
     }
 
-    /// Addressed store-and-forward for the peer at `idx`: emit one `Obs` frame
-    /// carrying an addressed observation, preferring *delivery*
-    /// (`to == peer.id`) over *epidemic* forwarding (`to == Some(other != me)`).
+    /// Reverts the bookkeeping for the frame the last
+    /// [`Exchange::next_frame`] produced, after the transport failed to send
+    /// it.
     ///
-    /// Never emits if the peer's id is unknown, equals `me`, or every candidate
-    /// was already forwarded to (or received from) this peer — in which case it
-    /// returns `None` so the caller falls through to broadcast `emit_one`.
-    #[allow(clippy::too_many_arguments)]
-    fn forward_addressed<S: Store>(
+    /// For `Busy` and `Unreachable` the next call produces the same frame
+    /// again: a summary stays due, an observation or fragment stays queued, and
+    /// an addressed message is not counted as delivered. `TooLarge` is final —
+    /// a frame the transport can never carry is dropped rather than retried on
+    /// every poll.
+    pub fn on_send_error(&mut self, err: &SendError) {
+        let Some(undo) = self.undo.take() else {
+            return;
+        };
+        if *err == SendError::TooLarge {
+            return;
+        }
+        self.salt = undo.salt;
+        if let Some(id) = undo.bounce {
+            if let Some(pos) = self
+                .bounce
+                .iter()
+                .position(|(b, a)| *b == id && *a == undo.addr)
+            {
+                self.bounce.remove(pos);
+            }
+        }
+        let Some(peer) = self.peers.iter_mut().find(|p| p.addr == undo.addr) else {
+            return;
+        };
+        if let Some(prev) = undo.last_summary_sent {
+            peer.last_summary_sent = prev;
+        }
+        peer.in_flight = undo.in_flight;
+        peer.prefer_broadcast = undo.prefer_broadcast;
+        peer.custody_cursor = undo.custody_cursor;
+        if let Some((pos, id)) = undo.requeue {
+            if !peer.send_queue.contains(&id) {
+                let pos = pos.min(peer.send_queue.len());
+                let _ = peer.send_queue.insert(pos, id);
+            }
+        }
+    }
+
+    /// Emits at most one Obs/Frag frame for the peer at `idx`.
+    fn emit_for_peer<S: Store>(
         &mut self,
-        me: NodeId,
         idx: usize,
-        recipient: Option<NodeId>,
-        addr: A,
         store: &S,
         mtu: usize,
         now: Tick,
         out: &mut [u8],
     ) -> Option<(A, usize)> {
-        let recipient = recipient?;
+        // Finish the stream in flight first: starting another observation
+        // would abandon it part-way. An observation that has since been
+        // trimmed or expired, or that no longer encodes as the stream began,
+        // is abandoned (and restarted from fragment 0 if still wanted).
+        if let Some(f) = self.peers[idx].in_flight {
+            if let Some(obs) = store.get(&f.id, now).filter(|o| !reject(o)) {
+                if let Some(res) = self.emit(idx, f.id, &obs, Some(f), mtu, out) {
+                    return Some(res);
+                }
+            }
+            self.peers[idx].in_flight = None;
+        }
+
+        // Custody and broadcast take turns, so neither starves the other.
+        let broadcast_first = self.peers[idx].prefer_broadcast;
+        for broadcast in [broadcast_first, !broadcast_first] {
+            let res = if broadcast {
+                self.emit_broadcast(idx, store, mtu, now, out)
+            } else {
+                self.forward_addressed(idx, store, mtu, now, out)
+            };
+            if res.is_some() {
+                self.peers[idx].prefer_broadcast = !broadcast;
+                return res;
+            }
+        }
+        None
+    }
+
+    /// Starts sending the front of the peer's broadcast send queue, dropping
+    /// ids that are no longer stored or cannot be sent at this MTU.
+    fn emit_broadcast<S: Store>(
+        &mut self,
+        idx: usize,
+        store: &S,
+        mtu: usize,
+        now: Tick,
+        out: &mut [u8],
+    ) -> Option<(A, usize)> {
+        loop {
+            let front = *self.peers[idx].send_queue.first()?;
+            if let Some(obs) = store.get(&front, now) {
+                if let Some(res) = self.emit(idx, front, &obs, None, mtu, out) {
+                    return Some(res);
+                }
+            }
+            self.peers[idx].send_queue.remove(0);
+        }
+    }
+
+    /// Addressed store-and-forward for the peer at `idx`: start sending one
+    /// addressed observation, preferring *delivery* (`to == peer.id`) over
+    /// *epidemic* forwarding (`to == Some(other != me)`).
+    ///
+    /// Never emits if the peer's id is unknown or equals `me`. Candidates that
+    /// were already exchanged with this peer this contact, or that cannot be
+    /// sent at this MTU, are skipped; the rest are taken in id order, resuming
+    /// after the last one started for this peer. Returns `None` when nothing
+    /// qualifies.
+    fn forward_addressed<S: Store>(
+        &mut self,
+        idx: usize,
+        store: &S,
+        mtu: usize,
+        now: Tick,
+        out: &mut [u8],
+    ) -> Option<(A, usize)> {
+        let me = self.me;
+        let recipient = self.peers[idx].id?;
         if recipient == me {
             return None;
         }
-        // Delivery first: an addressed observation addressed exactly to this peer.
-        if let Some(id) = select_addressed(store, now, &self.bounce, &addr, |obs| {
-            obs.to == Some(recipient)
-        }) {
-            return self.emit_selected(me, idx, id, store, mtu, now, out);
-        }
-        // Else epidemic: an addressed observation for some other node.
-        if let Some(id) = select_addressed(store, now, &self.bounce, &addr, |obs| {
-            obs.to.is_some() && obs.to != Some(me)
-        }) {
-            return self.emit_selected(me, idx, id, store, mtu, now, out);
+        let addr = self.peers[idx].addr.clone();
+        let cursor = self.peers[idx].custody_cursor;
+        for deliver in [true, false] {
+            let found = select_addressed(store, now, &self.bounce, &addr, cursor, |id, obs| {
+                let wanted = if deliver {
+                    obs.to == Some(recipient)
+                } else {
+                    obs.to.is_some() && obs.to != Some(me)
+                };
+                // `out` is scratch here; the chosen frame is re-encoded below.
+                wanted && encode_frame(me, *id, obs, None, mtu, out).is_some()
+            });
+            if let Some((id, obs)) = found {
+                let res = self.emit(idx, id, &obs, None, mtu, out);
+                if res.is_some() {
+                    self.peers[idx].custody_cursor = Some(id);
+                }
+                return res;
+            }
         }
         None
     }
 
-    /// Emits one addressed frame for `id` to the peer at `idx` and records
-    /// `(id, peer_addr)` in the bounce table so neither this peer nor the
-    /// message's source receives it again. Returns `None` if the obs is gone
-    /// or does not fit the MTU.
-    #[allow(clippy::too_many_arguments)]
-    fn emit_selected<S: Store>(
+    /// Encodes the next frame of `obs` for the peer at `idx` (see
+    /// [`encode_frame`]) and records what it changes. Once the last frame of
+    /// the observation is out, `id` leaves the peer's send queue and, if
+    /// addressed, is recorded as exchanged with this peer.
+    fn emit(
         &mut self,
-        me: NodeId,
         idx: usize,
         id: ObservationId,
-        store: &S,
+        obs: &Observation,
+        resume: Option<InFlight>,
         mtu: usize,
-        now: Tick,
         out: &mut [u8],
     ) -> Option<(A, usize)> {
-        let res = {
-            let peer = &mut self.peers[idx];
-            let obs = store.get(&id, now)?;
-            emit_fragment(me, peer, id, 0, obs, mtu, out)?
+        let (n, next) = encode_frame(self.me, id, obs, resume, mtu, out)?;
+        let peer = &mut self.peers[idx];
+        let addr = peer.addr.clone();
+        let mut undo = Undo {
+            addr: addr.clone(),
+            salt: self.salt,
+            last_summary_sent: None,
+            in_flight: peer.in_flight,
+            prefer_broadcast: peer.prefer_broadcast,
+            custody_cursor: peer.custody_cursor,
+            requeue: None,
+            bounce: None,
         };
-        let _ = self.bounce.push((id, res.0.clone()));
-        Some(res)
+        peer.in_flight = next;
+        if next.is_none() {
+            if let Some(pos) = peer.send_queue.iter().position(|&x| x == id) {
+                peer.send_queue.remove(pos);
+                undo.requeue = Some((pos, id));
+            }
+            if obs.to.is_some() && record_bounce(&mut self.bounce, id, addr.clone()) {
+                undo.bounce = Some(id);
+            }
+        }
+        self.undo = Some(undo);
+        Some((addr, n))
     }
 
     /// Returns the current peers.
@@ -243,6 +433,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         if self.peers.iter().any(|p| p.addr == addr) {
             return;
         }
+        self.forget_bounces(&addr);
         if self.peers.len() < consts::MAX_PEERS {
             let _ = self.peers.push(Peer::new(addr));
         }
@@ -252,18 +443,24 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         if let Some(idx) = self.peers.iter().position(|p| p.addr == *addr) {
             self.peers.remove(idx);
         }
+        self.forget_bounces(addr);
     }
 
-    /// Returns a mutable reference to the peer at `addr`, adding it as an
-    /// implicit contact if unknown and the table is not full.
-    fn get_peer_mut(&mut self, addr: &A) -> Option<&mut Peer<A>> {
+    /// Drops the bounce records for `addr`: suppression lasts one contact.
+    fn forget_bounces(&mut self, addr: &A) {
+        self.bounce.retain(|(_, a)| a != addr);
+    }
+
+    /// Returns the index of the peer at `addr`, adding it as an implicit
+    /// contact if unknown and the table is not full.
+    fn peer_index(&mut self, addr: &A) -> Option<usize> {
         if let Some(idx) = self.peers.iter().position(|p| &p.addr == addr) {
-            return self.peers.get_mut(idx);
+            return Some(idx);
         }
         if self.peers.len() < consts::MAX_PEERS {
+            self.forget_bounces(addr);
             let _ = self.peers.push(Peer::new(addr.clone()));
-            let idx = self.peers.len() - 1;
-            return self.peers.get_mut(idx);
+            return Some(self.peers.len() - 1);
         }
         None
     }
@@ -279,7 +476,8 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
             Ok(frame) => frame,
             Err(_) => return None,
         };
-        let peer = self.get_peer_mut(&addr)?;
+        let idx = self.peer_index(&addr)?;
+        let peer = &mut self.peers[idx];
         peer.id = Some(frame.sender());
         match frame {
             Frame::Summary { salt, bits, .. } => {
@@ -287,26 +485,9 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                     peer.their_summary = Some(bloom);
                     rebuild_send_queue(peer, &*store, now);
                 }
+                None
             }
-            Frame::Obs { from: _, obs } => {
-                if reject(&obs) {
-                    return None;
-                }
-                let returned = obs.clone();
-                let id = obs.id();
-                // A newly-stored addressed message is recorded so it can never
-                // be forwarded back to the peer it came from.
-                let addressed = obs.to.is_some();
-                return match store.insert(obs, now) {
-                    Ok(true) => {
-                        if addressed {
-                            let _ = self.bounce.push((id, addr));
-                        }
-                        Some(returned)
-                    }
-                    Ok(false) | Err(_) => None,
-                };
-            }
+            Frame::Obs { from: _, obs } => self.accept(obs, addr, store, now),
             Frame::Frag {
                 from: _,
                 id,
@@ -314,28 +495,38 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                 count,
                 data,
             } => {
-                if let Some(obs) = peer.reassembler.feed(id, index, count, &data, now) {
-                    if reject(&obs) {
-                        return None;
-                    }
-                    let returned = obs.clone();
-                    // A reassembled addressed message is recorded so it can
-                    // never be forwarded back to the peer it came from.
-                    let oid = obs.id();
-                    let addressed = obs.to.is_some();
-                    return match store.insert(obs, now) {
-                        Ok(true) => {
-                            if addressed {
-                                let _ = self.bounce.push((oid, addr));
-                            }
-                            Some(returned)
-                        }
-                        Ok(false) | Err(_) => None,
-                    };
-                }
+                let obs = peer.reassembler.feed(id, index, count, &data, now)?;
+                self.accept(obs, addr, store, now)
             }
         }
-        None
+    }
+
+    /// Stores an observation received from `addr`, returning it if it was new.
+    ///
+    /// An addressed message is recorded against `addr` whether it was new or
+    /// a duplicate: the sender evidently holds it, so it is never offered back
+    /// this contact.
+    fn accept<S: Store>(
+        &mut self,
+        obs: Observation,
+        addr: A,
+        store: &mut S,
+        now: Tick,
+    ) -> Option<Observation> {
+        if reject(&obs) {
+            return None;
+        }
+        let id = obs.id();
+        let addressed = obs.to.is_some();
+        let returned = obs.clone();
+        let res = store.insert(obs, now);
+        if addressed && res.is_ok() {
+            record_bounce(&mut self.bounce, id, addr);
+        }
+        match res {
+            Ok(true) => Some(returned),
+            Ok(false) | Err(_) => None,
+        }
     }
 }
 
@@ -348,6 +539,21 @@ fn summary_due<A>(peer: &Peer<A>, now: Tick) -> bool {
     }
 }
 
+/// The largest bloom size, in bytes, whose Summary frame fits in `mtu`: a
+/// power of two (see [`Bloom::fold`]) no larger than `SUMMARY_BYTES`. Narrower
+/// links get a smaller filter, which only raises the false-positive rate —
+/// a delayed propagation, never an inconsistency, and salt rotation varies
+/// which ids are affected on each round.
+fn summary_bytes(mtu: usize) -> Option<usize> {
+    let room = mtu
+        .saturating_sub(SUMMARY_OVERHEAD)
+        .min(consts::SUMMARY_BYTES);
+    if room == 0 {
+        return None;
+    }
+    Some(1 << (usize::BITS - 1 - room.leading_zeros()))
+}
+
 /// Returns `true` when a received [`Observation`] must be dropped before it is
 /// stored: either its addressing is malformed, or it is an addressed message
 /// whose age has passed its lifetime.
@@ -358,154 +564,162 @@ fn summary_due<A>(peer: &Peer<A>, now: Tick) -> bool {
 /// well-formed addressed message is rejected once its age exceeds its
 /// lifetime. Broadcasts (`to = None`, `lifetime_ms = None`) are never rejected.
 fn reject(obs: &Observation) -> bool {
-    if obs.to.is_some() != obs.lifetime_ms.is_some() {
-        return true;
+    match (obs.to, obs.lifetime_ms) {
+        (None, None) => false,
+        (Some(_), Some(lifetime)) => obs.age_ms > lifetime,
+        _ => true,
     }
-    obs.to.is_some() && obs.age_ms > obs.lifetime_ms.unwrap()
 }
 
-/// Finds one non-expired, well-formed addressed observation matching
-/// `predicate`, skipping any id already forwarded to (or received from)
-/// `addr`.
+/// Finds the non-expired, well-formed addressed observation matching
+/// `predicate` with the smallest id after `after`, wrapping round to the
+/// smallest id overall, and skipping any id already exchanged with `addr` this
+/// contact.
 ///
 /// `reject` excludes expired/malformed addressed messages (the expiry
-/// invariant) and `is_sourced` enforces bounce suppression; iteration stops at
-/// the first match. Returns the stored key of the chosen obs, if any.
+/// invariant) and `is_sourced` enforces bounce suppression. `predicate` is
+/// only consulted for an id that would beat the current pick. Returns the
+/// stored key and age-adjusted observation.
 fn select_addressed<S: Store, A: PartialEq>(
     store: &S,
     now: Tick,
     bounce: &[(ObservationId, A)],
     addr: &A,
-    mut predicate: impl FnMut(&Observation) -> bool,
-) -> Option<ObservationId> {
-    let mut found: Option<ObservationId> = None;
+    after: Option<ObservationId>,
+    mut predicate: impl FnMut(&ObservationId, &Observation) -> bool,
+) -> Option<(ObservationId, Observation)> {
+    let mut ahead: Option<(ObservationId, Observation)> = None;
+    let mut wrapped: Option<(ObservationId, Observation)> = None;
     store.for_each_id(&mut |id| {
-        if found.is_some() {
+        let is_ahead = after.is_none_or(|a| *id > a);
+        let beats = |pick: &Option<(ObservationId, Observation)>| {
+            pick.as_ref().is_none_or(|(best, _)| id < best)
+        };
+        let improves = if is_ahead {
+            beats(&ahead)
+        } else {
+            ahead.is_none() && beats(&wrapped)
+        };
+        if !improves || is_sourced(bounce, *id, addr) {
             return;
         }
         let Some(obs) = store.get(id, now) else {
             return;
         };
-        // Never forward an expired/malformed addressed obs (Task 4), and never
-        // forward to a peer the message was already sent to or received from
-        // (bounce suppression).
-        if reject(&obs) || is_sourced(bounce, *id, addr) {
+        if obs.to.is_none() || reject(&obs) || !predicate(id, &obs) {
             return;
         }
-        if predicate(&obs) {
-            found = Some(*id);
+        if is_ahead {
+            ahead = Some((*id, obs));
+        } else {
+            wrapped = Some((*id, obs));
         }
     });
-    found
+    ahead.or(wrapped)
 }
 
 /// Returns `true` when `(id, addr)` has been recorded in the bounce table —
-/// i.e. `id` was received from, or forwarded to, `addr`. A message addressed to
-/// such a peer would just bounce back, so it is skipped.
+/// i.e. `id` was received from, or sent to, `addr` this contact. Offering it
+/// to that peer again would only bounce, so it is skipped.
 fn is_sourced<A: PartialEq>(bounce: &[(ObservationId, A)], id: ObservationId, addr: &A) -> bool {
-    for &(bid, ref baddr) in bounce {
-        if bid == id && baddr == addr {
-            return true;
-        }
-    }
-    false
+    bounce
+        .iter()
+        .any(|(bid, baddr)| *bid == id && baddr == addr)
 }
 
-/// Emits at most one frame for `peer`: continuing an in-flight fragment if one
-/// is pending, otherwise draining the send queue (skipping ids no longer
-/// stored).
-fn emit_one<A: Clone, S: Store>(
+/// Records `(id, addr)` in the bounce table, evicting the oldest record when
+/// full. Returns `true` if a new record was added.
+fn record_bounce<A: PartialEq>(
+    bounce: &mut Vec<(ObservationId, A), { consts::SEND_QUEUE_CAP }>,
+    id: ObservationId,
+    addr: A,
+) -> bool {
+    if is_sourced(bounce, id, &addr) {
+        return false;
+    }
+    if bounce.is_full() {
+        bounce.remove(0);
+    }
+    let _ = bounce.push((id, addr));
+    true
+}
+
+/// Encodes one frame of `obs` (whose id is `id`) into `out`.
+///
+/// Starting a stream (`resume = None`), the whole observation goes out as one
+/// Obs frame if that fits in `mtu`; otherwise fragment 0 of its postcard
+/// encoding. Resuming, fragment `resume.next` is cut from the encoding at the
+/// frozen `resume.age_ms`, so every fragment of a stream comes from identical
+/// bytes even as the observation ages or the clock steps backwards.
+///
+/// Returns the frame length and the stream state to keep — `None` once the
+/// observation's last frame is out. Returns `None` if the observation cannot
+/// be sent at this MTU, or no longer encodes to the length and fragment count
+/// the stream started with.
+fn encode_frame(
     me: NodeId,
-    peer: &mut Peer<A>,
-    store: &S,
+    id: ObservationId,
+    obs: &Observation,
+    resume: Option<InFlight>,
     mtu: usize,
-    now: Tick,
     out: &mut [u8],
-) -> Option<(A, usize)> {
-    // in_flight takes precedence: continue the current fragmentation.
-    if let Some((id, index)) = peer.in_flight {
-        match store.get(&id, now) {
-            Some(obs) => return emit_fragment(me, peer, id, index, obs, mtu, out),
-            None => {
-                peer.in_flight = None;
-                return None;
+) -> Option<(usize, Option<InFlight>)> {
+    if resume.is_none() {
+        let frame = Frame::Obs {
+            from: me,
+            obs: obs.clone(),
+        };
+        if let Ok(n) = frame.encode(out) {
+            if n <= mtu {
+                return Some((n, None));
             }
         }
     }
 
-    while let Some(&front) = peer.send_queue.first() {
-        // A single `get` both checks presence and returns the age-adjusted
-        // observation; a missing id (trimmed elsewhere) is skipped.
-        let Some(obs) = store.get(&front, now) else {
-            peer.send_queue.remove(0);
-            continue;
-        };
-        if let Some(res) = emit_fragment(me, peer, front, 0, obs, mtu, out) {
-            return Some(res);
-        }
-        peer.send_queue.remove(0);
-    }
-    None
-}
-
-/// Emits exactly one frame for `id`: a single Obs frame if it fits in `mtu`,
-/// otherwise one fragment of the postcard-encoded observation. Updates
-/// `in_flight`/`send_queue` state accordingly.
-fn emit_fragment<A: Clone>(
-    me: NodeId,
-    peer: &mut Peer<A>,
-    id: ObservationId,
-    index: u8,
-    obs: Observation,
-    mtu: usize,
-    out: &mut [u8],
-) -> Option<(A, usize)> {
-    // 1. Try the whole Observation as a single Obs frame.
-    let frame = Frame::Obs {
-        from: me,
-        obs: obs.clone(),
+    let age_ms = resume.map_or(obs.age_ms, |f| f.age_ms);
+    let frozen = Observation {
+        age_ms,
+        ..obs.clone()
     };
-    if let Ok(n) = frame.encode(out) {
-        if n <= mtu {
-            peer.send_queue.retain(|&x| x != id);
-            peer.in_flight = None;
-            return Some((peer.addr.clone(), n));
-        }
-    }
-
-    // 2. Otherwise emit a single fragment of the postcard-encoded observation.
     let mut obs_buf = [0u8; consts::MAX_FRAME * 2];
-    let obs_bytes = postcard::to_slice(&obs, &mut obs_buf).ok()?;
+    let obs_bytes = postcard::to_slice(&frozen, &mut obs_buf).ok()?;
     let chunk = mtu.saturating_sub(crate::frag::FRAG_OVERHEAD);
     if chunk == 0 {
         return None;
     }
-    #[allow(clippy::manual_div_ceil)]
-    let count = (obs_bytes.len() + chunk - 1) / chunk;
+    let count = obs_bytes.len().div_ceil(chunk);
     if count == 0 || count > MAX_FRAGMENTS {
         return None;
     }
+    let index = match resume {
+        Some(f) if f.len != obs_bytes.len() || usize::from(f.count) != count => return None,
+        Some(f) => f.next,
+        None => 0,
+    };
 
-    let start = (index as usize).saturating_mul(chunk);
+    let start = usize::from(index) * chunk;
     let end = core::cmp::min(start + chunk, obs_bytes.len());
-    let data = &obs_bytes[start..end];
-    let frag_data = Vec::<u8, { consts::MAX_FRAME }>::from_slice(data).ok()?;
+    let data = obs_bytes.get(start..end)?;
     let frame = Frame::Frag {
         from: me,
         id,
         index,
         count: count as u8,
-        data: frag_data,
+        data: Vec::from_slice(data).ok()?,
     };
     let n = frame.encode(out).ok()?;
-
-    if (index as u32).wrapping_add(1) >= count as u32 {
-        peer.send_queue.retain(|&x| x != id);
-        peer.in_flight = None;
-    } else {
-        peer.in_flight = Some((id, index.wrapping_add(1)));
+    if n > mtu {
+        return None;
     }
-    Some((peer.addr.clone(), n))
+
+    let next = (usize::from(index) + 1 < count).then_some(InFlight {
+        id,
+        next: index + 1,
+        count: count as u8,
+        age_ms,
+        len: obs_bytes.len(),
+    });
+    Some((n, next))
 }
 
 /// Rebuilds a peer's send queue to the ids in `store` they do not already hold
@@ -575,7 +789,7 @@ fn insert_pos(heap: &Vec<(ObservationId, u64), { consts::SEND_QUEUE_CAP }>, age:
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
-    use crate::{MemStore, Observation, Payload, Topic};
+    use crate::{MemStore, Observation, Payload, SendError, Topic};
     use std::vec::Vec;
 
     const ME: NodeId = [42; 16];
@@ -1264,5 +1478,329 @@ mod tests {
             !bounced,
             "an addressed obs must not be forwarded back to its source"
         );
+    }
+
+    /// A payload whose bytes differ by position, so a fragment cut from the
+    /// wrong offset corrupts the reassembled observation.
+    fn ramp(len: usize) -> std::vec::Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn addressed(observer: [u8; 16], seq: u64, to: [u8; 16], payload: &[u8]) -> Observation {
+        let mut o = obs(observer, seq, 0, None, b"t", payload);
+        o.to = Some(to);
+        o.lifetime_ms = Some(1_000_000);
+        o
+    }
+
+    /// Feeds an empty full-size summary from `from` at `addr`, so the peer is
+    /// known by id and appears to lack every broadcast observation.
+    fn empty_summary(ex: &mut Exchange<u8>, store: &mut MemStore, addr: u8, from: NodeId) {
+        let bits = heapless::Vec::from_slice(&[0u8; consts::SUMMARY_BYTES]).unwrap();
+        let sum = Frame::Summary {
+            from,
+            salt: 0,
+            bits,
+        };
+        ex.on_event(Event::Frame(addr, frame_bytes(&sum)), store, 0);
+    }
+
+    /// Polls `ex` once at `now`/`mtu` and decodes the frame, if any.
+    fn poll_frame(
+        ex: &mut Exchange<u8>,
+        store: &MemStore,
+        mtu: usize,
+        now: Tick,
+    ) -> Option<(u8, Frame, FrameBufT)> {
+        let mut buf = [0u8; consts::MAX_FRAME];
+        let (addr, n) = ex.next_frame(store, mtu, now, &mut buf)?;
+        assert!(n <= mtu, "emitted a {n}-byte frame over mtu {mtu}");
+        let bytes = heapless::Vec::from_slice(&buf[..n]).unwrap();
+        Some((addr, Frame::decode(&buf[..n]).unwrap(), bytes))
+    }
+
+    type FrameBufT = heapless::Vec<u8, { consts::MAX_FRAME }>;
+
+    #[test]
+    fn frag_stream_survives_tick_going_backwards() {
+        // Pick a payload whose encoding at age 20 000 (a 3-byte varint) is one
+        // byte past a whole number of 136-byte chunks (mtu 200): re-encoding at
+        // a 1-byte age would then leave the last fragment's start past the end.
+        let chunk = 200 - crate::frag::FRAG_OVERHEAD;
+        let big = (900..1024)
+            .map(|len| obs([2; 16], 1, 20_000, None, b"t", &ramp(len)))
+            .find(|o| {
+                let mut buf = [0u8; consts::MAX_FRAME * 2];
+                postcard::to_slice(o, &mut buf).unwrap().len() % chunk == 1
+            })
+            .unwrap();
+        let big = Observation { age_ms: 0, ..big };
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let id = big.id();
+        store.insert(big, 0).unwrap();
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        empty_summary(&mut ex, &mut store, 1, [9; 16]);
+
+        let mut rx = Exchange::new([9; 16]);
+        let mut rx_store = MemStore::new();
+        // Send everything but the last fragment at a large age (3-byte
+        // varint), then let the tick jump backwards so the age re-encodes
+        // shorter just before the final fragment is cut.
+        let mut sent = 0;
+        for i in 0..64 {
+            let now = if i < 8 { 20_000 } else { 100 };
+            let Some((_, frame, bytes)) = poll_frame(&mut ex, &store, 200, now) else {
+                break;
+            };
+            if matches!(frame, Frame::Frag { .. }) {
+                sent += 1;
+            }
+            rx.on_event(Event::Frame(7, bytes), &mut rx_store, now);
+        }
+        assert!(sent > 1, "the observation must have been fragmented");
+        assert!(
+            rx_store.contains(&id),
+            "receiver must reassemble the observation"
+        );
+    }
+
+    #[test]
+    fn frag_stream_survives_age_crossing_varint_boundary() {
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let big = obs([2; 16], 1, 0, None, b"t", &ramp(1000));
+        let id = big.id();
+        store.insert(big, 0).unwrap();
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        empty_summary(&mut ex, &mut store, 1, [9; 16]);
+
+        let mut rx = Exchange::new([9; 16]);
+        let mut rx_store = MemStore::new();
+        // Polling every 50 ms carries age_ms past 127 (1 -> 2 varint bytes)
+        // part-way through the stream.
+        for i in 0..64u64 {
+            let now = i * 50;
+            let Some((_, _, bytes)) = poll_frame(&mut ex, &store, 200, now) else {
+                break;
+            };
+            rx.on_event(Event::Frame(7, bytes), &mut rx_store, now);
+        }
+        assert!(
+            rx_store.contains(&id),
+            "receiver must reassemble the observation"
+        );
+    }
+
+    #[test]
+    fn summary_fits_small_mtu_and_drives_sync() {
+        let mtu = 200;
+        let mut a = Exchange::new([1; 16]);
+        let mut sa = MemStore::new();
+        let mut b = Exchange::new([2; 16]);
+        let mut sb = MemStore::new();
+        let oa = obs([1; 16], 1, 0, None, b"t", b"from-a");
+        let ob = obs([2; 16], 1, 0, None, b"t", b"from-b");
+        let (ida, idb) = (oa.id(), ob.id());
+        sa.insert(oa, 0).unwrap();
+        sb.insert(ob, 0).unwrap();
+        a.on_event(Event::Contact(2), &mut sa, 0);
+        b.on_event(Event::Contact(1), &mut sb, 0);
+
+        for _ in 0..20 {
+            if let Some((_, _, bytes)) = poll_frame(&mut a, &sa, mtu, 0) {
+                b.on_event(Event::Frame(1, bytes), &mut sb, 0);
+            }
+            if let Some((_, _, bytes)) = poll_frame(&mut b, &sb, mtu, 0) {
+                a.on_event(Event::Frame(2, bytes), &mut sa, 0);
+            }
+        }
+        assert!(
+            sa.contains(&idb),
+            "a must receive b's observation over a small mtu"
+        );
+        assert!(
+            sb.contains(&ida),
+            "b must receive a's observation over a small mtu"
+        );
+    }
+
+    #[test]
+    fn bounce_table_overflow_does_not_starve_broadcast_or_custody() {
+        let peer: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let mut want = std::collections::BTreeSet::new();
+        for seq in 0..300u64 {
+            let o = addressed([3; 16], seq, peer, b"x");
+            want.insert(o.id());
+            store.insert(o, 0).unwrap();
+        }
+        let bcast = obs([3; 16], 1000, 0, None, b"t", b"broadcast");
+        let bid = bcast.id();
+        store.insert(bcast, 0).unwrap();
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        empty_summary(&mut ex, &mut store, 1, peer);
+
+        let mut got = std::collections::BTreeSet::new();
+        let mut saw_broadcast = false;
+        for _ in 0..700 {
+            match poll_frame(&mut ex, &store, consts::MAX_FRAME, 0) {
+                Some((_, Frame::Obs { obs, .. }, _)) if obs.to.is_some() => {
+                    got.insert(obs.id());
+                }
+                Some((_, Frame::Obs { obs, .. }, _)) if obs.id() == bid => saw_broadcast = true,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_broadcast,
+            "custody traffic must not starve the broadcast diff"
+        );
+        assert_eq!(got, want, "every addressed message must be delivered");
+    }
+
+    #[test]
+    fn addressed_frag_streams_are_not_clobbered() {
+        let peer: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let x = addressed([3; 16], 1, peer, &ramp(1000));
+        let y = addressed([3; 16], 2, peer, &ramp(999));
+        let (idx, idy) = (x.id(), y.id());
+        store.insert(x, 0).unwrap();
+        store.insert(y, 0).unwrap();
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        empty_summary(&mut ex, &mut store, 1, peer);
+
+        let mut rx = Exchange::new(peer);
+        let mut rx_store = MemStore::new();
+        for _ in 0..64 {
+            let Some((_, _, bytes)) = poll_frame(&mut ex, &store, 200, 0) else {
+                break;
+            };
+            rx.on_event(Event::Frame(7, bytes), &mut rx_store, 0);
+        }
+        assert!(
+            rx_store.contains(&idx),
+            "first addressed stream must complete"
+        );
+        assert!(
+            rx_store.contains(&idy),
+            "second addressed stream must complete"
+        );
+    }
+
+    #[test]
+    fn failed_send_is_retried() {
+        let peer: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let a = addressed([3; 16], 1, peer, b"addressed");
+        let b = obs([3; 16], 2, 0, None, b"t", b"broadcast");
+        let big = obs([3; 16], 3, 5, None, b"t", &ramp(1000));
+        store.insert(a, 0).unwrap();
+        store.insert(b, 0).unwrap();
+        store.insert(big, 0).unwrap();
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        empty_summary(&mut ex, &mut store, 1, peer);
+
+        // Every frame that hits a Busy transport must come out again on the
+        // next poll, unchanged.
+        let mut frames = 0;
+        while let Some((_, first, _)) = poll_frame(&mut ex, &store, 200, 0) {
+            ex.on_send_error(&SendError::Busy);
+            let (_, again, _) = poll_frame(&mut ex, &store, 200, 0).expect("retry after Busy");
+            assert_eq!(again, first, "a Busy frame must be re-emitted");
+            frames += 1;
+            assert!(frames < 64, "exchange never drained");
+        }
+        assert!(
+            frames > 3,
+            "summary, addressed, broadcast and fragments were all exercised"
+        );
+    }
+
+    #[test]
+    fn bounce_suppression_resets_on_new_contact() {
+        let peer: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let o = addressed([3; 16], 1, peer, b"hi");
+        let id = o.id();
+        store.insert(o, 0).unwrap();
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        empty_summary(&mut ex, &mut store, 1, peer);
+        assert_eq!(
+            drain_addressed_obs(&mut ex, &store, Some(peer)),
+            Some((1, id))
+        );
+
+        // The frame was lost; the peer leaves and comes back.
+        ex.on_event(Event::Lost(1), &mut store, 0);
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        empty_summary(&mut ex, &mut store, 1, peer);
+        assert_eq!(
+            drain_addressed_obs(&mut ex, &store, Some(peer)),
+            Some((1, id)),
+            "a new contact must get another delivery attempt"
+        );
+    }
+
+    #[test]
+    fn unemittable_addressed_obs_does_not_block_others() {
+        let peer: NodeId = [2; 16];
+        // Small enough that a 1000-byte obs needs more than 64 fragments, big
+        // enough that a tiny obs fits in one Obs frame.
+        let mtu = 80;
+        let small = addressed([3; 16], 0, peer, b"s");
+        let sid = small.id();
+        let mut seq = 1;
+        let big = loop {
+            let b = addressed([3; 16], seq, peer, &ramp(1000));
+            if b.id() < sid {
+                break b;
+            }
+            seq += 1;
+        };
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        store.insert(big, 0).unwrap();
+        store.insert(small, 0).unwrap();
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        empty_summary(&mut ex, &mut store, 1, peer);
+
+        let mut delivered = false;
+        for _ in 0..8 {
+            if let Some((_, Frame::Obs { obs, .. }, _)) = poll_frame(&mut ex, &store, mtu, 0) {
+                delivered |= obs.id() == sid;
+            }
+        }
+        assert!(
+            delivered,
+            "a deliverable message must not wait behind an undeliverable one"
+        );
+    }
+
+    #[test]
+    fn duplicate_addressed_obs_is_not_sent_back() {
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let o = addressed([3; 16], 1, [4; 16], b"hi");
+        // Two carriers, at addrs 1 and 2, each hand us the same message.
+        for (addr, from) in [(1u8, [5u8; 16]), (2, [6; 16])] {
+            let f = Frame::Obs {
+                from,
+                obs: o.clone(),
+            };
+            ex.on_event(Event::Frame(addr, frame_bytes(&f)), &mut store, 0);
+        }
+        for _ in 0..16 {
+            if let Some((addr, Frame::Obs { obs, .. }, _)) =
+                poll_frame(&mut ex, &store, consts::MAX_FRAME, 0)
+            {
+                panic!("sent {:?} back to carrier {addr}", obs.id());
+            }
+        }
     }
 }

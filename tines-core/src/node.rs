@@ -140,10 +140,10 @@ impl<S: Store, T: Transport> Node<S, T> {
     /// Drains all pending transport events, storing any newly received
     /// observations, then emits at most one outbound frame.
     ///
-    /// Returns the number of *new* observations stored this round. A
-    /// [`crate::transport::SendError`] is ignored: the observation stays
-    /// queued only when the transport was `Busy`, otherwise it is dropped and
-    /// re-queued by the next summary round.
+    /// Returns the number of *new* observations stored this round. If the
+    /// transport refuses the frame with `Busy` or `Unreachable`, the exchange
+    /// rolls back and offers the same frame on a later poll; a `TooLarge`
+    /// frame is dropped (see [`Exchange::on_send_error`]).
     pub fn poll(&mut self, now: Tick) -> usize {
         let mut stored = 0usize;
         while let Some(ev) = self.transport.poll() {
@@ -158,7 +158,9 @@ impl<S: Store, T: Transport> Node<S, T> {
             .exchange
             .next_frame(&self.store, mtu, now, &mut self.out)
         {
-            let _ = self.transport.send(&addr, &self.out[..n]);
+            if let Err(err) = self.transport.send(&addr, &self.out[..n]) {
+                self.exchange.on_send_error(&err);
+            }
         }
         stored
     }

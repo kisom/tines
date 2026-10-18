@@ -308,3 +308,52 @@ fn belief_includes_addressed_to_me() {
     assert_eq!(belief.payload, Payload::from_slice(b"for-me").unwrap());
     assert_eq!(belief.observer, [1; 16]);
 }
+
+/// A `PairTransport` that reports `Busy` for every other send, dropping it.
+struct Flaky {
+    inner: PairTransport,
+    sends: usize,
+}
+
+impl Transport for Flaky {
+    type Addr = u8;
+
+    fn poll(&mut self) -> Option<Event<Self::Addr>> {
+        self.inner.poll()
+    }
+
+    fn send(&mut self, to: &Self::Addr, frame: &[u8]) -> Result<(), SendError> {
+        self.sends += 1;
+        if self.sends % 2 == 1 {
+            return Err(SendError::Busy);
+        }
+        self.inner.send(to, frame)
+    }
+
+    fn mtu(&self) -> usize {
+        self.inner.mtu()
+    }
+}
+
+#[test]
+fn busy_sends_are_retried() {
+    let (a, b) = PairTransport::pair(1500);
+    let mut na = Node::new([1u8; 16], 0, MemStore::new(), Flaky { inner: a, sends: 0 });
+    let mut nb = Node::new([2u8; 16], 0, MemStore::new(), Flaky { inner: b, sends: 0 });
+    na.observe(b"door/1", b"open", None, 0).unwrap();
+    na.observe(b"door/2", b"closed", None, 0).unwrap();
+    nb.observe(b"bat/1", b"up", None, 0).unwrap();
+    na.observe_to([2; 16], 60_000, b"task", b"go", None, 0)
+        .unwrap();
+    na.transport_mut().inner.connect();
+    nb.transport_mut().inner.connect();
+
+    // The clock stands still, so no summary is ever re-sent: a frame lost to
+    // Busy is only delivered if the exchange retries it.
+    for _ in 0..40 {
+        na.poll(0);
+        nb.poll(0);
+    }
+    assert_eq!(na.store().len(), 4);
+    assert_eq!(nb.store().len(), 4);
+}
