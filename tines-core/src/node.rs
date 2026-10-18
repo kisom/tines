@@ -11,8 +11,8 @@
 //! transport frames are dropped by the [`Exchange`].
 
 use crate::{
-    consts, BeliefPolicy, Exchange, NodeId, Observation, ObservationId, Payload, Store, StoreError,
-    Tick, Topic, Transport, TrimPolicy,
+    consts, BeliefPolicy, ConfidenceEvent, Exchange, NodeId, Observation, ObservationId, Payload,
+    Store, StoreError, Tick, Topic, Transport, TrimPolicy,
 };
 
 /// Errors returned by [`Node::observe`].
@@ -163,6 +163,18 @@ impl<S: Store, T: Transport> Node<S, T> {
             }
         }
         stored
+    }
+
+    /// Drains the buffered [`ConfidenceEvent`]s the [`Exchange`] has collected
+    /// as a peer acknowledged holding one of our broadcasts, oldest-first.
+    ///
+    /// The returned [`heapless::Vec`] is capped at
+    /// [`consts::EVENT_QUEUE_CAP`] entries and is empty once drained (a second
+    /// drain yields nothing). Index it directly — [`ConfidenceEvent::peer`]
+    /// names who received our broadcast and [`ConfidenceEvent::id`] is the
+    /// broadcast's content-ID.
+    pub fn drain_events(&mut self) -> heapless::Vec<ConfidenceEvent, { consts::EVENT_QUEUE_CAP }> {
+        self.exchange.drain_events()
     }
 
     /// The current belief for `topic_prefix` under `policy` (an empty prefix

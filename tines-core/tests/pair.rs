@@ -357,3 +357,37 @@ fn busy_sends_are_retried() {
     assert_eq!(na.store().len(), 4);
     assert_eq!(nb.store().len(), 4);
 }
+
+#[test]
+fn confidence_event_surfaces_on_node() {
+    let (a, b) = PairTransport::pair(1500);
+    let mut na = Node::new([1u8; 16], 0, MemStore::new(), a);
+    let mut nb = Node::new([2u8; 16], 0, MemStore::new(), b);
+
+    // a publishes a broadcast; b receives it and its Ack fires a confidence
+    // event that must surface on a's node.
+    let id = na.observe(b"door/1", b"open", None, 0).unwrap();
+
+    na.transport_mut().connect();
+    nb.transport_mut().connect();
+
+    // Poll until b holds the observation, then give b's Ack a few more rounds
+    // to round-trip back to a and fire the confidence event.
+    let mut t = 0u64;
+    for _ in 0..200 {
+        na.poll(t);
+        nb.poll(t);
+        t += 10;
+    }
+    assert!(
+        nb.store().contains(&id),
+        "b must receive a's broadcast before an Ack fires"
+    );
+
+    // a's node surfaces the confidence event: peer == b, id == the broadcast.
+    let events = na.drain_events();
+    assert!(
+        events.iter().any(|ev| ev.peer == nb.id() && ev.id == id),
+        "a's node must surface the confidence event for b's Ack"
+    );
+}
