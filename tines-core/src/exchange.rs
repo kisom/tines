@@ -116,6 +116,47 @@ struct Undo<A> {
     bounce: Option<ObservationId>,
 }
 
+/// A bounded ring of `(observation-id, addr)` pairs awaiting an `Ack`
+/// emission. The oldest entry is dropped when full.
+#[derive(Clone, Debug)]
+struct AckBuffer<A> {
+    entries: Vec<(ObservationId, A), { consts::ACK_BUFFER_CAP }>,
+}
+
+impl<A: Clone> AckBuffer<A> {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    fn front(&self) -> Option<&(ObservationId, A)> {
+        self.entries.first()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Enqueue `(id, addr)`, dropping the oldest entry if the buffer is full.
+    fn enqueue(&mut self, id: ObservationId, addr: A) {
+        if self.entries.is_full() {
+            self.entries.remove(0);
+        }
+        let _ = self.entries.push((id, addr));
+    }
+}
+
+/// The ids removed from a pending buffer by a failed (Busy) frame
+/// emission, so [`Exchange::on_send_error`] can restore them for retry.
+/// Dropped on `TooLarge`.
+#[derive(Debug)]
+struct UndoAck<A> {
+    addr: A,
+    ids: Vec<ObservationId, { consts::ACK_IDS_CAP }>,
+    is_bcast: bool,
+}
+
 /// The exchange state machine, tracking up to [`consts::MAX_PEERS`] peers.
 pub struct Exchange<A> {
     me: NodeId,
@@ -140,8 +181,19 @@ pub struct Exchange<A> {
     /// One [`ConfidenceEvent`] per broadcast id a peer has confirmed, pushed
     /// drop-oldest when full. Drain through [`Exchange::drain_events`].
     events: Vec<ConfidenceEvent, { consts::EVENT_QUEUE_CAP }>,
+    /// Pending addressed acks: ids awaiting an `Ack` for a peer that sent an
+    /// addressed observation.
+    acks: AckBuffer<A>,
+    /// Pending broadcast acks: ids awaiting an `Ack` for a peer that sent a
+    /// broadcast observation.
+    bcast_acks: AckBuffer<A>,
     /// How to undo the last frame [`Exchange::next_frame`] produced.
     undo: Option<Undo<A>>,
+    /// The ids drained from a pending buffer by an in-flight `Ack` that the
+    /// transport rejected with `Busy`; [`Exchange::on_send_error`] restores
+    /// them. Cleared when a frame is successfully sent or a new frame is
+    /// emitted, so a `Busy` retry re-queues the ids rather than re-sending.
+    ack_undo: Option<UndoAck<A>>,
 }
 
 impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
@@ -156,6 +208,9 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
             bcast_sent: Vec::new(),
             events: Vec::new(),
             undo: None,
+            ack_undo: None,
+            acks: AckBuffer::new(),
+            bcast_acks: AckBuffer::new(),
         }
     }
 
@@ -201,6 +256,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         out: &mut [u8],
     ) -> Option<(A, usize)> {
         self.undo = None;
+        self.ack_undo = None;
         let me = self.me;
         // Priority 1: a summary is due for some peer.
         for peer in self.peers.iter_mut() {
@@ -239,6 +295,12 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
             return Some((peer.addr.clone(), n));
         }
 
+        // Priority 1.5: emit a pending Ack for a peer that has one outstanding,
+        // before any further addressed/broadcast traffic.
+        if let Some(res) = self.drain_pending_ack(mtu, out) {
+            return Some(res);
+        }
+
         // Priority 2: round-robin, emit one frame from a single peer.
         let len = self.peers.len();
         if len == 0 {
@@ -264,10 +326,19 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
     /// a frame the transport can never carry is dropped rather than retried on
     /// every poll.
     pub fn on_send_error(&mut self, err: &SendError) {
-        let Some(undo) = self.undo.take() else {
+        let pending = self.undo.take();
+        if !matches!(err, SendError::TooLarge) {
+            // A pending-ack drain is reverted on Busy (but dropped on TooLarge)
+            // independently of the undo struct, which is None for an Ack-only
+            // frame.
+            if let Some(ack) = self.ack_undo.take() {
+                self.restore_ack_drain(ack);
+            }
+        }
+        let Some(undo) = pending else {
             return;
         };
-        if *err == SendError::TooLarge {
+        if matches!(err, SendError::TooLarge) {
             return;
         }
         self.salt = undo.salt;
@@ -294,6 +365,123 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                 let pos = pos.min(peer.send_queue.len());
                 let _ = peer.send_queue.insert(pos, id);
             }
+        }
+    }
+
+    /// Drain up to one pending `Ack` from the addressed then broadcast
+    /// buffers. Returns `(dest_addr, bytes)` when an `Ack` was emitted into
+    /// `out`, else `None`.
+    fn drain_pending_ack(&mut self, mtu: usize, out: &mut [u8]) -> Option<(A, usize)> {
+        // Addressed acks take priority over broadcast acks.
+        if let Some(res) = self.drain_ack_buffer(false, mtu, out) {
+            return Some(res);
+        }
+        self.drain_ack_buffer(true, mtu, out)
+    }
+
+    /// Drain one `Ack` for a single destination from the given buffer,
+    /// splitting across frames to fit `mtu`. On success the ids that did not
+    /// fit are left in the buffer; on a `Busy` rejection they are restored by
+    /// [`Exchange::on_send_error`] (see [`Exchange::ack_undo`]).
+    fn drain_ack_buffer(
+        &mut self,
+        is_bcast: bool,
+        mtu: usize,
+        out: &mut [u8],
+    ) -> Option<(A, usize)> {
+        // Pull every pending id for the destination out of the buffer.
+        let addr;
+        let mut send_n = 0usize;
+        let mut pulled: heapless::Vec<ObservationId, { consts::ACK_IDS_CAP }> =
+            heapless::Vec::new();
+        {
+            let buffer = if is_bcast {
+                &mut self.bcast_acks
+            } else {
+                &mut self.acks
+            };
+            addr = buffer.front()?.1.clone();
+            let mut i = 0;
+            while i < buffer.len() {
+                if buffer.entries[i].1 == addr {
+                    let (id, _a) = buffer.entries.remove(i);
+                    if pulled.push(id).is_err() {
+                        // Overflow while pulling out: restore this entry and stop.
+                        let _ = buffer.entries.insert(i, (id, addr.clone()));
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            // How many ids fit in `mtu`? Ids shrink monotonically as we drop.
+            for k in (1..=pulled.len()).rev() {
+                if Self::encode_ack(self.me, &pulled[..k], out, mtu).is_some() {
+                    send_n = k;
+                    break;
+                }
+            }
+            if send_n == 0 {
+                // Even a single id overflows `mtu`: drop the oldest for this
+                // addr and let the next poll retry the rest rather than stall.
+                buffer.entries.remove(0);
+                return None;
+            }
+        }
+        // Emit the fitting ids (they fit by the loop above).
+        let n = Self::encode_ack(self.me, &pulled[..send_n], out, mtu).expect("fits per loop");
+        // Keep the ids that did not fit for a later poll.
+        for id in &pulled[send_n..] {
+            let buffer = if is_bcast {
+                &mut self.bcast_acks
+            } else {
+                &mut self.acks
+            };
+            let _ = buffer.entries.push((*id, addr.clone()));
+        }
+        // Record the ids we removed and did not re-keep so a `Busy` retry can
+        // re-queue them (the retained ids are already back in the buffer).
+        let mut sent: heapless::Vec<ObservationId, { consts::ACK_IDS_CAP }> = heapless::Vec::new();
+        for id in &pulled[..send_n] {
+            let _ = sent.push(*id);
+        }
+        let return_addr = addr.clone();
+        self.ack_undo = Some(UndoAck {
+            addr,
+            ids: sent,
+            is_bcast,
+        });
+        Some((return_addr, n))
+    }
+
+    /// Re-add the ids drained from a pending buffer by a failed (Busy) frame so
+    /// they are retried on the next poll.
+    fn restore_ack_drain(&mut self, ack: UndoAck<A>) {
+        let buffer = if ack.is_bcast {
+            &mut self.bcast_acks
+        } else {
+            &mut self.acks
+        };
+        for id in ack.ids.iter() {
+            let _ = buffer.entries.push((*id, ack.addr.clone()));
+        }
+    }
+
+    /// Encode an `Ack { from: me, ids }` into `out`, returning the byte count if
+    /// it fits within `mtu`. Returns `None` if it overflows `mtu` (or the ids
+    /// exceed [`consts::ACK_IDS_CAP`]).
+    fn encode_ack(me: NodeId, ids: &[ObservationId], out: &mut [u8], mtu: usize) -> Option<usize> {
+        let ids_vec =
+            heapless::Vec::<ObservationId, { consts::ACK_IDS_CAP }>::from_slice(ids).ok()?;
+        let frame = Frame::Ack {
+            from: me,
+            ids: ids_vec,
+        };
+        let n = frame.encode(out).ok()?;
+        if n <= mtu {
+            Some(n)
+        } else {
+            None
         }
     }
 
@@ -570,9 +758,14 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
     ) -> Option<Observation> {
         for id in ids.iter() {
             if was_sent(&self.bounce, *id, &addr) {
-                // Addressed: release custody for the local copy if still held
-                // and still addressed (a broadcast can never match `was_sent`).
-                let held_addressed = store.get(id, now).is_some_and(|obs| obs.to.is_some());
+                // Addressed: release custody for the local copy only when
+                // the Ack confirms delivery to the *intended* recipient. An
+                // Ack from a peer that merely holds an epidemic-forwarded
+                // copy must not release custody — the copy would then be
+                // ineligible to forward toward the recipient once the only
+                // contact to it has closed, so the observation could never be
+                // delivered.
+                let held_addressed = store.get(id, now).is_some_and(|obs| obs.to == Some(from));
                 if held_addressed {
                     store.release(id);
                 }
@@ -606,13 +799,34 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         let addressed = obs.to.is_some();
         let returned = obs.clone();
         let res = store.insert(obs, now);
+        // Enqueue a pending ack for what we received: a newly stored
+        // observation, any duplicate, and even an un-stored id (its id is
+        // validated by the receiver). The single exception is a duplicate
+        // *addressed* offer whose local copy has been released — a released
+        // holder must not ack — so that one is held back.
+        let duplicate = !matches!(res, Ok(true));
+        let released = res.is_ok() && store.is_released(&id);
+        if !(duplicate && addressed && released) {
+            self.enqueue_pending_ack(id, addr.clone(), addressed);
+        }
         if addressed && res.is_ok() {
             record_bounce(&mut self.bounce, id, addr, BounceKind::Received);
         }
         match res {
             Ok(true) => Some(returned),
-            Ok(false) | Err(_) => None,
+            _ => None,
         }
+    }
+
+    /// Enqueue `(id, addr)` as a pending ack into the addressed (`acks`) or
+    /// broadcast (`bcast_acks`) buffer, dropping the oldest entry if full.
+    fn enqueue_pending_ack(&mut self, id: ObservationId, addr: A, addressed: bool) {
+        let buffer = if addressed {
+            &mut self.acks
+        } else {
+            &mut self.bcast_acks
+        };
+        buffer.enqueue(id, addr);
     }
 }
 
@@ -1080,6 +1294,198 @@ mod tests {
             .expect("obs returned");
         assert_eq!(returned, obs);
         assert!(store.contains(&obs.id()));
+    }
+
+    /// Encodes an addressed observation from `observer` to `to` (for ack-path
+    /// tests).
+    fn observed_addressed(
+        observer: NodeId,
+        seq: u64,
+        to: NodeId,
+        topic: &[u8],
+        payload: &[u8],
+    ) -> Observation {
+        let mut o = obs(observer, seq, 0, None, topic, payload);
+        o.to = Some(to);
+        // An addressed message must carry a lifetime or `reject` drops it.
+        o.lifetime_ms = Some(consts::SUMMARY_INTERVAL_MS * 10);
+        o
+    }
+
+    /// Drains frames until an `Ack` carrying `id` is found (summary frames are
+    /// skipped), reporting whether one was seen.
+    fn ack_for(ex: &mut Exchange<u8>, store: &MemStore, id: ObservationId) -> bool {
+        let mut buf = [0u8; consts::MAX_FRAME];
+        for _ in 0..consts::MAX_FRAME {
+            if let Some((_, n)) = ex.next_frame(store, consts::MAX_FRAME, 0, &mut buf) {
+                match Frame::decode(&buf[..n]) {
+                    Ok(Frame::Ack { ids, .. }) if ids.contains(&id) => return true,
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn released_duplicate_is_not_acked() {
+        let a: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        empty_summary(&mut ex, &mut store, 1, a);
+
+        // A held an addressed message to B; B's store already holds it and has
+        // released it (e.g. it was delivered and confirmed).
+        let x = observed_addressed(a, 1, ME, b"t", b"hi");
+        let x_id = x.id();
+        store.insert(x.clone(), 0).unwrap();
+        store.release(&x_id);
+        assert!(store.is_released(&x_id));
+
+        // A re-offers the same addressed message: a duplicate whose local copy
+        // is released, so B must not enqueue a pending ack for it.
+        let frame = Frame::Obs { from: a, obs: x };
+        ex.on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0);
+
+        // The duplicate never enters the buffer and no Ack carries X.
+        assert!(
+            ex.acks.entries.is_empty(),
+            "a released duplicate is not enqueued"
+        );
+        for _ in 0..consts::MAX_FRAME {
+            let mut buf = [0u8; consts::MAX_FRAME];
+            if let Some((_, n)) = ex.next_frame(&store, consts::MAX_FRAME, 0, &mut buf) {
+                if let Ok(Frame::Ack { ids, .. }) = Frame::decode(&buf[..n]) {
+                    assert!(
+                        !ids.contains(&x_id),
+                        "a released duplicate must not be acked"
+                    );
+                }
+            }
+        }
+        assert!(
+            ex.acks.entries.is_empty(),
+            "the released duplicate never left the buffer"
+        );
+    }
+
+    #[test]
+    fn ack_fits_mtu() {
+        let a: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        empty_summary(&mut ex, &mut store, 1, a);
+
+        // Receive 12 broadcasts from A -> 12 pending broadcast acks.
+        for seq in 0..12u64 {
+            let y = obs(a, seq, 0, None, b"t", b"bc");
+            let frame = Frame::Obs { from: a, obs: y };
+            ex.on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0);
+        }
+        assert_eq!(ex.bcast_acks.len(), 12, "each received broadcast is acked");
+
+        // At an mtu too small for all 12, every Ack carries only a few ids,
+        // split across frames.
+        let mtu = 110usize;
+        let mut max_ids = 0usize;
+        let mut acks = 0usize;
+        for _ in 0..consts::MAX_FRAME {
+            let mut buf = [0u8; consts::MAX_FRAME];
+            if let Some((_, n)) = ex.next_frame(&store, mtu, 0, &mut buf) {
+                match Frame::decode(&buf[..n]) {
+                    Ok(Frame::Ack { ids, .. }) => {
+                        acks += 1;
+                        max_ids = max_ids.max(ids.len());
+                    }
+                    Ok(Frame::Summary { .. }) => {}
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            acks >= 2,
+            "12 ids must split across multiple Ack frames at mtu {mtu}, got {acks}"
+        );
+        assert!(
+            max_ids <= 5,
+            "each Ack stays within mtu (max {max_ids} ids)"
+        );
+    }
+
+    #[test]
+    fn broadcast_flood_does_not_evict_custody_ack() {
+        let a: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        empty_summary(&mut ex, &mut store, 1, a);
+
+        // An addressed custody message A -> B, which B received (pending
+        // addressed ack).
+        let x = observed_addressed(a, 1, ME, b"t", b"hi");
+        let x_id = x.id();
+        let frame = Frame::Obs { from: a, obs: x };
+        ex.on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0);
+        assert!(
+            !ex.acks.entries.is_empty(),
+            "an addressed message has a pending ack"
+        );
+
+        // Flood B with far more broadcasts than bcast_acks can hold; overflow
+        // drops the oldest.
+        for seq in 0..400u64 {
+            let y = obs(a, seq, 0, None, b"t", b"bc");
+            let frame = Frame::Obs { from: a, obs: y };
+            ex.on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0);
+        }
+        assert!(
+            ex.bcast_acks.entries.is_full(),
+            "bcast_acks flooded to capacity"
+        );
+
+        // Draining must still emit an Ack carrying the addressed custody id X.
+        let mut saw_x = false;
+        for _ in 0..consts::MAX_FRAME {
+            let mut buf = [0u8; consts::MAX_FRAME];
+            if let Some((_, n)) = ex.next_frame(&store, consts::MAX_FRAME, 0, &mut buf) {
+                if let Ok(Frame::Ack { ids, .. }) = Frame::decode(&buf[..n]) {
+                    if ids.contains(&x_id) {
+                        saw_x = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_x,
+            "an addressed pending ack must survive a broadcast flood"
+        );
+    }
+
+    #[test]
+    fn duplicate_broadcast_is_acked() {
+        let a: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        empty_summary(&mut ex, &mut store, 1, a);
+
+        // B receives broadcast Y from A, then the same Y again (a duplicate).
+        let y = obs(a, 1, 0, None, b"t", b"bc");
+        let y_id = y.id();
+
+        // First reception yields an Ack for Y.
+        let frame1 = Frame::Obs {
+            from: a,
+            obs: y.clone(),
+        };
+        ex.on_event(Event::Frame(1, frame_bytes(&frame1)), &mut store, 0);
+        assert!(ack_for(&mut ex, &store, y_id), "first reception is acked");
+
+        // Duplicate reception yields another Ack for Y (duplicates ARE acked).
+        let frame2 = Frame::Obs { from: a, obs: y };
+        ex.on_event(Event::Frame(1, frame_bytes(&frame2)), &mut store, 0);
+        assert!(
+            ack_for(&mut ex, &store, y_id),
+            "duplicate reception is acked"
+        );
     }
 
     #[test]

@@ -40,3 +40,8 @@ pub const EVENT_QUEUE_CAP: usize = 64;
 /// Cap on the `Exchange` per-peer `bcast_sent` table of broadcast ids
 /// dispatched to a peer.
 pub const BCAST_SENT_CAP: usize = 256;
+
+/// Cap on the number of pending ack ids (`acks` for addressed, `bcast_acks`
+/// for broadcast) buffered before the next Ack is emitted. Overflow drops
+/// the oldest pending entry.
+pub const ACK_BUFFER_CAP: usize = 256;
