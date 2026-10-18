@@ -263,10 +263,8 @@ fn emit_one<A: Clone, S: Store>(
     }
 
     while let Some(&front) = peer.send_queue.first() {
-        if !store.contains(&front) {
-            peer.send_queue.remove(0);
-            continue;
-        }
+        // A single `get` both checks presence and returns the age-adjusted
+        // observation; a missing id (trimmed elsewhere) is skipped.
         let Some(obs) = store.get(&front, now) else {
             peer.send_queue.remove(0);
             continue;
@@ -720,5 +718,27 @@ mod tests {
         // After draining, in_flight clears and the queue drops the id.
         assert!(ex.peers()[0].in_flight.is_none());
         assert!(!ex.peers()[0].send_queue.contains(&id));
+    }
+
+    #[test]
+    fn inbound_frags_are_reassembled_and_stored() {
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let big = obs([2; 16], 7, 0, None, b"t", &[0u8; 1024]);
+        let id = big.id();
+
+        // Fragment the observation exactly as the peer would, then feed each
+        // Frag frame through the exchange's inbound path (no prior Contact).
+        let mut frames: Vec<heapless::Vec<u8, { consts::MAX_FRAME }>> = Vec::new();
+        crate::frag::fragment([2; 16], &big, 200, &mut |b| {
+            frames.push(heapless::Vec::from_slice(b).unwrap());
+        })
+        .expect("fragment large obs");
+
+        for f in frames {
+            let _ = ex.on_event(Event::Frame(9, f), &mut store, 0);
+        }
+        assert!(store.contains(&id), "reassembled obs must be stored");
+        assert_eq!(store.len(), 1);
     }
 }

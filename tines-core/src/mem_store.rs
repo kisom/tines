@@ -53,6 +53,18 @@ impl Default for MemStore {
 }
 
 #[cfg(feature = "alloc")]
+impl MemStore {
+    /// Order two stored ids by their current age at `now` (youngest first).
+    fn age_cmp(&self, a: &ObservationId, b: &ObservationId, now: Tick) -> core::cmp::Ordering {
+        current_age(&self.map[a].obs, self.map[a].stored_at, now).cmp(&current_age(
+            &self.map[b].obs,
+            self.map[b].stored_at,
+            now,
+        ))
+    }
+}
+
+#[cfg(feature = "alloc")]
 impl Store for MemStore {
     fn insert(&mut self, obs: Observation, now: Tick) -> Result<bool, StoreError> {
         let id = obs.id();
@@ -119,13 +131,7 @@ impl Store for MemStore {
                     continue;
                 }
                 let mut ids = member_ids.clone();
-                ids.sort_by(|&a, &b| {
-                    current_age(&self.map[&a].obs, self.map[&a].stored_at, now).cmp(&current_age(
-                        &self.map[&b].obs,
-                        self.map[&b].stored_at,
-                        now,
-                    ))
-                });
+                ids.sort_by(|&a, &b| self.age_cmp(&a, &b, now));
                 for id in ids.into_iter().skip(keep) {
                     removed.insert(id);
                 }
@@ -151,13 +157,7 @@ impl Store for MemStore {
                 .filter(|id| !removed.contains(id))
                 .collect();
             if remaining.len() > max_count {
-                remaining.sort_by(|&a, &b| {
-                    current_age(&self.map[&a].obs, self.map[&a].stored_at, now).cmp(&current_age(
-                        &self.map[&b].obs,
-                        self.map[&b].stored_at,
-                        now,
-                    ))
-                });
+                remaining.sort_by(|&a, &b| self.age_cmp(&a, &b, now));
                 let over = remaining.len() - max_count;
                 for id in remaining.into_iter().rev().take(over) {
                     removed.insert(id);
@@ -343,5 +343,28 @@ mod tests {
         assert!(s.insert(o2, 0).unwrap());
         assert!(s.contains(&id));
         assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn trim_keep_per_topic_uses_elapsed_age() {
+        let mut s = MemStore::new();
+        // All stored with age_ms=0, but at different ticks: seq 1 is oldest
+        // (stored first), seq 3 youngest (stored last).
+        s.insert(obs([1; 16], 1, 0, None, b"t"), 1000).unwrap();
+        s.insert(obs([1; 16], 2, 0, None, b"t"), 2000).unwrap();
+        s.insert(obs([1; 16], 3, 0, None, b"t"), 3000).unwrap();
+        let policy = TrimPolicy {
+            keep_per_topic: Some(2),
+            max_age_ms: None,
+            max_count: None,
+        };
+        // At now=4000 the current ages are 3000/2000/1000 for seq 1/2/3, so
+        // the two youngest (seq 2 and 3) survive and seq 1 (oldest) drops.
+        assert_eq!(s.trim(&policy, 4000), 1);
+        let mut seqs = std::collections::BTreeSet::new();
+        s.for_each_topic(b"t", 4000, &mut |o| {
+            seqs.insert(o.seq);
+        });
+        assert_eq!(seqs, std::collections::BTreeSet::from_iter([2u64, 3]));
     }
 }

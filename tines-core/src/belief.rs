@@ -31,6 +31,13 @@ pub struct LatestWins;
 /// `me` beats any observation from another observer regardless of age.
 pub struct SelfFirst;
 
+/// The [`LatestWins`] ordering: `obs` beats `cur` when it is younger, with a
+/// deterministic `(observer, seq)` ascending tie-break on equal age.
+fn latest_beats(obs: &Observation, cur: &Observation) -> bool {
+    obs.age_ms < cur.age_ms
+        || (obs.age_ms == cur.age_ms && (obs.observer, obs.seq) < (cur.observer, cur.seq))
+}
+
 impl BeliefPolicy for LatestWins {
     type Belief = Observation;
 
@@ -43,10 +50,7 @@ impl BeliefPolicy for LatestWins {
         match acc {
             None => Some(obs.clone()),
             Some(cur) => {
-                if obs.age_ms < cur.age_ms
-                    || (obs.age_ms == cur.age_ms
-                        && (obs.observer, obs.seq) < (cur.observer, cur.seq))
-                {
+                if latest_beats(obs, &cur) {
                     Some(obs.clone())
                 } else {
                     Some(cur)
@@ -78,10 +82,7 @@ impl BeliefPolicy for SelfFirst {
                     // Both from `me` or both from someone else: fall back to
                     // the LatestWins rule (youngest, tie broken by
                     // (observer, seq) ascending).
-                    if obs.age_ms < cur.age_ms
-                        || (obs.age_ms == cur.age_ms
-                            && (obs.observer, obs.seq) < (cur.observer, cur.seq))
-                    {
+                    if latest_beats(obs, &cur) {
                         obs.clone()
                     } else {
                         cur
@@ -157,6 +158,17 @@ mod tests {
         let obs = [lo, hi];
         assert_eq!(fold(&LatestWins, me, &obs).unwrap().observer, [2; 16]);
         assert_eq!(fold_rev(&LatestWins, me, &obs).unwrap().observer, [2; 16]);
+    }
+
+    #[test]
+    fn latest_wins_tie_same_observer_breaks_by_seq() {
+        let me = [7; 16];
+        // Same observer, same age: the tie-break must fall to the smaller seq.
+        let hi_seq = obs([5; 16], 9, 100);
+        let lo_seq = obs([5; 16], 2, 100);
+        let obs = [hi_seq, lo_seq];
+        assert_eq!(fold(&LatestWins, me, &obs).unwrap().seq, 2);
+        assert_eq!(fold_rev(&LatestWins, me, &obs).unwrap().seq, 2);
     }
 
     #[test]
