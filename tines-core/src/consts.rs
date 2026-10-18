@@ -32,3 +32,11 @@ pub const MAX_FRAME: usize = 1500;
 
 /// Maximum number of content-IDs an `Ack` receipt may carry.
 pub const ACK_IDS_CAP: usize = 90;
+
+/// Cap on the `Exchange` `events` queue of `ConfidenceEvent`s (one per
+/// broadcast id a peer has confirmed).
+pub const EVENT_QUEUE_CAP: usize = 64;
+
+/// Cap on the `Exchange` per-peer `bcast_sent` table of broadcast ids
+/// dispatched to a peer.
+pub const BCAST_SENT_CAP: usize = 256;

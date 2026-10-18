@@ -39,8 +39,20 @@ pub struct InFlight {
     pub count: u8,
     /// `age_ms` the stream was encoded with.
     pub age_ms: u64,
-    /// Length of the encoded observation the fragments are cut from.
+    /// Length of the encoded observation the fragments are cut from. (A
+    /// fragment cut from the wrong offset would reassemble to corrupt bytes.)
     pub len: usize,
+}
+
+/// Emitted for a broadcast observation a peer has confirmed holding via an
+/// `Ack` receipt: [`ConfidenceEvent::peer`] is who received it and `id` is
+/// the broadcast's content-ID. Produced through `Exchange::drain_events`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConfidenceEvent {
+    /// The node id of the peer that acknowledged receiving the observation.
+    pub peer: NodeId,
+    /// The content-ID of the broadcast observation that was acknowledged.
+    pub id: ObservationId,
 }
 
 /// A single peer the [`Exchange`] is tracking.
@@ -110,15 +122,24 @@ pub struct Exchange<A> {
     salt: u32,
     peers: Vec<Peer<A>, { consts::MAX_PEERS }>,
     rr: usize,
-    /// `(id, addr)` for each addressed message received from, or fully sent
-    /// to, `addr` during its current contact. [`Exchange::next_frame`] uses it
-    /// so an addressed message is offered to each peer at most once per contact
-    /// and never bounced straight back to its source. Records for an address
-    /// are dropped when its contact starts or ends. Bounded at
+    /// `(id, addr, direction)` for each addressed message received from, or
+    /// fully sent to, `addr` during its current contact. [`Exchange::next_frame`]
+    /// uses it so an addressed message is offered to each peer at most once per
+    /// contact and never bounced straight back to its source. Records for an
+    /// address are dropped when its contact starts or ends. Bounded at
     /// `SEND_QUEUE_CAP`: on overflow the oldest record is evicted, so
     /// suppression only weakens (ID dedup absorbs a repeat) and never fails
-    /// closed on a `no_std` target.
-    bounce: Vec<(ObservationId, A), { consts::SEND_QUEUE_CAP }>,
+    /// closed on a `no_std` target. The `direction` (a `Sent` or `Received`)
+    /// lets a bounce only suppress an id the local node actually handed out to,
+    /// or received from, `addr` — never one merely observed while forwarding.
+    bounce: Vec<(ObservationId, A, BounceKind), { consts::SEND_QUEUE_CAP }>,
+    /// `(id, addr)` for each broadcast observation dispatched to `addr` on the
+    /// broadcast emit path. Used to validate inbound `Ack` receipts against
+    /// broadcasts we actually sent; overflow drops the oldest record.
+    bcast_sent: Vec<(ObservationId, A), { consts::BCAST_SENT_CAP }>,
+    /// One [`ConfidenceEvent`] per broadcast id a peer has confirmed, pushed
+    /// drop-oldest when full. Drain through [`Exchange::drain_events`].
+    events: Vec<ConfidenceEvent, { consts::EVENT_QUEUE_CAP }>,
     /// How to undo the last frame [`Exchange::next_frame`] produced.
     undo: Option<Undo<A>>,
 }
@@ -132,6 +153,8 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
             peers: Vec::new(),
             rr: 0,
             bounce: Vec::new(),
+            bcast_sent: Vec::new(),
+            events: Vec::new(),
             undo: None,
         }
     }
@@ -252,7 +275,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
             if let Some(pos) = self
                 .bounce
                 .iter()
-                .position(|(b, a)| *b == id && *a == undo.addr)
+                .position(|(b, a, _)| *b == id && *a == undo.addr)
             {
                 self.bounce.remove(pos);
             }
@@ -322,15 +345,29 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         now: Tick,
         out: &mut [u8],
     ) -> Option<(A, usize)> {
+        let addr = self.peers[idx].addr.clone();
         loop {
             let front = *self.peers[idx].send_queue.first()?;
             if let Some(obs) = store.get(&front, now) {
                 if let Some(res) = self.emit(idx, front, &obs, None, mtu, out) {
+                    self.record_bcast_sent(front, addr.clone());
                     return Some(res);
                 }
             }
             self.peers[idx].send_queue.remove(0);
         }
+    }
+
+    /// Records that a broadcast for `id` was dispatched to `addr`, evicting the
+    /// oldest record when `bcast_sent` is full.
+    fn record_bcast_sent(&mut self, id: ObservationId, addr: A) {
+        if bcast_sent_contains(&self.bcast_sent, id, &addr) {
+            return;
+        }
+        if self.bcast_sent.is_full() {
+            self.bcast_sent.remove(0);
+        }
+        let _ = self.bcast_sent.push((id, addr));
     }
 
     /// Addressed store-and-forward for the peer at `idx`: start sending one
@@ -410,7 +447,9 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                 peer.send_queue.remove(pos);
                 undo.requeue = Some((pos, id));
             }
-            if obs.to.is_some() && record_bounce(&mut self.bounce, id, addr.clone()) {
+            if obs.to.is_some()
+                && record_bounce(&mut self.bounce, id, addr.clone(), BounceKind::Sent)
+            {
                 undo.bounce = Some(id);
             }
         }
@@ -421,6 +460,22 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
     /// Returns the current peers.
     pub fn peers(&self) -> &[Peer<A>] {
         &self.peers
+    }
+
+    /// [`Exchange`]s emit [`ConfidenceEvent`]s through [`Exchange::drain_events`];
+    /// `tines` surfaces them to its transport, so the drain method is unused
+    /// inside `tines-core` itself.
+    #[allow(dead_code)]
+    pub(crate) fn drain_events(&mut self) -> Vec<ConfidenceEvent, { consts::EVENT_QUEUE_CAP }> {
+        let mut drained: Vec<ConfidenceEvent, { consts::EVENT_QUEUE_CAP }> = Vec::new();
+        while !self.events.is_empty() {
+            if drained.is_full() {
+                break;
+            }
+            let ev = self.events.remove(0);
+            let _ = drained.push(ev);
+        }
+        drained
     }
 
     fn add_peer(&mut self, addr: A) {
@@ -442,7 +497,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
 
     /// Drops the bounce records for `addr`: suppression lasts one contact.
     fn forget_bounces(&mut self, addr: &A) {
-        self.bounce.retain(|(_, a)| a != addr);
+        self.bounce.retain(|(_, baddr, _)| baddr != addr);
     }
 
     /// Returns the index of the peer at `addr`, adding it as an implicit
@@ -492,11 +547,44 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                 let obs = peer.reassembler.feed(id, index, count, &data, now)?;
                 self.accept(obs, addr, store, now)
             }
-            // Ack carries a handoff receipt of content-IDs; it produces no
-            // Observation here (ack handling in the exchange layer is out of
-            // scope for this wire-frame task).
-            Frame::Ack { .. } => None,
+            Frame::Ack { from, ids } => self.on_ack(addr, from, ids, store, now),
         }
+    }
+
+    /// Handles an inbound `Ack` receipt from the peer at `addr`, whose node id
+    /// is `from`.
+    ///
+    /// For each id in the receipt: an id the local node `Sent` to `addr` (per
+    /// the bounce table) is released from custody so it is never forwarded
+    /// again; an id the node dispatched as a broadcast to `addr` (per
+    /// `bcast_sent`) fires a [`ConfidenceEvent`]. A receipt for an id the node
+    /// never dispatched to `addr` is silently ignored. No path panics on
+    /// malformed input — an oversized id list just drops the overflow.
+    fn on_ack<S: Store>(
+        &mut self,
+        addr: A,
+        from: NodeId,
+        ids: Vec<ObservationId, { consts::ACK_IDS_CAP }>,
+        store: &mut S,
+        now: Tick,
+    ) -> Option<Observation> {
+        for id in ids.iter() {
+            if was_sent(&self.bounce, *id, &addr) {
+                // Addressed: release custody for the local copy if still held
+                // and still addressed (a broadcast can never match `was_sent`).
+                let held_addressed = store.get(id, now).is_some_and(|obs| obs.to.is_some());
+                if held_addressed {
+                    store.release(id);
+                }
+            } else if bcast_sent_contains(&self.bcast_sent, *id, &addr) {
+                // Broadcast: the peer confirms it holds our broadcast.
+                let _ = self.events.push(ConfidenceEvent {
+                    peer: from,
+                    id: *id,
+                });
+            }
+        }
+        None
     }
 
     /// Stores an observation received from `addr`, returning it if it was new.
@@ -519,7 +607,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         let returned = obs.clone();
         let res = store.insert(obs, now);
         if addressed && res.is_ok() {
-            record_bounce(&mut self.bounce, id, addr);
+            record_bounce(&mut self.bounce, id, addr, BounceKind::Received);
         }
         match res {
             Ok(true) => Some(returned),
@@ -581,7 +669,7 @@ fn reject(obs: &Observation) -> bool {
 fn select_addressed<S: Store, A: PartialEq>(
     store: &S,
     now: Tick,
-    bounce: &[(ObservationId, A)],
+    bounce: &[(ObservationId, A, BounceKind)],
     addr: &A,
     after: Option<ObservationId>,
     mut predicate: impl FnMut(&ObservationId, &Observation) -> bool,
@@ -604,7 +692,7 @@ fn select_addressed<S: Store, A: PartialEq>(
         let Some(obs) = store.get(id, now) else {
             return;
         };
-        if obs.to.is_none() || reject(&obs) || !predicate(id, &obs) {
+        if obs.to.is_none() || reject(&obs) || store.is_released(id) || !predicate(id, &obs) {
             return;
         }
         if is_ahead {
@@ -616,21 +704,50 @@ fn select_addressed<S: Store, A: PartialEq>(
     ahead.or(wrapped)
 }
 
-/// Returns `true` when `(id, addr)` has been recorded in the bounce table —
-/// i.e. `id` was received from, or sent to, `addr` this contact. Offering it
-/// to that peer again would only bounce, so it is skipped.
-fn is_sourced<A: PartialEq>(bounce: &[(ObservationId, A)], id: ObservationId, addr: &A) -> bool {
-    bounce
-        .iter()
-        .any(|(bid, baddr)| *bid == id && baddr == addr)
+/// The direction that produced a bounce record: the local node `Sent` the id
+/// to `addr`, or `Received` it from `addr`. Used to make bounce suppression
+/// direction-aware — a `Sent` record can only release custody, a `Received`
+/// record can only suppress re-offering.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BounceKind {
+    Sent,
+    Received,
 }
 
-/// Records `(id, addr)` in the bounce table, evicting the oldest record when
-/// full. Returns `true` if a new record was added.
+/// Returns `true` when `(id, addr)` has been recorded in the bounce table —
+/// i.e. `id` was received from, or sent to, `addr` this contact under either
+/// direction. Offering it to that peer again would only bounce, so it is
+/// skipped.
+fn is_sourced<A: PartialEq>(
+    bounce: &[(ObservationId, A, BounceKind)],
+    id: ObservationId,
+    addr: &A,
+) -> bool {
+    bounce
+        .iter()
+        .any(|(bid, baddr, _kind)| *bid == id && baddr == addr)
+}
+
+/// Whether `id` was `Sent` to `addr`. An inbound `Ack` from `addr` may only
+/// release custody of an id the local node actually dispatched to it — never
+/// an id it only received, or merely observed while forwarding.
+fn was_sent<A: PartialEq>(
+    bounce: &[(ObservationId, A, BounceKind)],
+    id: ObservationId,
+    addr: &A,
+) -> bool {
+    bounce
+        .iter()
+        .any(|(bid, baddr, kind)| *bid == id && baddr == addr && *kind == BounceKind::Sent)
+}
+
+/// Records an `(id, addr, direction)` bounce in the table, evicting the oldest
+/// record when full. Returns `true` if a new record was added.
 fn record_bounce<A: PartialEq>(
-    bounce: &mut Vec<(ObservationId, A), { consts::SEND_QUEUE_CAP }>,
+    bounce: &mut Vec<(ObservationId, A, BounceKind), { consts::SEND_QUEUE_CAP }>,
     id: ObservationId,
     addr: A,
+    kind: BounceKind,
 ) -> bool {
     if is_sourced(bounce, id, &addr) {
         return false;
@@ -638,8 +755,21 @@ fn record_bounce<A: PartialEq>(
     if bounce.is_full() {
         bounce.remove(0);
     }
-    let _ = bounce.push((id, addr));
+    let _ = bounce.push((id, addr, kind));
     true
+}
+
+/// Whether `(id, addr)` has been recorded in `bcast_sent` — i.e. the local node
+/// actually dispatched that broadcast to that peer. Used to validate inbound
+/// `Ack` receipts against broadcasts we truly sent.
+fn bcast_sent_contains<A: PartialEq>(
+    bcast_sent: &[(ObservationId, A)],
+    id: ObservationId,
+    addr: &A,
+) -> bool {
+    bcast_sent
+        .iter()
+        .any(|(bid, baddr)| *bid == id && baddr == addr)
 }
 
 /// Encodes one frame of `obs` (whose id is `id`) into `out`.
@@ -1871,6 +2001,312 @@ mod tests {
             store.gets.get(),
             0,
             "custody must not read broadcast observations"
+        );
+    }
+
+    /// Drives `ex` so that `id` (addressed or broadcast) is emitted to `addr`:
+    /// contact, an empty summary (so the peer lacks everything), then poll
+    /// `next_frame` until an Obs carrying `id` goes out. The emit path records
+    /// the Sent bounce (addressed) or the `bcast_sent` entry (broadcast).
+    fn deliver_to(ex: &mut Exchange<u8>, store: &mut MemStore, addr: u8, id: ObservationId) {
+        ex.on_event(Event::Contact(addr), store, 0);
+        empty_summary(ex, store, addr, [2; 16]);
+        for _ in 0..consts::MAX_FRAME {
+            if matches!(
+                poll_frame(ex, store, consts::MAX_FRAME, 0),
+                Some((_, Frame::Obs { obs, .. }, _)) if obs.id() == id
+            ) {
+                break;
+            }
+        }
+    }
+
+    /// An Ack for an addressed observation the peer received releases custody:
+    /// the id is marked released and is no longer selected for forwarding.
+    #[test]
+    fn ack_releases_addressed_custody_after_sent() {
+        let peer: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let x = addressed([3; 16], 1, peer, b"hi");
+        let x_id = x.id();
+        store.insert(x, 0).unwrap();
+        deliver_to(&mut ex, &mut store, 1, x_id);
+        assert!(
+            !store.is_released(&x_id),
+            "custody is held until the peer confirms delivery"
+        );
+
+        let ids = heapless::Vec::from_slice(&[x_id]).unwrap();
+        let ack = Frame::Ack { from: peer, ids };
+        ex.on_event(Event::Frame(1, frame_bytes(&ack)), &mut store, 0);
+
+        assert!(
+            store.is_released(&x_id),
+            "an Ack releases custody for a dispatched addressed id"
+        );
+    }
+
+    /// After an Ack releases custody, a new contact drops the bounce records,
+    /// but the released id is still not selected: the is_released mark on the
+    /// stored entry keeps it out of forwarding.
+    #[test]
+    fn ack_released_id_will_reselect_and_reject() {
+        let peer: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let x = addressed([3; 16], 1, peer, b"hi");
+        let x_id = x.id();
+        store.insert(x, 0).unwrap();
+        deliver_to(&mut ex, &mut store, 1, x_id);
+
+        let ids = heapless::Vec::from_slice(&[x_id]).unwrap();
+        let ack = Frame::Ack { from: peer, ids };
+        ex.on_event(Event::Frame(1, frame_bytes(&ack)), &mut store, 0);
+        assert!(store.is_released(&x_id), "an Ack releases custody of X");
+
+        // A new contact drops the bounce records; the released id must still be
+        // refused by the custody scan.
+        ex.on_event(Event::Lost(1), &mut store, 0);
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        empty_summary(&mut ex, &mut store, 1, peer);
+
+        let mut reemitted = false;
+        for _ in 0..consts::MAX_FRAME {
+            if matches!(
+                poll_frame(&mut ex, &store, consts::MAX_FRAME, 0),
+                Some((_, Frame::Obs { obs, .. }, _)) if obs.id() == x_id
+            ) {
+                reemitted = true;
+                break;
+            }
+        }
+        assert!(
+            !reemitted,
+            "a released id must not be selected again after a new contact"
+        );
+    }
+
+    /// An Ack for a broadcast we dispatched to the peer fires exactly one
+    /// ConfidenceEvent naming the peer and the broadcast id.
+    #[test]
+    fn ack_broadcast_fires_confidence_event() {
+        let peer: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let b = obs([3; 16], 1, 0, None, b"t", b"bc");
+        let b_id = b.id();
+        store.insert(b, 0).unwrap();
+        deliver_to(&mut ex, &mut store, 1, b_id);
+        assert!(!store.is_released(&b_id));
+
+        let ids = heapless::Vec::from_slice(&[b_id]).unwrap();
+        let ack = Frame::Ack { from: peer, ids };
+        ex.on_event(Event::Frame(1, frame_bytes(&ack)), &mut store, 0);
+
+        let events = ex.drain_events();
+        assert_eq!(
+            events.len(),
+            1,
+            "one broadcast ack fires one confidence event"
+        );
+        assert_eq!(events[0].peer, peer);
+        assert_eq!(events[0].id, b_id);
+    }
+
+    /// A broadcast Ack does not release custody: there is no local addressed
+    /// copy to release, so the broadcast stays held.
+    #[test]
+    fn ack_broadcast_release_does_not_store_broadcast() {
+        let peer: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let b = obs([3; 16], 1, 0, None, b"t", b"bc");
+        let b_id = b.id();
+        store.insert(b, 0).unwrap();
+        deliver_to(&mut ex, &mut store, 1, b_id);
+        assert!(
+            !store.is_released(&b_id),
+            "a broadcast is held, not released"
+        );
+
+        let ids = heapless::Vec::from_slice(&[b_id]).unwrap();
+        let ack = Frame::Ack { from: peer, ids };
+        ex.on_event(Event::Frame(1, frame_bytes(&ack)), &mut store, 0);
+
+        assert!(
+            !store.is_released(&b_id),
+            "an Ack must not release a broadcast we dispatched"
+        );
+    }
+
+    /// An Ack for an id the local node only received (not dispatched) must NOT
+    /// release it: release applies to dispatched ids only.
+    #[test]
+    fn is_released_not_selected_after_ack() {
+        let peer: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        // A broadcast received from the peer: the node only received it.
+        let x = obs(peer, 1, 0, None, b"t", b"hi");
+        let x_id = x.id();
+        let frame = Frame::Obs { from: peer, obs: x };
+        ex.on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0);
+        assert!(store.contains(&x_id));
+        assert!(store.get(&x_id, 0).unwrap().to.is_none());
+
+        let ids = heapless::Vec::from_slice(&[x_id]).unwrap();
+        let ack = Frame::Ack { from: peer, ids };
+        ex.on_event(Event::Frame(1, frame_bytes(&ack)), &mut store, 0);
+
+        assert!(
+            !store.is_released(&x_id),
+            "an Ack must not release an id the local node only received"
+        );
+    }
+
+    /// The custody scan skips a released id but still offers non-released ids:
+    /// releasing the broadcast leaves the addressed id offered, and releasing
+    /// the addressed id leaves nothing offered.
+    #[test]
+    fn select_addressed_still_selects_non_released() {
+        let mut store = MemStore::new();
+        let a = addressed([3; 16], 1, [4; 16], b"a");
+        let b = obs([3; 16], 2, 0, None, b"t", b"bc");
+        let a_id = a.id();
+        let b_id = b.id();
+        store.insert(a, 0).unwrap();
+        store.insert(b, 0).unwrap();
+
+        // Release the broadcast only: the non-released addressed id is still
+        // offered.
+        store.release(&b_id);
+        let empty: &[(ObservationId, u8, BounceKind)] = &[];
+        let found = select_addressed(&store, 0, empty, &1u8, None, |_id, obs| obs.to.is_some());
+        assert_eq!(found.map(|(id, _)| id), Some(a_id));
+
+        // Release the addressed id too: nothing remains selectable.
+        store.release(&a_id);
+        let found = select_addressed(&store, 0, empty, &1u8, None, |_id, obs| obs.to.is_some());
+        assert!(found.is_none(), "an id released by an Ack is not selected");
+    }
+
+    /// After an Ack releases custody, the release mark persists on the stored
+    /// entry across a new contact: dropping the exchange's bounce records does
+    /// not re-open the id, so it is never offered again.
+    #[test]
+    fn is_released_not_offered_after_contact_ends() {
+        let peer: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let x = addressed([3; 16], 1, peer, b"hi");
+        let x_id = x.id();
+        store.insert(x, 0).unwrap();
+        deliver_to(&mut ex, &mut store, 1, x_id);
+
+        let ids = heapless::Vec::from_slice(&[x_id]).unwrap();
+        let ack = Frame::Ack { from: peer, ids };
+        ex.on_event(Event::Frame(1, frame_bytes(&ack)), &mut store, 0);
+        assert!(
+            store.is_released(&x_id),
+            "an Ack releases custody for a dispatched id"
+        );
+
+        // A new contact drops the exchange's bounce records, but the release
+        // mark on the stored entry persists.
+        ex.on_event(Event::Lost(1), &mut store, 0);
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        assert!(
+            store.is_released(&x_id),
+            "the release mark persists across a new contact; the id is not re-offered"
+        );
+    }
+
+    /// A broadcast Ack from a peer that never held the broadcast fires no
+    /// ConfidenceEvent: the receipt names a broadcast we did not dispatch to
+    /// that peer.
+    #[test]
+    fn ack_broadcast_forged_id_no_confidence() {
+        let peer: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let b = obs([3; 16], 1, 0, None, b"t", b"bc");
+        let b_id = b.id();
+        store.insert(b, 0).unwrap();
+        // Dispatch the broadcast to a different peer (addr 2), not addr 1.
+        deliver_to(&mut ex, &mut store, 2, b_id);
+
+        // Peer 1 (addr 1) claims to hold b_id though it never did.
+        let ids = heapless::Vec::from_slice(&[b_id]).unwrap();
+        let ack = Frame::Ack { from: peer, ids };
+        ex.on_event(Event::Frame(1, frame_bytes(&ack)), &mut store, 0);
+
+        let events = ex.drain_events();
+        assert!(
+            events.is_empty(),
+            "a broadcast Ack for a broadcast not sent to the peer fires no confidence event"
+        );
+    }
+
+    /// drain_events returns confidence events oldest-first, in the order the
+    /// broadcasts were acknowledged.
+    #[test]
+    fn drain_events_returns_confidence_events_oldest_first() {
+        let peer: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let a = obs([3; 16], 1, 0, None, b"t", b"bc-a");
+        let b = obs([3; 16], 2, 0, None, b"t", b"bc-b");
+        let a_id = a.id();
+        let b_id = b.id();
+        store.insert(a, 0).unwrap();
+        store.insert(b, 0).unwrap();
+        deliver_to(&mut ex, &mut store, 1, a_id);
+        deliver_to(&mut ex, &mut store, 1, b_id);
+
+        let ack_for = |ids: heapless::Vec<ObservationId, { consts::ACK_IDS_CAP }>| Frame::Ack {
+            from: peer,
+            ids,
+        };
+
+        let ids_a = heapless::Vec::from_slice(&[a_id]).unwrap();
+        ex.on_event(Event::Frame(1, frame_bytes(&ack_for(ids_a))), &mut store, 0);
+        let ids_b = heapless::Vec::from_slice(&[b_id]).unwrap();
+        ex.on_event(Event::Frame(1, frame_bytes(&ack_for(ids_b))), &mut store, 0);
+
+        let events = ex.drain_events();
+        assert_eq!(
+            events.len(),
+            2,
+            "each broadcast ack fires a confidence event"
+        );
+        assert_eq!(events[0].id, a_id, "events come back oldest-first");
+        assert_eq!(events[1].id, b_id);
+    }
+
+    /// drain_events empties the queue: a second drain yields nothing.
+    #[test]
+    fn drain_events_empties_queue() {
+        let peer: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let b = obs([3; 16], 1, 0, None, b"t", b"bc");
+        let b_id = b.id();
+        store.insert(b, 0).unwrap();
+        deliver_to(&mut ex, &mut store, 1, b_id);
+
+        let ids = heapless::Vec::from_slice(&[b_id]).unwrap();
+        let ack = Frame::Ack { from: peer, ids };
+        ex.on_event(Event::Frame(1, frame_bytes(&ack)), &mut store, 0);
+
+        let first = ex.drain_events();
+        assert_eq!(first.len(), 1, "the queued confidence event is drained");
+        assert_eq!(first[0].id, b_id);
+
+        let second = ex.drain_events();
+        assert!(
+            second.is_empty(),
+            "drain_events empties the queue; a second drain yields nothing"
         );
     }
 }

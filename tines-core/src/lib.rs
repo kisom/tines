@@ -8,6 +8,7 @@ pub mod belief;
 pub mod bloom;
 pub mod consts;
 pub mod exchange;
+pub use exchange::ConfidenceEvent;
 pub mod frag;
 #[cfg(feature = "alloc")]
 pub mod mem_store;
