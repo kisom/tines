@@ -20,16 +20,16 @@ Three layers, each a separate concern, top to bottom:
 
 ```
  ┌──────────────────────────────────────────┐
- │ memory      — "my priors": beliefs per    │  derived, local, never synced
- │               topic, computed from         │
- │               storage under a policy       │
+ │ memory      — "my priors": beliefs per   │  derived, local, never synced
+ │               topic, computed from       │
+ │               storage under a policy     │
  ├──────────────────────────────────────────┤
- │ storage     — append-only log of raw      │  synced by set-union
- │               observations; local          │
- │               trimming policy              │
+ │ storage     — append-only log of raw     │  synced by set-union
+ │               observations; local        │
+ │               trimming policy            │
  ├──────────────────────────────────────────┤
- │ comms       — contact-driven exchange     │  PHY-agnostic; transport
- │               of observations              │  trait + adapters
+ │ comms       — contact-driven exchange    │  PHY-agnostic; transport
+ │               of observations            │  trait + adapters
  └──────────────────────────────────────────┘
 ```
 
