@@ -6,6 +6,8 @@ that each robot's picture of the world improves over time. No robot *depends* on
 receiving anything — it can do its job on its own observations — but there is no
 reason not to share.
 
+![tines](tines.jpg)
+
 `tines` is the library that does this: a store of timestamped-by-age
 observations, a belief layer derived from them, and a delay-tolerant exchange
 protocol that runs over whatever datagram link the robot has. The name is from
