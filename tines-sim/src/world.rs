@@ -10,7 +10,7 @@ use rand::{rngs::StdRng, SeedableRng};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use tines_core::transport::Event;
+use tines_core::transport::{Event, FrameBuf};
 
 /// World configuration for a `SimWorld`.
 #[derive(Clone, Debug)]
@@ -104,6 +104,18 @@ impl SimWorld {
     /// Total frames dropped by the loss roll-out.
     pub fn frames_dropped(&self) -> u64 {
         self.frames_dropped
+    }
+
+    /// Inject a raw inbound `Frame` into `node`'s mailbox without going through
+    /// the transport's reachability, MTU, or loss checks.
+    ///
+    /// A test seam: it lets tests feed arbitrary or malformed byte strings
+    /// straight to a node's exchange, which is where the "never panic on
+    /// untrusted wire input" guarantee lives. The frame is not validated here —
+    /// a malformed frame is dropped by the receiving node's
+    /// [`Exchange`](tines_core::Exchange) rather than stored.
+    pub fn inject_frame(&mut self, node: usize, peer: usize, bytes: FrameBuf) {
+        self.inboxes[node].push_back(Event::Frame(peer, bytes));
     }
 }
 
