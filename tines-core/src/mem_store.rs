@@ -110,6 +110,14 @@ impl Store for MemStore {
         }
     }
 
+    fn for_each_addressed_id(&self, f: &mut dyn FnMut(&ObservationId)) {
+        for (id, held) in self.map.iter() {
+            if held.obs.to.is_some() {
+                f(id);
+            }
+        }
+    }
+
     fn for_each_topic(&self, prefix: &[u8], now: Tick, f: &mut dyn FnMut(&Observation)) {
         for held in self.map.values() {
             if held.obs.topic.starts_with(prefix) {

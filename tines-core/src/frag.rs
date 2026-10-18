@@ -7,6 +7,26 @@ use heapless::Vec;
 /// Header allowance per fragment (bytes), pinned.
 pub const FRAG_OVERHEAD: usize = 64;
 
+/// The most fragments one observation may be split into: the reassembler
+/// tracks received indices in a `u64` bitset.
+pub(crate) const MAX_FRAGMENTS: usize = 64;
+
+/// Splits an encoded observation of `len` bytes for a link of `mtu` bytes,
+/// returning `(chunk, count)`: the data bytes per fragment and the number of
+/// fragments. `None` when `mtu` leaves no room for data or `count` would
+/// exceed [`MAX_FRAGMENTS`].
+pub(crate) fn plan(len: usize, mtu: usize) -> Option<(usize, usize)> {
+    let chunk = mtu.saturating_sub(FRAG_OVERHEAD);
+    if chunk == 0 {
+        return None;
+    }
+    let count = len.div_ceil(chunk);
+    if count == 0 || count > MAX_FRAGMENTS {
+        return None;
+    }
+    Some((chunk, count))
+}
+
 /// Encodes `obs` as one Obs frame if it fits in `mtu`, else as N Frag frames.
 /// Returns the number of frames; writes each via `emit(frame_bytes)`.
 pub fn fragment(
@@ -32,15 +52,7 @@ pub fn fragment(
     let mut obs_buf = [0u8; consts::MAX_FRAME * 2];
     let obs_bytes = postcard::to_slice(obs, &mut obs_buf).map_err(|_| WireError::TooLarge)?;
 
-    let chunk = mtu.saturating_sub(FRAG_OVERHEAD);
-    if chunk == 0 {
-        return Err(WireError::TooLarge);
-    }
-    #[allow(clippy::manual_div_ceil)]
-    let count = (obs_bytes.len() + chunk - 1) / chunk;
-    if count > 64 {
-        return Err(WireError::TooLarge);
-    }
+    let (chunk, count) = plan(obs_bytes.len(), mtu).ok_or(WireError::TooLarge)?;
 
     for i in 0..count {
         let start = i * chunk;
@@ -68,8 +80,8 @@ pub struct Reassembler {
     received: u64,
     started_at: Tick,
     buf: Vec<u8, { consts::MAX_FRAME * 2 }>,
-    offs: [u16; 64],
-    lens: [u16; 64],
+    offs: [u16; MAX_FRAGMENTS],
+    lens: [u16; MAX_FRAGMENTS],
 }
 
 impl Reassembler {
@@ -80,8 +92,8 @@ impl Reassembler {
             received: 0,
             started_at: 0,
             buf: heapless::Vec::new(),
-            offs: [u16::MAX; 64],
-            lens: [0u16; 64],
+            offs: [u16::MAX; MAX_FRAGMENTS],
+            lens: [0u16; MAX_FRAGMENTS],
         }
     }
 
@@ -96,7 +108,11 @@ impl Reassembler {
         // 1. Drop malformed indices: count must be in 1..=64 and index < count.
         //    `index >= 64` is guarded too so the `1 << index` bitmap never
         //    shifts out of bounds on adversarial wire input.
-        if count == 0 || count > 64 || (index as usize) >= 64 || index >= count {
+        if count == 0
+            || usize::from(count) > MAX_FRAGMENTS
+            || usize::from(index) >= MAX_FRAGMENTS
+            || index >= count
+        {
             return None;
         }
 
@@ -112,8 +128,8 @@ impl Reassembler {
             self.received = 0;
             self.started_at = now;
             self.buf.clear();
-            self.offs = [u16::MAX; 64];
-            self.lens = [0u16; 64];
+            self.offs = [u16::MAX; MAX_FRAGMENTS];
+            self.lens = [0u16; MAX_FRAGMENTS];
         }
 
         // 3. Append the fragment data to the flat buffer in arrival order and
@@ -181,8 +197,8 @@ impl Reassembler {
         self.received = 0;
         self.started_at = 0;
         self.buf.clear();
-        self.offs = [u16::MAX; 64];
-        self.lens = [0u16; 64];
+        self.offs = [u16::MAX; MAX_FRAGMENTS];
+        self.lens = [0u16; MAX_FRAGMENTS];
     }
 }
 

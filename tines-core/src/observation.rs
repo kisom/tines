@@ -32,11 +32,14 @@ pub struct Observation {
 }
 
 impl Observation {
-    /// Content-derived identity: Blake2s-256 over
-    /// `(observer, seq, topic_len, topic, payload_len, payload)`, first 16 bytes.
+    /// Content-derived identity: the first 16 bytes of Blake2s-256 over
+    /// `observer ‖ seq_le ‖ topic_len_le(u16) ‖ topic ‖ payload_len_le(u16) ‖
+    /// payload ‖ to_marker`, where `to_marker` is `0x00` for broadcast
+    /// (`to = None`) and `0x01 ‖ node_id` for `to = Some(node_id)`.
     ///
-    /// The hash ignores `age_ms` and `observed_at`, so two observations that
-    /// differ only in age/time are still treated as the same key.
+    /// The hash ignores `age_ms`, `observed_at` and `lifetime_ms`, so two
+    /// observations that differ only in age, time or lifetime are still
+    /// treated as the same key.
     pub fn id(&self) -> ObservationId {
         let mut hasher = Blake2s256::new();
         hasher.update(self.observer);

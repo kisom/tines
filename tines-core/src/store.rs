@@ -64,6 +64,16 @@ pub trait Store {
     /// (`to == None`), i.e. broadcasts. Order is unspecified.
     fn for_each_broadcast_id(&self, f: &mut dyn FnMut(&ObservationId));
 
+    /// Visit the ids of observations addressed to someone (`to == Some`).
+    /// Order is unspecified.
+    ///
+    /// The default visits every id, which is correct since callers still
+    /// check `to`; backends that can filter cheaply should override it so the
+    /// exchange does not read every broadcast on each poll.
+    fn for_each_addressed_id(&self, f: &mut dyn FnMut(&ObservationId)) {
+        self.for_each_id(f)
+    }
+
     /// Visit every stored observation whose topic starts with `prefix`
     /// (an empty prefix matches all), each age-adjusted to `now`.
     fn for_each_topic(&self, prefix: &[u8], now: Tick, f: &mut dyn FnMut(&Observation));

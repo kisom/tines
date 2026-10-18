@@ -17,12 +17,6 @@ use crate::{
 };
 use heapless::Vec;
 
-/// The maximum number of fragments an observation may be split into.
-///
-/// Matches [`crate::fragment`]: the reassembler tracks up to 64 indices via a
-/// bitset, so `count` is capped at 64 on both ends.
-const MAX_FRAGMENTS: usize = 64;
-
 /// Worst-case bytes a [`Frame::Summary`] adds around its bloom bits: the
 /// variant tag (1), `from` (16), `salt` as a varint (up to 5), and the bits
 /// length as a varint (up to 2).
@@ -590,7 +584,7 @@ fn select_addressed<S: Store, A: PartialEq>(
 ) -> Option<(ObservationId, Observation)> {
     let mut ahead: Option<(ObservationId, Observation)> = None;
     let mut wrapped: Option<(ObservationId, Observation)> = None;
-    store.for_each_id(&mut |id| {
+    store.for_each_addressed_id(&mut |id| {
         let is_ahead = after.is_none_or(|a| *id > a);
         let beats = |pick: &Option<(ObservationId, Observation)>| {
             pick.as_ref().is_none_or(|(best, _)| id < best)
@@ -683,14 +677,7 @@ fn encode_frame(
     };
     let mut obs_buf = [0u8; consts::MAX_FRAME * 2];
     let obs_bytes = postcard::to_slice(&frozen, &mut obs_buf).ok()?;
-    let chunk = mtu.saturating_sub(crate::frag::FRAG_OVERHEAD);
-    if chunk == 0 {
-        return None;
-    }
-    let count = obs_bytes.len().div_ceil(chunk);
-    if count == 0 || count > MAX_FRAGMENTS {
-        return None;
-    }
+    let (chunk, count) = crate::frag::plan(obs_bytes.len(), mtu)?;
     let index = match resume {
         Some(f) if f.len != obs_bytes.len() || usize::from(f.count) != count => return None,
         Some(f) => f.next,
@@ -1802,5 +1789,78 @@ mod tests {
                 panic!("sent {:?} back to carrier {addr}", obs.id());
             }
         }
+    }
+
+    /// A `MemStore` that counts `get` calls.
+    struct CountingStore {
+        inner: MemStore,
+        gets: core::cell::Cell<usize>,
+    }
+
+    impl Store for CountingStore {
+        fn insert(&mut self, obs: Observation, now: Tick) -> Result<bool, crate::StoreError> {
+            self.inner.insert(obs, now)
+        }
+        fn contains(&self, id: &ObservationId) -> bool {
+            self.inner.contains(id)
+        }
+        fn get(&self, id: &ObservationId, now: Tick) -> Option<Observation> {
+            self.gets.set(self.gets.get() + 1);
+            self.inner.get(id, now)
+        }
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+        fn for_each_id(&self, f: &mut dyn FnMut(&ObservationId)) {
+            self.inner.for_each_id(f)
+        }
+        fn for_each_broadcast_id(&self, f: &mut dyn FnMut(&ObservationId)) {
+            self.inner.for_each_broadcast_id(f)
+        }
+        fn for_each_addressed_id(&self, f: &mut dyn FnMut(&ObservationId)) {
+            self.inner.for_each_addressed_id(f)
+        }
+        fn for_each_topic(&self, prefix: &[u8], now: Tick, f: &mut dyn FnMut(&Observation)) {
+            self.inner.for_each_topic(prefix, now, f)
+        }
+        fn trim(&mut self, policy: &crate::TrimPolicy, now: Tick) -> usize {
+            self.inner.trim(policy, now)
+        }
+    }
+
+    #[test]
+    fn custody_scan_skips_broadcast_observations() {
+        let mut ex = Exchange::new(ME);
+        let mut store = CountingStore {
+            inner: MemStore::new(),
+            gets: core::cell::Cell::new(0),
+        };
+        let mut theirs = Bloom::new(0);
+        for seq in 0..200 {
+            let o = obs([3; 16], seq, 0, None, b"t", b"x");
+            theirs.insert(&o.id());
+            store.insert(o, 0).unwrap();
+        }
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        // The peer already holds every broadcast, so there is nothing to send.
+        let sum = Frame::Summary {
+            from: [2; 16],
+            salt: 0,
+            bits: heapless::Vec::from_slice(theirs.bits()).unwrap(),
+        };
+        ex.on_event(Event::Frame(1, frame_bytes(&sum)), &mut store, 0);
+        let mut buf = [0u8; consts::MAX_FRAME];
+        ex.next_frame(&store, consts::MAX_FRAME, 0, &mut buf); // our summary
+        store.gets.set(0);
+        for _ in 0..10 {
+            assert!(ex
+                .next_frame(&store, consts::MAX_FRAME, 0, &mut buf)
+                .is_none());
+        }
+        assert_eq!(
+            store.gets.get(),
+            0,
+            "custody must not read broadcast observations"
+        );
     }
 }
