@@ -1,6 +1,7 @@
 //! Shared, test-only helper: two `PairTransport`s wired back-to-back as if they
 //! were peers on a datagram link. A `send` on one side surfaces as a `Frame`
-//! on the other; `connect`/`disconnect` broadcast `Contact`/`Lost`.
+//! on the other; `connect`/`disconnect` enqueue `Contact`/`Lost` on the
+//! caller's own queue only.
 //!
 //! Each side owns its own inbound queue (`inbox`) and holds a shared handle to
 //! the other side's queue (`peer_inbox`), so outbound frames land in the peer's

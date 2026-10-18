@@ -4,7 +4,7 @@
 //! bit positions per inserted `ObservationId`. The `salt` value mixes into the
 //! hash so that the same id under different salts lands on different bit
 //! positions, keeping false positives between independent filters low. The
-//! The hashing scheme is pinned (see [`positions`]) so that `tines-core` and the
+//! hashing scheme is pinned (see [`positions`]) so that `tines-core` and the
 //! simulation agree bit-for-bit across builds.
 //!
 //! This type is `core`-only: it owns a fixed `[u8; SUMMARY_BYTES]` array and
@@ -68,9 +68,9 @@ impl Bloom {
 /// `k` in `0..BLOOM_K`:
 /// ```text
 /// a = u64::from_le_bytes(id[0..8]) ^ (salt as u64).wrapping_mul(0x9E3779B97F4A7C15)
-/// b = u64::from_le_bytes(id[8..16]) ^ (salt as u64).wrapping_mul(0xC2B2AE3D27D4EB4F) | 1
+/// b = u64::from_le_bytes(id[8..16]) ^ (salt as u64).wrapping_mul(0xC2B2AE3D27D4EB4F)
 /// h1 = fmix64(a)
-/// h2 = fmix64(b)
+/// h2 = fmix64(b) | 1
 /// capacity = SUMMARY_BYTES * 8
 /// bit_index = (h1 + k * h2) % capacity
 /// ```
