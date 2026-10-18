@@ -82,7 +82,7 @@
 **Interfaces:**
 - Produces: `pub struct ConfidenceEvent { pub peer: NodeId, pub id: ObservationId }` (peer = who received the obs).
 - Bounce records become `(ObservationId, A, BounceKind)` where `enum BounceKind { Sent, Received }` (private). `record_bounce` takes a kind; `is_sourced` matches either kind; a new `was_sent(bounce, id, addr)` matches `Sent` only.
-- Exchange gains `bcast_sent: heapless::Vec<(ObservationId, A), { consts::BCAST_SENT_CAP }>` — broadcast sends are recorded into it on the emit path — plus `events: heapless::Vec<ConfidenceEvent, { consts::EVENT_QUEUE_CAP }>` (push drop-oldest) and `pub fn drain_events(&mut self) -> impl Iterator<Item = ConfidenceEvent> + '_`.
+- Exchange gains `bcast_sent: heapless::Vec<(ObservationId, A), { consts::BCAST_SENT_CAP }>` — broadcast sends are recorded into it on the emit path — plus `events: heapless::Vec<ConfidenceEvent, { consts::EVENT_QUEUE_CAP }>` (push drop-oldest) and `pub(crate) fn drain_events(&mut self) -> heapless::Vec<ConfidenceEvent, { consts::EVENT_QUEUE_CAP }>` (hosts reach it via `Node::drain_events`, Task 5).
 
 - [ ] **Step 1: Write the failing test** — `ack_validates_only_sent_ids`: A sends obs X to peer at addr 1; a forged `Ack { from: [2;16], ids: [X] }` from addr 2 (which never received X) is ignored — `store.is_released(&X)` stays false. `ack_releases_custody`: after A sends X to addr 1, an `Ack` from addr 1 listing X releases it (`is_released(&X)` true, `for_each_addressed_id`/forwarding skips it). `ack_fires_confidence_event`: a broadcast obs Y sent to addr 1, an `Ack` from addr 1 listing Y, `drain_events()` yields one `ConfidenceEvent { peer: [2;16], id: Y }`.
 - [ ] **Step 2: Run test to verify it fails** — `cargo test -p tines-core ack_` — Expected: FAIL.
