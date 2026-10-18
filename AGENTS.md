@@ -15,11 +15,13 @@ observations, a belief layer derived from them, and a delay-tolerant exchange
 protocol over any datagram link. Read the full intent, goals, anti-goals, and
 architecture in the **spec first**:
 
-- **Spec (authoritative):** `docs/superpowers/specs/2026-10-16-tines-design.md`
-- **Implementation plan (how to build it):** `docs/superpowers/plans/2026-10-16-tines-core-and-sim.md`
+- **Core design (authoritative):** `docs/superpowers/specs/2026-10-16-tines-design.md`
+- **Addressed delivery (authoritative):** `docs/superpowers/specs/2026-10-18-tines-addressed-delivery.md`
+- **Implementation plans:** `docs/superpowers/plans/`
 
-The plan argues from the spec. Where the plan is silent, the **spec rules**.
-Do not edit the spec or the plan — they are design history, not source.
+The plans argue from the specs. Where a plan is silent, the **spec rules**.
+Do not edit the specs or the plans — they are design history, not source.
+`README.md` is the user-facing overview and should track the code.
 
 ## Architecture (three layers)
 
@@ -36,20 +38,15 @@ details.
 
 ## Workflow
 
-This project is built by working the implementation **task-by-task, in order**.
-Each task is TDD: write the failing test → see it fail → implement → see it
-pass → commit. Do not skip ahead — later tasks depend on the exact names and
-signatures earlier tasks produce. Tick the task checkboxes as you go.
+Changes are TDD: write the failing test → see it fail → implement → see it
+pass → commit.
 
-For each task:
-
-1. Read its section in the plan.
-2. Implement to the interfaces the plan pins; don't invent new public names.
-3. Before committing, run:
-   - `cargo test --workspace`
-   - `cargo clippy --workspace -- -D warnings`
-   - `sh scripts/check-no-std.sh` (for any core change)
-4. Commit with the **exact** message the plan gives for that task.
+1. Keep the public API small. New public names in `tines-core` (types, trait
+   methods, functions) need a reason; call them out when you add them.
+2. Before committing, run the full gate, which is what CI runs:
+   `sh scripts/ci.sh` (fmt, clippy and rustdoc with warnings as errors, tests
+   with and without `alloc`, and the `thumbv7em-none-eabihf` build).
+3. Use conventional commit messages (`fix(core): …`, `ci: …`, `docs: …`).
 
 The `Node` facade is core, not application glue: an application on any target
 should only need to construct a `Node` with its `NodeId`, store, and transport,
@@ -65,21 +62,25 @@ call `poll()` in its loop, and `observe()` when it sees something.
   unwrapped.
 - Core never maps a transport `Addr` to a `NodeId`; every frame carries the
   sender's `NodeId`.
-- Identity hash covers `(observer, seq, topic, payload)` **only**. `age_ms` and
-  `observed_at` are excluded.
+- Identity hash covers `(observer, seq, topic, payload, to)` **only**.
+  `age_ms`, `observed_at` and `lifetime_ms` are excluded.
+- Addressed observations (`to = Some`) never appear in a summary Bloom
+  filter, and an addressed observation past its `lifetime_ms` is never
+  stored or forwarded.
 - `Node::next_seq()` must be persisted by the application across reboots
   (`boot_count << 32 | counter`); a repeated seq after reboot collides in the
   ID hash and must dedupe silently (`insert` returns `Ok(false)`).
 - `NodeId = [u8; 16]`, `ObservationId = [u8; 16]`, `Tick = u64` (local
   monotonic ms, supplied on every call).
 
-### Review Focus (each pinned to a task with a test)
+### Review Focus (each covered by a test; keep it that way)
 
-1. Reused `seq` after reboot → store dedupes, `insert` returns `Ok(false)`. (Task 3)
-2. Oversized `topic`/`payload` at `observe()` → `Err(TooLarge)`, never truncate/panic. (Task 10)
-3. Garbage frames → dropped, no panic, no store change. (Tasks 2, 6, 7, 13)
-4. Frame from an address with no prior `Contact` → treated as implicit contact. (Task 7)
-5. Tick going backwards → age saturates at stored value, never underflow. (Task 3)
+1. Reused `seq` after reboot → store dedupes, `insert` returns `Ok(false)`.
+2. Oversized `topic`/`payload` at `observe()` → `Err(TooLarge)`, never truncate/panic.
+3. Garbage frames → dropped, no panic, no store change.
+4. Frame from an address with no prior `Contact` → treated as implicit contact.
+5. Tick going backwards → age saturates at stored value, never underflow.
+6. Every emitted frame fits the transport's `mtu()`, including summaries.
 
 ### Compile-time constants (`tines-core/src/consts.rs`)
 
@@ -94,11 +95,11 @@ tines/
   tines-core/   no_std core: Observation, Store/Transport/BeliefPolicy traits,
                 exchange state machine, Node facade, in-memory store, reference
                 policies
-  tines-sim/    std: simulator, contact traces, convergence property tests
+  tines-sim/    std: simulator, contact traces, convergence and relay
+                property tests
 ```
 
-## Not in scope for this plan
+## Not started
 
-`tines-udp`, `tines-sqlite`, `tines-cli`, and `tines-serial` belong to a second
-plan. Do not start them here. The README lives in Task 14 of the plan — it will
-be produced by the implementer; do not author it separately.
+`tines-udp`, `tines-sqlite`, `tines-cli`, and `tines-serial` (from the core
+spec's crate layout) belong to a future plan. Don't start them unless asked.
