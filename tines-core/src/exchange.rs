@@ -63,6 +63,13 @@ pub struct Exchange<A> {
     salt: u32,
     peers: Vec<Peer<A>, { consts::MAX_PEERS }>,
     rr: usize,
+    /// `(id, addr)` of each inbound-addressed message **or** each message
+    /// forwarded through this exchange: `(id, addr)`. [`Exchange::next_frame`]
+    /// uses it to stop an addressed message bouncing back to its source (or to
+    /// the peer it was just forwarded to, i.e. delivering it at most once).
+    /// Bounded at `SEND_QUEUE_CAP`: on overflow the oldest records drop, so
+    /// suppression only weakens — it never fails closed on a `no_std` target.
+    bounce: Vec<(ObservationId, A), { consts::SEND_QUEUE_CAP }>,
 }
 
 impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
@@ -73,6 +80,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
             salt: 0,
             peers: Vec::new(),
             rr: 0,
+            bounce: Vec::new(),
         }
     }
 
@@ -142,6 +150,20 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         for _ in 0..len {
             let idx = self.rr % len;
             self.rr = self.rr.wrapping_add(1);
+            // Snapshot the peer's id/addr before the mutable borrow in
+            // `emit_one`/`forward_addressed`; the immutable bounce lookup below
+            // must not conflict with the mutable peer borrow.
+            let recipient = self.peers[idx].id;
+            let addr = self.peers[idx].addr.clone();
+            // Addressed store-and-forward (one frame): deliver to a known
+            // recipient, else epidemic-forward — attempted before broadcast so
+            // the broadcast diff is never starved when there is no addressed
+            // work to do.
+            if let Some(res) =
+                self.forward_addressed(me, idx, recipient, addr, store, mtu, now, out)
+            {
+                return Some(res);
+            }
             let peer = &mut self.peers[idx];
             if let Some(res) = emit_one(me, peer, store, mtu, now, out) {
                 return Some(res);
@@ -150,7 +172,69 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         None
     }
 
-    /// Returns the tracked peers.
+    /// Addressed store-and-forward for the peer at `idx`: emit one `Obs` frame
+    /// carrying an addressed observation, preferring *delivery*
+    /// (`to == peer.id`) over *epidemic* forwarding (`to == Some(other != me)`).
+    ///
+    /// Never emits if the peer's id is unknown, equals `me`, or every candidate
+    /// was already forwarded to (or received from) this peer — in which case it
+    /// returns `None` so the caller falls through to broadcast `emit_one`.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_addressed<S: Store>(
+        &mut self,
+        me: NodeId,
+        idx: usize,
+        recipient: Option<NodeId>,
+        addr: A,
+        store: &S,
+        mtu: usize,
+        now: Tick,
+        out: &mut [u8],
+    ) -> Option<(A, usize)> {
+        let recipient = recipient?;
+        if recipient == me {
+            return None;
+        }
+        // Delivery first: an addressed observation addressed exactly to this peer.
+        if let Some(id) = select_addressed(store, now, &self.bounce, &addr, |obs| {
+            obs.to == Some(recipient)
+        }) {
+            return self.emit_selected(me, idx, id, store, mtu, now, out);
+        }
+        // Else epidemic: an addressed observation for some other node.
+        if let Some(id) = select_addressed(store, now, &self.bounce, &addr, |obs| {
+            obs.to.is_some() && obs.to != Some(me)
+        }) {
+            return self.emit_selected(me, idx, id, store, mtu, now, out);
+        }
+        None
+    }
+
+    /// Emits one addressed frame for `id` to the peer at `idx` and records
+    /// `(id, peer_addr)` in the bounce table so neither this peer nor the
+    /// message's source receives it again. Returns `None` if the obs is gone
+    /// or does not fit the MTU.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_selected<S: Store>(
+        &mut self,
+        me: NodeId,
+        idx: usize,
+        id: ObservationId,
+        store: &S,
+        mtu: usize,
+        now: Tick,
+        out: &mut [u8],
+    ) -> Option<(A, usize)> {
+        let res = {
+            let peer = &mut self.peers[idx];
+            let obs = store.get(&id, now)?;
+            emit_fragment(me, peer, id, 0, obs, mtu, out)?
+        };
+        let _ = self.bounce.push((id, res.0.clone()));
+        Some(res)
+    }
+
+    /// Returns the current peers.
     pub fn peers(&self) -> &[Peer<A>] {
         &self.peers
     }
@@ -209,8 +293,17 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                     return None;
                 }
                 let returned = obs.clone();
+                let id = obs.id();
+                // A newly-stored addressed message is recorded so it can never
+                // be forwarded back to the peer it came from.
+                let addressed = obs.to.is_some();
                 return match store.insert(obs, now) {
-                    Ok(true) => Some(returned),
+                    Ok(true) => {
+                        if addressed {
+                            let _ = self.bounce.push((id, addr));
+                        }
+                        Some(returned)
+                    }
                     Ok(false) | Err(_) => None,
                 };
             }
@@ -226,8 +319,17 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                         return None;
                     }
                     let returned = obs.clone();
+                    // A reassembled addressed message is recorded so it can
+                    // never be forwarded back to the peer it came from.
+                    let oid = obs.id();
+                    let addressed = obs.to.is_some();
                     return match store.insert(obs, now) {
-                        Ok(true) => Some(returned),
+                        Ok(true) => {
+                            if addressed {
+                                let _ = self.bounce.push((oid, addr));
+                            }
+                            Some(returned)
+                        }
                         Ok(false) | Err(_) => None,
                     };
                 }
@@ -260,6 +362,57 @@ fn reject(obs: &Observation) -> bool {
         return true;
     }
     obs.to.is_some() && obs.age_ms > obs.lifetime_ms.unwrap()
+}
+
+/// Finds one non-expired, well-formed addressed observation matching
+/// `predicate`, skipping any id already forwarded to (or received from)
+/// `addr`.
+///
+/// `reject` excludes expired/malformed addressed messages (the expiry
+/// invariant) and `is_sourced` enforces bounce suppression; iteration stops at
+/// the first match. Returns the stored key of the chosen obs, if any.
+fn select_addressed<S: Store, A: PartialEq>(
+    store: &S,
+    now: Tick,
+    bounce: &[(ObservationId, A)],
+    addr: &A,
+    mut predicate: impl FnMut(&Observation) -> bool,
+) -> Option<ObservationId> {
+    let mut found: Option<ObservationId> = None;
+    store.for_each_id(&mut |id| {
+        if found.is_some() {
+            return;
+        }
+        let Some(obs) = store.get(id, now) else {
+            return;
+        };
+        // Never forward an expired/malformed addressed obs (Task 4), and never
+        // forward to a peer the message was already sent to or received from
+        // (bounce suppression).
+        if reject(&obs) || is_sourced(bounce, *id, addr) {
+            return;
+        }
+        if predicate(&obs) {
+            found = Some(*id);
+        }
+    });
+    found
+}
+
+/// Returns `true` when `(id, addr)` has been recorded in the bounce table —
+/// i.e. `id` was received from, or forwarded to, `addr`. A message addressed to
+/// such a peer would just bounce back, so it is skipped.
+fn is_sourced<A: PartialEq>(
+    bounce: &[(ObservationId, A)],
+    id: ObservationId,
+    addr: &A,
+) -> bool {
+    for &(bid, ref baddr) in bounce {
+        if bid == id && baddr == addr {
+            return true;
+        }
+    }
+    false
 }
 
 /// Emits at most one frame for `peer`: continuing an in-flight fragment if one
@@ -861,5 +1014,120 @@ mod tests {
             }
             other => panic!("expected a Summary frame, got {other:?}"),
         }
+    }
+
+    /// Drains `next_frame` and returns the first `Obs` frame whose `to` matches
+    /// `want`, along with its destination address — skipping summaries and
+    /// non-Obs frames. Breaks on the first match or when `next_frame` yields
+    /// `None`.
+    fn drain_addressed_obs(
+        ex: &mut Exchange<u8>,
+        store: &MemStore,
+        want: Option<[u8; 16]>,
+    ) -> Option<(u8, ObservationId)> {
+        let mut result: Option<(u8, ObservationId)> = None;
+        for _ in 0..consts::MAX_FRAME {
+            let mut buf = [0u8; consts::MAX_FRAME];
+            match ex.next_frame(store, consts::MAX_FRAME, 0, &mut buf) {
+                Some((addr, n)) => match Frame::decode(&buf[..n]).unwrap() {
+                    Frame::Obs { obs, .. } if obs.to == want => {
+                        result = Some((addr, obs.id()));
+                        break;
+                    }
+                    _ => {}
+                },
+                None => break,
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn addressed_obs_delivered_to_recipient() {
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        // An addressed obs to [2;16] already held in the store.
+        let mut o = obs([2; 16], 5, 0, None, b"t", b"hi");
+        o.to = Some([2; 16]);
+        o.lifetime_ms = Some(consts::SUMMARY_INTERVAL_MS * 10);
+        let id = o.id();
+        store.insert(o, 0).unwrap();
+
+        // Peer at addr 1 contacts us and learns its id from a broadcast frame
+        // (so peer.id = Some([2; 16]) without recording a bounce for our obs).
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        let hello = Frame::Obs {
+            from: [2; 16],
+            obs: obs([2; 16], 99, 0, None, b"t", b"x"),
+        };
+        ex.on_event(Event::Frame(1, frame_bytes(&hello)), &mut store, 0);
+        assert_eq!(ex.peers()[0].id, Some([2; 16]));
+
+        // Draining must deliver the addressed Obs to its recipient at addr 1.
+        let got = drain_addressed_obs(&mut ex, &store, Some([2; 16]));
+        let (addr, emitted_id) =
+            got.expect("addressed obs must be delivered to its recipient at addr 1");
+        assert_eq!(addr, 1, "delivered to the recipient peer");
+        assert_eq!(emitted_id, id, "the exact addressed obs was delivered");
+    }
+
+    #[test]
+    fn addressed_obs_epidemic_forwards_to_non_recipient() {
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        // Addressed to an unknown node [3;16]; the only peer's id is [2;16].
+        let mut o = obs([2; 16], 5, 0, None, b"t", b"hi");
+        o.to = Some([3; 16]);
+        o.lifetime_ms = Some(consts::SUMMARY_INTERVAL_MS * 10);
+        let id = o.id();
+        store.insert(o, 0).unwrap();
+
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        let hello = Frame::Obs {
+            from: [2; 16],
+            obs: obs([2; 16], 99, 0, None, b"t", b"x"),
+        };
+        ex.on_event(Event::Frame(1, frame_bytes(&hello)), &mut store, 0);
+
+        // Draining must epidemic-forward the obs to addr 1 even though the
+        // recipient [3;16] is not yet a known peer (never dropped).
+        let got = drain_addressed_obs(&mut ex, &store, Some([3; 16]));
+        let (addr, emitted_id) =
+            got.expect("unknown-recipient addressed obs must be epidemic-forwarded");
+        assert_eq!(addr, 1);
+        assert_eq!(emitted_id, id);
+    }
+
+    #[test]
+    fn addressed_obs_does_not_bounce_to_source() {
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        // A single addressed obs, received from addr 1, addressed to [3;16].
+        let mut o = obs([2; 16], 7, 0, None, b"t", b"hi");
+        o.to = Some([3; 16]);
+        o.lifetime_ms = Some(consts::SUMMARY_INTERVAL_MS * 10);
+        let frame = Frame::Obs { from: [2; 16], obs: o };
+        ex.on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0);
+
+        // Draining must never bounce the addressed obs back to its source (addr
+        // 1): only a summary should come out, never an Obs to [3;16] at addr 1.
+        let mut bounced = false;
+        for _ in 0..consts::MAX_FRAME {
+            let mut buf = [0u8; consts::MAX_FRAME];
+            match ex.next_frame(&store, consts::MAX_FRAME, 0, &mut buf) {
+                Some((addr, n)) => match Frame::decode(&buf[..n]).unwrap() {
+                    Frame::Obs { obs, .. } if obs.to == Some([3; 16]) && addr == 1 => {
+                        bounced = true;
+                        break;
+                    }
+                    _ => {}
+                },
+                None => break,
+            }
+        }
+        assert!(
+            !bounced,
+            "an addressed obs must not be forwarded back to its source"
+        );
     }
 }
