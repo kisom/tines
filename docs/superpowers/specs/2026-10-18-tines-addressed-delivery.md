@@ -113,6 +113,11 @@ computes its current age with the existing machinery
 per hop (each relay re-encodes the age-adjusted observation), so a lifetime
 measured from observation is consistent across every carrier.
 
+Lifetime bounds *time*, not *count*: a node's custody is additionally bounded by
+the store's `max_count` trim — when retained addressed messages exceed the cap,
+the oldest are dropped. Together, lifetime + `max_count` bound custody memory in
+both dimensions.
+
 ## Cancellation
 
 A node that is done with a message — the recipient, or a carrier that no longer
@@ -124,7 +129,8 @@ network.
 **Kyle decided:** `to` is part of identity (content ID); multi-hop epidemic
 forwarding; lifetime (per-message, time-based) rather than hop-count; best-effort
 with no ack; local-drop cancellation; "about" stays the topic; `observer` is
-"from whom."
+"from whom"; custody retention is bounded by lifetime plus the store's
+`max_count` trim.
 
 **My calls** (the builder-check surfaced five open questions; all resolved below
 without needing further input — none changed a Kyle decision):
