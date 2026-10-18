@@ -1,7 +1,7 @@
 //! In-memory observation store backed by a `BTreeMap` keyed by content-derived
 //! `ObservationId`.
 //!
-//! `MemStore` implements [`Store`](crate::store::Store). It is unbounded, so it
+//! `MemStore` implements [`Store`]. It is unbounded, so it
 //! never returns `StoreError::Full`; allocation is therefore required and the
 //! module is gated behind the `alloc` feature.
 

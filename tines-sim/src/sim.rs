@@ -1,7 +1,7 @@
 //! Sim: a reference-counted harness over a shared `SimWorld`.
 //!
 //! `Sim` drives the world and its `Node`s as a discrete time-step machine. Each
-//! [`Self::step`] advances the clock, asks the world to emit any `Contact`/`Lost`
+//! [`Sim::step`] advances the clock, asks the world to emit any `Contact`/`Lost`
 //! events, and polls every node once. Peers discover each other through those
 //! events and exchange summaries; the harness exposes convenience views over the
 //! resulting state (the per-node id set, global convergence, and the components

@@ -4,7 +4,7 @@
 //! bit positions per inserted `ObservationId`. The `salt` value mixes into the
 //! hash so that the same id under different salts lands on different bit
 //! positions, keeping false positives between independent filters low. The
-//! hashing scheme is pinned (see [`positions`]) so that `tines-core` and the
+//! hashing scheme is pinned (see `positions`) so that `tines-core` and the
 //! simulation agree bit-for-bit across builds.
 //!
 //! This type is `core`-only: it owns a fixed `[u8; SUMMARY_BYTES]` array and

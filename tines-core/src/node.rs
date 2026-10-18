@@ -102,7 +102,7 @@ impl<S: Store, T: Transport> Node<S, T> {
     /// observations, then emits at most one outbound frame.
     ///
     /// Returns the number of *new* observations stored this round. A
-    /// [`tines_core::transport::SendError`] is ignored: the observation stays
+    /// [`crate::transport::SendError`] is ignored: the observation stays
     /// queued only when the transport was `Busy`, otherwise it is dropped and
     /// re-queued by the next summary round.
     pub fn poll(&mut self, now: Tick) -> usize {
