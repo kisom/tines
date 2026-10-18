@@ -220,3 +220,55 @@ fn pair_transport_send_rejects_unreachable() {
     // a's only peer is 1; sending to 2 is unreachable.
     assert_eq!(a.send(&2, b"hi"), Err(SendError::Unreachable));
 }
+
+#[test]
+fn observe_to_creates_addressed_message() {
+    let (a, _b) = PairTransport::pair(1500);
+    let mut node = Node::new([1u8; 16], 0, MemStore::new(), a);
+
+    let id = node.observe_to([2; 16], 5000, b"task", b"go", None, 0).unwrap();
+    assert_eq!(node.next_seq(), 1);
+
+    let obs = node.store().get(&id, 0).expect("observation stored");
+    assert_eq!(obs.observer, [1; 16]);
+    assert_eq!(obs.to, Some([2; 16]));
+    assert_eq!(obs.lifetime_ms, Some(5000));
+    assert_eq!(obs.age_ms, 0);
+}
+
+#[test]
+fn observe_to_rejects_oversized_topic() {
+    let (a, _b) = PairTransport::pair(1500);
+    let mut node = Node::new([1u8; 16], 0, MemStore::new(), a);
+
+    let oversized_topic = vec![0u8; consts::MAX_TOPIC + 1];
+    assert_eq!(
+        node.observe_to([2; 16], 5000, &oversized_topic, b"go", None, 0),
+        Err(ObserveError::TooLarge)
+    );
+    // Rejected whole: nothing stored, seq not advanced.
+    assert_eq!(node.store().len(), 0);
+    assert_eq!(node.next_seq(), 0);
+}
+
+#[test]
+fn belief_excludes_addressed_to_others() {
+    let (a, _b) = PairTransport::pair(1500);
+    let mut node = Node::new([1u8; 16], 0, MemStore::new(), a);
+
+    // A broadcast observation and an addressed-to-other observation on the
+    // same topic. `me` = [1;16]; the addressed one is for [2;16] (≠ me).
+    node.observe(b"door", b"broadcast", None, 0).unwrap();
+    node.observe_to([2; 16], 10_000, b"door", b"addressed", None, 10).unwrap();
+
+    let now = 100_000u64;
+    let belief = node
+        .belief(b"door", &LatestWins, now)
+        .expect("door belief exists");
+    assert_eq!(
+        belief.payload,
+        Payload::from_slice(b"broadcast").unwrap(),
+        "app view must show the broadcast, not the addressed-to-other"
+    );
+    assert_eq!(belief.observer, [1; 16]);
+}

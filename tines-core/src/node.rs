@@ -100,6 +100,43 @@ impl<S: Store, T: Transport> Node<S, T> {
         Ok(id)
     }
 
+    /// Records an observation addressed to `to` with a `lifetime_ms`, made
+    /// "now" (with `age_ms = 0`) under `topic`.
+    ///
+    /// The resulting observation has `to = Some(to)` and
+    /// `lifetime_ms = Some(lifetime_ms)`, so the exchange will deliver it only
+    /// to `to` (see [`Exchange`]). Returns the observation's content-derived
+    /// id. An oversized topic or payload is rejected with
+    /// [`ObserveError::TooLarge`] rather than truncated; a store rejection is
+    /// surfaced as [`ObserveError::Store`]. Duplicate ids are accepted (the id
+    /// is still returned).
+    pub fn observe_to(
+        &mut self,
+        to: NodeId,
+        lifetime_ms: u64,
+        topic: &[u8],
+        payload: &[u8],
+        observed_at: Option<u64>,
+        now: Tick,
+    ) -> Result<ObservationId, ObserveError> {
+        let topic = Topic::from_slice(topic).map_err(|_| ObserveError::TooLarge)?;
+        let payload = Payload::from_slice(payload).map_err(|_| ObserveError::TooLarge)?;
+        let obs = Observation {
+            observer: self.me,
+            seq: self.next_seq,
+            age_ms: 0,
+            observed_at,
+            topic,
+            payload,
+            to: Some(to),
+            lifetime_ms: Some(lifetime_ms),
+        };
+        self.next_seq += 1;
+        let id = obs.id();
+        self.store.insert(obs, now).map_err(ObserveError::Store)?;
+        Ok(id)
+    }
+
     /// Drains all pending transport events, storing any newly received
     /// observations, then emits at most one outbound frame.
     ///
@@ -140,6 +177,11 @@ impl<S: Store, T: Transport> Node<S, T> {
     ) -> Option<P::Belief> {
         let mut acc: Option<P::Belief> = None;
         self.store.for_each_topic(topic_prefix, now, &mut |obs| {
+            // App-facing view: broadcast plus addressed to `me` only.
+            // Drop anything addressed to a different node.
+            if matches!(obs.to, Some(other) if other != self.me) {
+                return;
+            }
             let prev = acc.take();
             acc = policy.step(self.me, prev, obs);
         });
