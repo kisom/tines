@@ -17,6 +17,7 @@ architecture in the **spec first**:
 
 - **Core design (authoritative):** `docs/superpowers/specs/2026-10-16-tines-design.md`
 - **Addressed delivery (authoritative):** `docs/superpowers/specs/2026-10-18-tines-addressed-delivery.md`
+- **Fleet deployment v1 (authoritative):** `docs/superpowers/specs/2026-10-18-tines-fleet-deployment-design.md` — supersedes the addressed-delivery spec's epidemic forwarding (custody chain with handoff receipts).
 - **Implementation plans:** `docs/superpowers/plans/`
 
 The plans argue from the specs. Where a plan is silent, the **spec rules**.
