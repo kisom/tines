@@ -21,6 +21,7 @@ use alloc::vec::Vec;
 struct Held {
     obs: Observation,
     stored_at: Tick,
+    released: bool,
 }
 
 /// An unbounded [`Store`] backed by a `BTreeMap` keyed by content-derived
@@ -77,6 +78,7 @@ impl Store for MemStore {
             Held {
                 obs,
                 stored_at: now,
+                released: false,
             },
         );
         Ok(true)
@@ -112,10 +114,22 @@ impl Store for MemStore {
 
     fn for_each_addressed_id(&self, f: &mut dyn FnMut(&ObservationId)) {
         for (id, held) in self.map.iter() {
-            if held.obs.to.is_some() {
+            // Skipping released ids is an optimization; the exchange predicate
+            // is the load-bearing check.
+            if held.obs.to.is_some() && !held.released {
                 f(id);
             }
         }
+    }
+
+    fn release(&mut self, id: &ObservationId) {
+        if let Some(held) = self.map.get_mut(id) {
+            held.released = true;
+        }
+    }
+
+    fn is_released(&self, id: &ObservationId) -> bool {
+        self.map.get(id).map(|held| held.released).unwrap_or(false)
     }
 
     fn for_each_topic(&self, prefix: &[u8], now: Tick, f: &mut dyn FnMut(&Observation)) {
@@ -437,5 +451,25 @@ mod tests {
             seqs,
             std::collections::BTreeSet::from_iter([0u64, 1, 2, 100])
         );
+    }
+
+    #[test]
+    fn release_marks_and_is_released_reports() {
+        let mut s = MemStore::new();
+        let o = obs([1; 16], 1, 0, None, b"door/1");
+        let id = o.id();
+        assert!(s.insert(o, 1000).unwrap());
+        assert!(!s.is_released(&id));
+        s.release(&id);
+        assert!(s.is_released(&id));
+    }
+
+    #[test]
+    fn release_unknown_is_noop() {
+        let mut s = MemStore::new();
+        // Releasing an id that was never inserted must not panic...
+        s.release(&[0u8; 16]);
+        // ...and must not report anything as released.
+        assert!(!s.is_released(&[0u8; 16]));
     }
 }

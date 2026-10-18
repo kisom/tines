@@ -1820,6 +1820,12 @@ mod tests {
         fn for_each_addressed_id(&self, f: &mut dyn FnMut(&ObservationId)) {
             self.inner.for_each_addressed_id(f)
         }
+        fn release(&mut self, id: &ObservationId) {
+            self.inner.release(id)
+        }
+        fn is_released(&self, id: &ObservationId) -> bool {
+            self.inner.is_released(id)
+        }
         fn for_each_topic(&self, prefix: &[u8], now: Tick, f: &mut dyn FnMut(&Observation)) {
             self.inner.for_each_topic(prefix, now, f)
         }

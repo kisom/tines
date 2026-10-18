@@ -74,6 +74,17 @@ pub trait Store {
         self.for_each_id(f)
     }
 
+    /// Mark the observation with `id` as released: it has been sent and must
+    /// not be offered for exchange again.
+    ///
+    /// Releasing an id that is not currently stored is a no-op. The mark
+    /// persists for the lifetime of the entry (until it is trimmed); a
+    /// re-inserted observation starts un-released.
+    fn release(&mut self, id: &ObservationId);
+
+    /// Returns `true` if the observation with `id` has been released.
+    fn is_released(&self, id: &ObservationId) -> bool;
+
     /// Visit every stored observation whose topic starts with `prefix`
     /// (an empty prefix matches all), each age-adjusted to `now`.
     fn for_each_topic(&self, prefix: &[u8], now: Tick, f: &mut dyn FnMut(&Observation));

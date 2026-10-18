@@ -12,7 +12,7 @@ keywords = ["robotics", "gossip", "simulation", "delay-tolerant"]
 categories = ["simulation", "science::robotics"]
 
 [dependencies]
-tines-core = { path = "../tines-core", version = "0.2.1" }
+tines-core = { path = "../tines-core", version = "0.3.0" }
 rand = "0.8"
 
 [dev-dependencies]

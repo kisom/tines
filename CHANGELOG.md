@@ -4,6 +4,22 @@ All notable changes to the tines crates. Versions follow
 [Semantic Versioning](https://semver.org/); before 1.0, a minor bump may break
 the API.
 
+## 0.3.0 — 2026-10-18
+
+### Breaking
+
+- `Store` now requires `release(&mut self, id)` and
+  `is_released(&self, id) -> bool`. Implementations of `Store` — including test
+  doubles and future backends — must provide them.
+
+### Added
+
+- `Store::release` marks an observation as sent, so it is no longer offered for
+  exchange. `MemStore` tracks a per-entry `released` flag, and its
+  `for_each_addressed_id` skips released ids as an optimization (the exchange
+  predicate remains the load-bearing check). Releasing an id that is not stored
+  is a no-op.
+
 ## 0.2.1 — 2026-10-18
 
 ### Changed
