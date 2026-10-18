@@ -3,7 +3,7 @@ use common::PairTransport;
 
 use std::collections::BTreeSet;
 use tines_core::observation::Payload;
-use tines_core::transport::{Event, FrameBuf, Transport};
+use tines_core::transport::{Event, FrameBuf, SendError, Transport};
 use tines_core::{consts, LatestWins, MemStore, Node, ObserveError, Store};
 
 #[test]
@@ -205,4 +205,18 @@ fn third_party_observation_propagates_within_contact() {
         "fresh observation must propagate to b"
     );
     assert_eq!(nb.store().len(), 1);
+}
+
+#[test]
+fn pair_transport_disconnect_enqueues_lost() {
+    let (mut a, _b) = PairTransport::pair(1500);
+    a.disconnect();
+    assert_eq!(a.poll(), Some(Event::Lost(1)));
+}
+
+#[test]
+fn pair_transport_send_rejects_unreachable() {
+    let (mut a, _b) = PairTransport::pair(1500);
+    // a's only peer is 1; sending to 2 is unreachable.
+    assert_eq!(a.send(&2, b"hi"), Err(SendError::Unreachable));
 }

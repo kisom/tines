@@ -57,10 +57,11 @@ impl Transport for SimTransport {
             return Ok(());
         }
         let buf = FrameBuf::from_slice(frame).map_err(|_| SendError::TooLarge)?;
+        let dup = w.rng.gen::<f64>() < w.cfg.dup;
         w.inboxes[*to].push_back(Event::Frame(self.me, buf.clone()));
         w.frames_sent += 1;
-        if w.rng.gen::<f64>() < w.cfg.dup {
-            w.inboxes[*to].push_back(Event::Frame(self.me, buf.clone()));
+        if dup {
+            w.inboxes[*to].push_back(Event::Frame(self.me, buf));
             w.frames_sent += 1;
         }
         Ok(())

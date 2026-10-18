@@ -72,12 +72,19 @@ type Scenario = (usize, ContactTrace, Vec<(usize, Vec<u8>, Vec<u8>)>);
 fn scenario() -> impl Strategy<Value = Scenario> {
     (2..=6usize).prop_flat_map(|nodes| {
         let trace = proptest::collection::vec(contact(nodes), 1..=12usize);
-        let obs = proptest::collection::vec(observation(), nodes..=nodes);
-        (trace, obs).prop_map(move |(contacts, per_node)| {
+        // Each node publishes 0..=10 observations, flattened to (node, topic,
+        // payload) triples so per-node counts vary across scenarios.
+        let per_node = proptest::collection::vec(
+            proptest::collection::vec(observation(), 0..=10usize),
+            nodes..=nodes,
+        );
+        (trace, per_node).prop_map(move |(contacts, per_node)| {
             let trace = ContactTrace { contacts };
             let mut list = Vec::new();
-            for (node, (topic, payload)) in per_node.into_iter().enumerate() {
-                list.push((node, topic, payload));
+            for (node, node_obs) in per_node.into_iter().enumerate() {
+                for (topic, payload) in node_obs {
+                    list.push((node, topic, payload));
+                }
             }
             (nodes, trace, list)
         })
