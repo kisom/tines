@@ -96,6 +96,37 @@ fn ages_rebase_on_load() {
 }
 
 #[test]
+fn ages_rebase_after_nonidle_flush() {
+    // An observation inserted *before* the last flush must lose no time when
+    // ages are rebased on load: the reopen fold has to be exact, not folded
+    // against the flush clock as if the entry had been inserted then.
+    let path = store_path("ages_nonidle");
+
+    {
+        let mut s = LogStore::new(&path, 1000, 1).unwrap();
+        let a = obs([1; 16], 1, 100, Some(10));
+        assert!(s.insert(a, 1000).unwrap());
+        // Advance the store clock via a second, distinct insert so the flush
+        // below runs at a tick later than `a`'s insert — the store is
+        // non-idle.
+        let b = obs([2; 16], 2, 0, Some(20));
+        assert!(s.insert(b, 3000).unwrap());
+        s.flush().unwrap();
+    }
+
+    {
+        // Reopen at 9000. `a`'s true age is 100 (insert-time) + (9000 - 1000)
+        // = 8100. A flush that fails to catch `age_ms` up folds the reopen
+        // against the flush clock (3000) and under-counts by the 2000ms
+        // between insert and flush, reporting only 6100.
+        let s = LogStore::new(&path, 9000, 1).unwrap();
+        let a = obs([1; 16], 1, 100, Some(10));
+        let g = s.get(&a.id(), 9000).unwrap();
+        assert_eq!(g.age_ms, 8100);
+    }
+}
+
+#[test]
 fn next_seq_persists() {
     let path = store_path("seq");
 

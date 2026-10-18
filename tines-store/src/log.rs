@@ -8,17 +8,22 @@
 //!
 //! Record kinds:
 //!
-//! * `Record::Obs` — a stored [`Observation`] (deduped on `id` at load).
+//! * `Record::Obs` — a stored [`Observation`] together with the tick it was
+//!   inserted at (`stored_at`). Deduped on `id` at load.
 //! * `Record::Trim` — the id of an observation removed by `trim`; the last
 //!   event for an id wins, so a re-inserted (new `Obs` record) id survives.
-//! * `Record::Meta` — the current `next_seq`, the last `now` seen (the clock
-//!   marker), and the full set of released ids. The last `Meta` on disk wins,
-//!   so it always reflects the latest flushed state.
+//! * `Record::Meta` — the current `next_seq` and the full set of released ids.
+//!   The last `Meta` on disk wins, so it always reflects the latest flushed
+//!   state.
 //!
 //! On load the index is rebuilt by replaying the log, then every age is
-//! rebased to load time: the time elapsed since the last persisted clock marker
-//! is folded into `age_ms` and `stored_at` is set to the load `now`, so ages
-//! continue across a reboot instead of freezing at their pre-shutdown value.
+//! rebased to load time: each entry's `age_ms` is folded by the time elapsed
+//! since its own `stored_at` (the tick it was inserted, carried on the `Obs`
+//! record). Anchoring the fold to each entry's insert tick rather than to a
+//! single persisted clock marker makes the reopen fold exact for idle stores
+//! and for observations inserted before the last flush — ages continue across a
+//! reboot instead of freezing at (and under-counting from) their pre-shutdown
+//! value.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{File, OpenOptions};
@@ -38,13 +43,13 @@ enum Record {
     Obs {
         id: ObservationId,
         obs: Box<Observation>,
+        stored_at: Tick,
     },
     Trim {
         id: ObservationId,
     },
     Meta {
         next_seq: u64,
-        last_clock: Tick,
         released: Vec<ObservationId>,
     },
 }
@@ -65,7 +70,6 @@ pub struct LogStore {
     index: BTreeMap<ObservationId, Entry>,
     next_seq: u64,
     now: Tick,
-    last_clock: Option<Tick>,
 }
 
 impl LogStore {
@@ -86,18 +90,19 @@ impl LogStore {
         let mut index: BTreeMap<ObservationId, Entry> = BTreeMap::new();
         let mut dead: HashSet<ObservationId> = HashSet::new();
         let mut next_seq = first_seq;
-        let mut last_clock: Option<Tick> = None;
 
         let mut file = file;
         while let Some(rec) = read_record(&mut file)? {
             match rec {
-                Record::Obs { id, obs } => {
+                Record::Obs { id, obs, stored_at } => {
                     // A preceding Trim for this id is cancelled by the
                     // re-insert, so revive it; otherwise dedupe to the
-                    // first (oldest) occurrence.
+                    // first (oldest) occurrence. Fold in the time elapsed
+                    // since the record's own insert tick so the age is exact
+                    // regardless of when the last flush happened.
                     dead.remove(&id);
-                    index.entry(id).or_insert(Entry {
-                        obs: *obs,
+                    index.entry(id).or_insert_with(|| Entry {
+                        obs: obs.aged(now.saturating_sub(stored_at)),
                         stored_at: now,
                         released: false,
                     });
@@ -108,11 +113,9 @@ impl LogStore {
                 }
                 Record::Meta {
                     next_seq: ns,
-                    last_clock: lc,
                     released,
                 } => {
                     next_seq = ns.max(next_seq);
-                    last_clock = Some(lc);
                     for rid in released {
                         if let Some(entry) = index.get_mut(&rid) {
                             entry.released = true;
@@ -126,21 +129,11 @@ impl LogStore {
             index.remove(&id);
         }
 
-        // Fold the pre-reboot elapsed time into every age and reset the stored
-        // base to load time. When there is no clock marker yet (a fresh store)
-        // or the clock moved backwards, nothing is folded (saturating).
-        let elapsed = now.saturating_sub(last_clock.unwrap_or(now));
-        for entry in index.values_mut() {
-            entry.obs.age_ms = entry.obs.age_ms.saturating_add(elapsed);
-            entry.stored_at = now;
-        }
-
         Ok(LogStore {
             file,
             index,
             next_seq,
             now,
-            last_clock,
         })
     }
 
@@ -150,8 +143,21 @@ impl LogStore {
     }
 
     /// Persist the current index state (released flags, `next_seq`, and the
-    /// clock marker) and the observation log to disk.
+    /// observation log) to disk.
     pub fn flush(&mut self) -> Result<(), StoreError> {
+        // Advance every entry's age up to this tick in memory, so each
+        // `entry.obs.age_ms` is the true current age and `stored_at` marks when
+        // that age was computed. Ages are recomputed from each entry's own
+        // `stored_at` on the next load (see [`LogStore::new`]), so this keeps
+        // the in-memory representation coherent within this run.
+        for entry in self.index.values_mut() {
+            entry.obs.age_ms = entry
+                .obs
+                .age_ms
+                .saturating_add(self.now.saturating_sub(entry.stored_at));
+            entry.stored_at = self.now;
+        }
+
         let mut released: Vec<ObservationId> = self
             .index
             .iter()
@@ -162,12 +168,10 @@ impl LogStore {
 
         let record = Record::Meta {
             next_seq: self.next_seq,
-            last_clock: self.now,
             released,
         };
         write_record(&mut self.file, &record)?;
         self.file.sync_all().map_err(|_| StoreError::Backend)?;
-        self.last_clock = Some(self.now);
         Ok(())
     }
 
@@ -212,6 +216,7 @@ impl Store for LogStore {
         let record = Record::Obs {
             id,
             obs: Box::new(obs.clone()),
+            stored_at: now,
         };
         self.append(&record)?;
         self.index.insert(
