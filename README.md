@@ -23,6 +23,7 @@ hear each other.
 - [Addressed delivery](#addressed-delivery)
 - [Usage](#usage)
 - [Writing a transport](#writing-a-transport)
+- [Writing a store](#writing-a-store)
 - [The simulator](#the-simulator)
 - [Crate layout](#crate-layout)
 - [Building and CI](#building-and-ci)
@@ -350,6 +351,35 @@ pub trait Transport {
 - **Report back-pressure honestly.** Return `SendError::Busy` when the radio
   can't take a frame right now; the exchange will offer the same frame again
   on the next poll. `TooLarge` tells the exchange to give that frame up.
+- **Driving `Exchange` without `Node`?** `Exchange::next_frame` assumes the
+  frame it returns gets sent. If `send` fails, call
+  `Exchange::on_send_error(&err)` before the next `next_frame`, or the frame
+  is treated as delivered. `Node::poll` does this for you.
+
+## Writing a store
+
+`MemStore` (behind the default `alloc` feature) is the reference backend. A
+flash or SQLite backend implements the `Store` trait:
+
+| Method                  | Contract                                                                 |
+|-------------------------|--------------------------------------------------------------------------|
+| `insert`                | `Ok(true)` if new; `Ok(false)` for a known id, leaving the existing entry (and its age) untouched; `Err(StoreError::Full)` when out of room |
+| `contains`              | whether an id is stored                                                  |
+| `get`                   | the observation with `age_ms` advanced by `now − stored_at`, saturating if `now` is earlier |
+| `len`                   | number of stored observations                                            |
+| `for_each_id`           | every stored id, any order                                               |
+| `for_each_broadcast_id` | ids with `to == None`; these feed the summary                            |
+| `for_each_addressed_id` | ids with `to == Some(_)`; scanned for custody on every poll              |
+| `for_each_topic`        | age-adjusted observations whose topic starts with a prefix               |
+| `trim`                  | apply a `TrimPolicy` (per-topic, then age, then count); return how many were removed |
+
+The store must remember when each observation was inserted (`stored_at`, in
+the caller's `Tick`s) so it can report current ages.
+
+`for_each_addressed_id` has a default implementation that visits every id,
+which is correct but makes the exchange read every broadcast observation on
+each poll just to find the few addressed ones. Override it if your backend can
+filter by `to` cheaply, e.g. with an index or a separate table.
 
 ## The simulator
 

@@ -1,13 +1,13 @@
 [package]
 name = "tines-sim"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Discrete-time simulator for tines: contact traces, convergence scenarios, and property tests."
 authors = ["K. Isom"]
 
 [dependencies]
-tines-core = { path = "../tines-core", version = "0.1.0" }
+tines-core = { path = "../tines-core", version = "0.2.0" }
 rand = "0.8"
 
 [dev-dependencies]

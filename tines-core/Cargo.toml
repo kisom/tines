@@ -1,6 +1,6 @@
 [package]
 name = "tines-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Opportunistic shared memory for mostly-offline robots: a no_std core of content-addressed observations, gossip, and store-and-forward exchange."
