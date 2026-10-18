@@ -205,6 +205,9 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                 }
             }
             Frame::Obs { from: _, obs } => {
+                if reject(&obs) {
+                    return None;
+                }
                 let returned = obs.clone();
                 return match store.insert(obs, now) {
                     Ok(true) => Some(returned),
@@ -219,6 +222,9 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                 data,
             } => {
                 if let Some(obs) = peer.reassembler.feed(id, index, count, &data, now) {
+                    if reject(&obs) {
+                        return None;
+                    }
                     let returned = obs.clone();
                     return match store.insert(obs, now) {
                         Ok(true) => Some(returned),
@@ -238,6 +244,22 @@ fn summary_due<A>(peer: &Peer<A>, now: Tick) -> bool {
         None => true,
         Some(sent) => now.saturating_sub(sent) >= consts::SUMMARY_INTERVAL_MS,
     }
+}
+
+/// Returns `true` when a received [`Observation`] must be dropped before it is
+/// stored: either its addressing is malformed, or it is an addressed message
+/// whose age has passed its lifetime.
+///
+/// An addressed message (`to = Some`) must carry a `lifetime_ms`; a mismatched
+/// pair — `to = Some` with no lifetime, or a lifetime with no recipient —
+/// violates the addressing invariant and is dropped in either direction. A
+/// well-formed addressed message is rejected once its age exceeds its
+/// lifetime. Broadcasts (`to = None`, `lifetime_ms = None`) are never rejected.
+fn reject(obs: &Observation) -> bool {
+    if obs.to.is_some() != obs.lifetime_ms.is_some() {
+        return true;
+    }
+    obs.to.is_some() && obs.age_ms > obs.lifetime_ms.unwrap()
 }
 
 /// Emits at most one frame for `peer`: continuing an in-flight fragment if one
@@ -742,6 +764,71 @@ mod tests {
         }
         assert!(store.contains(&id), "reassembled obs must be stored");
         assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn expired_addressed_obs_is_rejected() {
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        // Addressed to us, lifetime 100ms, but age 200ms -> expired.
+        let mut o = obs([2; 16], 7, 0, None, b"t", b"hi");
+        o.to = Some(ME);
+        o.lifetime_ms = Some(100);
+        o.age_ms = 200;
+        let frame = Frame::Obs { from: [2; 16], obs: o.clone() };
+        assert!(
+            ex.on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0)
+                .is_none(),
+            "an expired addressed obs must not be delivered"
+        );
+        assert_eq!(store.len(), 0, "an expired addressed obs must not be stored");
+    }
+
+    #[test]
+    fn expired_addressed_frag_is_rejected() {
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        // A large addressed obs that must be fragmented; already expired.
+        let mut big = obs([2; 16], 7, 0, None, b"t", &[0u8; 1024]);
+        big.to = Some(ME);
+        big.lifetime_ms = Some(100);
+        big.age_ms = 200;
+        let mut frames: Vec<heapless::Vec<u8, { consts::MAX_FRAME }>> = Vec::new();
+        crate::frag::fragment([2; 16], &big, 200, &mut |b| {
+            frames.push(heapless::Vec::from_slice(b).unwrap());
+        })
+        .expect("fragment the addressed obs into frags");
+        for f in frames {
+            let _ = ex.on_event(Event::Frame(9, f), &mut store, 0);
+        }
+        assert_eq!(
+            store.len(),
+            0,
+            "an expired addressed obs must not survive fragmentation"
+        );
+    }
+
+    #[test]
+    fn addressing_invariant_violation_is_dropped() {
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        // to = Some but lifetime_ms = None: the lifetime==to invariant is
+        // violated, so this frame is malformed and must be dropped, not stored.
+        let mut o = obs([2; 16], 7, 0, None, b"t", b"hi");
+        o.to = Some(ME);
+        o.lifetime_ms = None;
+        let frame = Frame::Obs { from: [2; 16], obs: o.clone() };
+        assert!(
+            ex.on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0)
+                .is_none()
+        );
+        assert_eq!(
+            store.len(),
+            0,
+            "an invariant-violating frame must not be stored"
+        );
     }
 
     #[test]
