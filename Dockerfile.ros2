@@ -1,0 +1,39 @@
+# Verify tines-ros2's rclrs-backed node compiles against a real ROS 2 toolchain.
+#
+# Build:   docker build -f Dockerfile.ros2 -t tines-ros2-check .
+# The final layer runs `cargo build -p tines-ros2 --features ros2` with the
+# ROS 2 environment sourced, so a successful build proves the gated node.rs
+# (and the bytes-payload mapping) type-check and link against rclrs.
+#
+# rclrs 0.8 supports Jazzy (LTS) / Kilted / Lyrical / Rolling. Jazzy is used
+# here because it is the current LTS and matches Ubuntu 24.04.
+
+FROM ros:jazzy-ros-base
+
+# Rust toolchain + the native build deps for rclrs (bindgen/cmake) and for
+# tines-bt's bluer (D-Bus/udev dev headers).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential pkg-config cmake curl ca-certificates \
+        libclang-dev clang \
+        libdbus-1-dev libudev-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /workspace
+
+# Copy the whole workspace (cargo needs every member's Cargo.toml present).
+# .dockerignore excludes **/target and .git.
+COPY Cargo.toml Cargo.lock ./
+COPY tines-core ./tines-core
+COPY tines-store ./tines-store
+COPY tines-bt ./tines-bt
+COPY tines-sim ./tines-sim
+COPY tines-ros2 ./tines-ros2
+COPY tines ./tines
+
+# Source the ROS 2 environment so rclrs/ros_env find the C libraries and
+# message packages, then compile the gated node with its `ros2` feature.
+RUN . /opt/ros/jazzy/setup.sh \
+    && cargo build -p tines-ros2 --features ros2
