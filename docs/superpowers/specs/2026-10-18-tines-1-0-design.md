@@ -1,9 +1,10 @@
 # tines-core 1.0 — design
 
 Date: 2026-10-18
-Status: draft v4. Kyle decided D1–D5 and the follow-ups Q1–Q3
-(2026-10-18). §2b records the 1.1 direction on age and authenticity. Not yet
-reviewed.
+Status: draft v6. Kyle decided D1–D5 and Q1–Q3 (2026-10-18) and the
+review decisions R1–R3 and the `observed_at` definition (2026-10-19);
+review fixes applied. v6 adds §10 (core hardening from `THREAT_MODEL.md`)
+and the adversarial fuzz mode; these additions aren't reviewed yet.
 Builds on: `2026-10-16-tines-design.md`, `2026-10-18-tines-addressed-delivery.md`,
 `2026-10-18-tines-fleet-deployment-design.md` (assumed fully implemented)
 
@@ -114,26 +115,52 @@ installed base to migrate (D5).
   milestone). Any value ≥ 4 is an unknown variant and decodes as
   `Malformed`. Conversely, a 0.x frame starts with 0–3, which a 1.0 node
   rejects as a version mismatch. No robot runs 0.x, but test rigs and
-  simulators might, so this costs nothing to get right. Pick a value well
-  clear of small tags (e.g. `0xA1`).
+  simulators might, so this costs nothing to get right. Avoid 0–3 (valid
+  0.x tags). Prefer a value in 4–0x7F: postcard reads it as a single-byte
+  unknown tag. A value ≥ 0x80 also ends up `Malformed`, but only because
+  postcard treats it as a varint continuation and reads a second byte,
+  which is a needless subtlety.
 - **Every drop is reported (D3).** A frame dropped at the envelope or in
-  decoding raises a `NodeEvent::Dropped { reason }`, where `reason` is a
+  decoding is reported against the transport `Addr` it arrived from, with a
   `#[non_exhaustive]` `DropReason`:
   - `VersionMismatch { version: u8 }`: an un-updated or foreign peer.
+  - `IdentityChanged`: a frame's `from` differs from the NodeId already
+    pinned for this contact (§10).
   - `Malformed`: the version was right but the body didn't decode, or
     decoded to something core must reject (e.g. a `Signature` whose length
     doesn't fit its algorithm, §2a).
 
   An operator then sees "met an un-updated robot" or "a peer is sending
-  garbage" instead of a silent non-exchange. With the version byte,
-  "Malformed" from a v1 peer means a bug or an attack, not drift. The
-  report carries no `NodeId`, since the sender can't be trusted before
-  decode. Reports are rate-limited per transport address so one peer can't
-  flood the event queue (builder's call how; the limit is a local
-  constant).
+  garbage" instead of a silent non-exchange. `Malformed` from a v1 peer
+  means one of three things:
+  - a bug,
+  - an attack,
+  - a *newer* 1.x peer sending a `Frame` variant this node predates. That
+    case is expected and safe (see "What a version bump means" below), so
+    tooling shouldn't treat every `Malformed` as an alarm.
+- **Reports carry the `Addr`, not a `NodeId` (R1).** The sender's NodeId is
+  inside the frame and can't be trusted before decode. The transport `Addr`
+  is local truth that doesn't depend on the frame, so it's what makes a
+  drop attributable. The report is only as good as the transport's
+  binding: on BLE, `Addr` must be the NodeId bound to the connection (see
+  `THREAT_MODEL.md` F3).
+- **Drops are counted, not queued (R2).** Core keeps a small fixed table of
+  counters keyed by `(Addr, DropReason)`, so that `VersionMismatch` with
+  different versions counts separately. Each new drop increments its
+  counter instead of pushing an event. `drain_events` reports each nonzero
+  counter once as `NodeEvent::Dropped { addr, reason, count }` and resets
+  it.
+  - A flood of bad frames therefore costs one table slot, not the event
+    queue. `Delivered` receipts can never be evicted by drops.
+  - The counting is itself the rate limit; no separate limiter is needed.
+  - When the table is full, a new `(Addr, reason)` pair goes into one
+    overflow counter, reported with no address. Losing attribution under a
+    flood is acceptable; losing the count isn't.
+  - The table size is a local constant (§5).
 - Expired addressed observations are *not* drops. They're well-formed and
   are discarded by policy; reporting them would be noise.
-- `SUMMARY_OVERHEAD` and `FRAG_OVERHEAD` absorb the extra byte. Every frame
+- `SUMMARY_OVERHEAD` (private, `exchange.rs`) and `FRAG_OVERHEAD` absorb
+  the extra byte. Every frame
   still fits `mtu()` (Review Focus #6).
 - **What a version bump means:** any change to the encoding of an existing
   variant, the meaning of an existing field, or a wire constant (§5) is a new
@@ -174,8 +201,24 @@ pub struct Dest { pub to: NodeId, pub lifetime_ms: u64 }
   plus `with_observed_at`. Applications normally never build one —
   `Node::observe`/`observe_to` do. 1.0 has no public way to set `sig`; 1.1
   adds it.
-- The id hash reads `dest.map(|d| d.to)` and is byte-for-byte the same as
-  0.x; the pinned vector proves it. `sig` is excluded from the id.
+- **The observation's wire encoding changes in v1; only its identity is
+  preserved.** `dest` replaces `to` + `lifetime_ms`, and `sig` is appended,
+  so postcard encodes an `Observation` differently from 0.x. That's fine
+  under the version byte (§1). The id hash reads `dest.map(|d| d.to)` and
+  is byte-for-byte the same as 0.x; the pinned vector proves it. `sig` is
+  excluded from the id.
+- **`observed_at` gets a defined meaning (Kyle confirmed, 2026-10-19).**
+  Today the field has no docs and no pinned units, but §2a signs it and
+  §2b cross-checks against it. Proposed definition:
+  - **Units:** the observer's wall-clock time when it made the
+    observation, in milliseconds since the Unix epoch (UTC).
+  - **`None`:** the observer had no clock it trusts. A robot without an
+    RTC or time sync must leave it `None` rather than guess.
+  - **Never changed:** set once by the observer; relays never change it.
+  - **Not a local tick:** it's unrelated to `Tick`, which stays local
+    monotonic milliseconds and never crosses the wire.
+
+  The rustdoc on the field says all of this.
 - `reject()` keeps only the expiry check; the malformed-pair branch and its
   tests go away (the pairing is now enforced by the type, including on
   decode).
@@ -319,17 +362,18 @@ Public in 1.0 (everything else becomes `pub(crate)`):
 | Item | Why it's public |
 |---|---|
 | `Node`, `ObserveError` | the facade applications use |
-| `NodeEvent` (non-exhaustive enum; replaces `ConfidenceEvent`), `DropReason` | `Delivered { peer, id }`, `Dropped { reason }`; room for more |
+| `NodeEvent<A>` (non-exhaustive enum, generic over the transport `Addr`; replaces `ConfidenceEvent`), `DropReason` | `Delivered { peer, id }`, `Dropped { addr: Option<A>, reason, count }` (`addr` is `None` only for the overflow counter, §1); room for more |
 | `Observation`, `Dest`, `Signature`, `SigAlgo`, `NodeId`, `ObservationId`, `Tick`, `Topic`, `Payload` | the data model |
 | `Store`, `StoreError`, `TrimPolicy`, `MemStore` (`alloc`) | backends and their reference impl |
 | `Transport`, `Event`, `SendError`, `FrameBuf` | transport adapters |
 | `BeliefPolicy`, `LatestWins`, `SelfFirst` | the memory layer |
 | `consts` (wire constants + local caps, §5), `WIRE_VERSION` | sizing |
+| `frame_sender(bytes) -> Option<NodeId>` | lets a transport check a frame's claimed sender against the identity it bound to the connection without core's private `Frame` layout (fleet fixes spec §3; `THREAT_MODEL.md` F3) |
 
 Made private: `Exchange`, `Peer`, `InFlight`, `Bloom` (including the
 public `salt` field), `Reassembler`, `fragment`, `Frame`, `WireError`,
-`FRAG_OVERHEAD`. Nothing outside `tines-core` uses them except one
-`tines-sim` test that touches `Exchange` directly; it moves to `Node`.
+`FRAG_OVERHEAD`. Nothing outside `tines-core` uses them; the only mention
+is a doc-comment link in `tines-sim/src/world.rs`, which is updated.
 
 - **All public enums are `#[non_exhaustive]`**: `ObserveError`,
   `StoreError`, `SendError`, `Event`, `NodeEvent`, `DropReason`,
@@ -341,7 +385,8 @@ public `salt` field), `Reassembler`, `fragment`, `Frame`, `WireError`,
   (`TrimPolicy::default()` + field assignment still works).
 - `Node` keeps its current methods: `new`, `id`, `next_seq`, `observe`,
   `observe_to`, `poll`, `drain_events`, `belief`, `trim`, `store`,
-  `transport_mut`. `drain_events` returns `NodeEvent`s.
+  `transport_mut`. `drain_events` returns `NodeEvent<T::Addr>`s: queued
+  `Delivered` events, then one `Dropped` per nonzero drop counter (§1).
 - Every remaining public item is documented; `#![deny(missing_docs)]` goes in
   `tines-core/src/lib.rs` (26 items are missing docs as of the fleet
   milestone; most of them are the fields of the now-private types).
@@ -387,18 +432,30 @@ changes:
 
 ### 5. Constants: wire vs local
 
-`consts.rs` splits into two documented groups:
+`consts.rs` splits into two documented groups. The rule: **a constant is
+a wire constant if changing it changes how a v1 peer decodes or interprets
+a frame.** That covers capacity bounds a decoder enforces, and constants
+both sides must agree on to read a field. Everything else is local.
 
 - **Wire constants**, frozen for wire v1: changing any is a `WIRE_VERSION`
-  bump. These are `MAX_TOPIC`, `MAX_PAYLOAD`, `MAX_FRAME`, `SUMMARY_BYTES`,
-  `BLOOM_K`, `ACK_IDS_CAP` and `MAX_SIG` (= 64, Ed25519; Q1), plus the
-  private `MAX_FRAGMENTS`. Post-quantum signatures don't fit in 64 bytes, so
-  adding one is a wire v2 / tines-core 2.0 change.
+  bump. The capacity bounds are `MAX_TOPIC`, `MAX_PAYLOAD`, `MAX_FRAME`,
+  `SUMMARY_BYTES`, `ACK_IDS_CAP` and `MAX_SIG` (= 64, Ed25519; Q1), plus the private
+  `MAX_FRAGMENTS`. `BLOOM_K` is a wire constant because both sides must
+  agree on it to read a summary.
+  - Post-quantum signatures don't fit in 64 bytes, so adding one is a wire
+    v2 / tines-core 2.0 change.
+  - **`MAX_FRAME = 1500` is a known 2.0 trigger (R3).** `Frag.data` is an
+    inline `Vec<u8, MAX_FRAME>`, so a peer can't decode a bigger frame. A
+    future radio that needs frames over 1500 bytes means wire v2. BLE (L2CAP
+    CoC) and LoRa are comfortably under it, and a bigger radio can still run
+    v1 with 1500-byte frames.
 - **Local capacities and timings**, which can change in a minor release
   because they never cross the wire: `MAX_PEERS`, `SEND_QUEUE_CAP`,
   `ACK_BUFFER_CAP`, `BCAST_SENT_CAP`, `EVENT_QUEUE_CAP`,
-  `SUMMARY_INTERVAL_MS`, `REASSEMBLY_TIMEOUT_MS`, and the drop-report rate
-  limit.
+  `SUMMARY_INTERVAL_MS`, `REASSEMBLY_TIMEOUT_MS`, and the size of the
+  drop-counter table (§1). `EVENT_QUEUE_CAP` is local, even though
+  `ACK_IDS_CAP` is wire: the event queue never leaves the node, while an
+  `Ack` frame's id list is decoded by the peer.
 
 AGENTS.md's constant list is updated to show the split.
 
@@ -435,8 +492,26 @@ can overflow during a large sync. The 1.0 spec pins what overflow costs:
   - no panic,
   - every sent frame is no larger than `mtu()` (randomised per run),
   - no addressed observation is stored past its lifetime,
-  - every rejected frame produced a `Dropped` report (up to the rate limit),
+  - every rejected frame is counted: the drained `Dropped` counts for an
+    address add up to the frames rejected from it (the overflow counter
+    included),
   - stored signatures round-trip unchanged.
+
+  **Adversarial-peer mode.** Random bytes rarely get past the decoder, so
+  a second input mode builds *well-formed* frames from the fuzz input:
+  - Summaries with chosen bits, including all-zero, all-one and repeated.
+  - Obs and Frag frames with chosen ids, observers (including the node's
+    own NodeId), seqs, ages, lifetimes and addressing.
+  - Acks for ids that were or weren't sent to that address.
+  - Fragments that conflict, repeat or arrive out of order.
+  - `from` values that change within a contact.
+
+  These are driven from many addresses, beyond `MAX_PEERS`. On top of the
+  checks above, this mode checks the §10 properties: peer-table recovery,
+  bounded output per received summary, no NodeId change within a contact,
+  and drop-oldest event behaviour. It also checks the custody invariant
+  under the fleet fixes' F1 rule: an ack is sent only for a stored
+  observation.
 
   Fuzzing through `Node` keeps every internal private. It runs as a
   scheduled CI job (not a PR gate, since the toolchain is pinned stable),
@@ -464,7 +539,8 @@ can overflow during a large sync. The 1.0 spec pins what overflow costs:
 - **Wire:** every 1.x release speaks wire v1. Only new optional `Frame`
   variants may be added, plus new `SigAlgo` ids and signature versions
   within the 64-byte `MAX_SIG` budget. A wire-v2 change, including any
-  post-quantum signature, ships as tines-core 2.0.
+  post-quantum signature or a `MAX_FRAME` above 1500, ships as
+  tines-core 2.0.
 - **Identity:** `Observation::id` never changes within a major version, and
   should not change across majors unless the hash itself is broken.
 - **API:** standard semver, enforced by `cargo-semver-checks`; the
@@ -483,13 +559,72 @@ can overflow during a large sync. The 1.0 spec pins what overflow costs:
 `tines-store` (0.x) moves to `tines-core = "1"` and its log format follows
 the new `Observation` encoding. There is no migration:
 
-- The log gains a format header. Opening a log with a missing or older
-  header is an error that names the fix (delete the log). Silently
-  misparsing an old log is not allowed.
+- The log already has a versioned header and per-record CRC by then: the
+  fleet fixes (`2026-10-19-tines-fleet-fixes.md` §5) introduce both for
+  integrity reasons. 1.0 bumps that header's `format_version` for the new
+  `Observation` encoding. Opening a log with an older version is an error
+  that names the fix (delete the log). Silently misparsing an old log is
+  not allowed.
 - Hosts wipe pre-1.0 logs on upgrade. That's acceptable because no robot
   runs tines yet, and none will be deployed with a pre-1.0 `tines-core`.
 - The header is what makes a later migration possible if one is ever
   needed. Adding it is cheap now and expensive later.
+
+### 10. Core hardening (from `THREAT_MODEL.md`)
+
+The security assessment at `3b1a644` found core behaviours that a peer can
+abuse without any key. All of them are local behaviour (§8), so 1.x could
+change them. They're fixed before 1.0 anyway: they're cheap, and 1.0 is
+when core's behaviour is written down as a promise. None of them adds
+authentication. They bound what an unauthenticated peer can do; 1.1
+decides who is allowed to be a peer.
+
+1. **F6 — a peer's NodeId is fixed for the contact.**
+   - Today `on_frame` overwrites `peer.id` with each frame's `from`
+     (exchange.rs:723), so a peer can claim another identity mid-contact
+     and be handed that identity's addressed mail.
+   - New rule: the first decoded frame on a contact sets `peer.id`. A
+     later frame with a different `from` is dropped and counted as
+     `DropReason::IdentityChanged` (§1).
+   - The pin resets on `Contact`/`Lost`. On transports that bind identities
+     (tines-bt after the fleet fixes), the two always agree.
+2. **F8 — idle peers are evicted.** A peer with no inbound frame for
+   `PEER_IDLE_MS` (local constant, default 30 s) is removed as if `Lost`.
+   Today peers leave only on `Lost`, so eight spoofed addresses can fill
+   the table until restart. With the fleet fixes' `Lost` events this
+   rarely triggers for honest peers, but it bounds the lockout.
+3. **F9 — a summary can't be replayed for amplification.**
+   - At most one received Summary per peer is acted on per
+     `SUMMARY_INTERVAL_MS`. Extra ones are ignored; that's a policy, not a
+     drop.
+   - The send-queue rebuild skips ids already sent to that peer this
+     contact, using the existing per-peer sent record. That record is
+     best-effort under its cap, and a miss only costs a resend.
+   - The worst-case output per received summary stays bounded by
+     `SEND_QUEUE_CAP`, but repeating the summary no longer re-sends.
+4. **F13 — smaller defects:**
+   - **Event queue drops the oldest** when full, as its docs and the fleet
+     spec say (today `push` silently drops the newest, exchange.rs:777).
+     This applies to `Delivered` events; `Dropped` uses counters (§1).
+   - **Pending acks for a removed peer are purged** on `Lost` or eviction,
+     so retries to a dead peer can't starve data frames.
+   - **Frames must be canonical.** Decode rejects trailing bytes after a
+     complete `Frame` (`postcard::take_from_bytes` and an empty remainder),
+     counted as `Malformed`. This is wire format, so it can't wait for 1.x,
+     and §7's vectors pin it with a valid frame plus one trailing byte.
+5. **Considered and left out:**
+   - **A per-peer quota on new inserts** (threat model F10). A big honest
+     sync is indistinguishable from a flood without authentication, and a
+     quota would slow convergence for everyone. Storage bounds belong to
+     the host's trim policy and store cap (host hardening spec §1).
+     Revisit after 1.1.
+   - **Refusing inbound observations that claim this node as observer**
+     (threat model F14). It would stop forged "self" observations beating
+     `SelfFirst`, but also stop a robot recovering its own history from
+     peers after losing its log. Signatures in 1.1 fix the real problem.
+
+New local constants, `PEER_IDLE_MS` and the drop-counter table size, join
+§5's local group. `DropReason` gains `IdentityChanged`.
 
 ## Decisions (Kyle, 2026-10-18)
 
@@ -519,10 +654,31 @@ the new `Observation` encoding. There is no migration:
 - **Q3. Malformed frames are reported the same way as version
   mismatches**, through `NodeEvent::Dropped { reason }` (§1).
 
+## Review decisions (Kyle, 2026-10-19)
+
+- **R1. Drop reports carry the transport `Addr`**, not a NodeId (§1).
+- **R2. No second queue: drops are counted by `(Addr, reason)`** and
+  reported as `Dropped { addr, reason, count }` when drained. `Delivered`
+  receipts can't be evicted by drops, and the counting doubles as the rate
+  limit (§1).
+- **R3. `MAX_FRAME` stays a wire constant at 1500**, and the spec names it
+  as a known 2.0 trigger (§5, §8).
+
+The review's other fixes are applied too:
+- `Malformed` can also mean a newer peer's optional variant (§1).
+- The rule for wire vs local constants is written down (§5).
+- The `Observation` encoding change is stated outright (§2).
+- The `tines-sim` claim is corrected (§3).
+- The version-byte guidance is corrected (§1).
+
+- **R4. `observed_at` is defined** as the observer's wall-clock time in
+  milliseconds since the Unix epoch (UTC), or `None` if the observer has no
+  trusted clock. Relays never change it, and it's unrelated to `Tick` (§2).
+
 ## Left to the builder
 
 - The exact `WIRE_VERSION` value, within the rules in §1.
-- How drop reports are rate-limited per peer, and the limit's value.
+- The size of the drop-counter table (§1).
 - The `SigAlgo` catch-all representation and the `version` sanity rule
   (§2a).
 - Fair-share vs shared FIFO for the bounce table (§6).
@@ -532,15 +688,17 @@ the new `Observation` encoding. There is no migration:
   2. the envelope and drop reports,
   3. `Dest`, then `Signature`,
   4. the API narrowing,
-  5. docs, fuzzing and MSRV,
-  6. the 1.0.0 release, with `cargo-semver-checks` switched on.
+  5. core hardening (§10),
+  6. docs, fuzzing (including adversarial mode) and MSRV,
+  7. the 1.0.0 release, with `cargo-semver-checks` switched on.
 
 ## Done means
 
 - `sh scripts/ci.sh` is green with `#![deny(missing_docs)]`, an MSRV job and
   the vector tests.
-- The fuzz target has run for an agreed budget (e.g. 24 CPU-hours) with no
-  findings, and the corpus is committed.
+- The fuzz target has run for an agreed budget (e.g. 24 CPU-hours) in both
+  input modes with no findings, and the corpus is committed.
+- `THREAT_MODEL.md` marks F6, F8, F9 and F13 fixed.
 - README has a "Stability" section with the §8 policy, including the 1.1
   signature note; CHANGELOG has a 1.0.0 entry listing every break from 0.3.
 - AGENTS.md lists this spec, the wire/local constant split and the trait

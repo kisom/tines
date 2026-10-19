@@ -1,0 +1,515 @@
+# tines — threat model and security assessment
+
+- **Assessed:** `master` at `3b1a644` (tines-core / tines-store / tines-bt /
+  tines-ros2 / tines 0.3.0, fleet-deployment milestone mostly landed)
+- **Date:** 2026-10-19
+- **Status:** first version. This is a living document, not a spec: update
+  it when the code or the trust assumptions change.
+- **Related:** the 1.0 spec (`docs/superpowers/specs/2026-10-18-tines-1-0-design.md`),
+  especially §2a (signature slot) and §2b (age and the 1.1 threat model).
+
+Every finding below was checked against the source; `file:line` references
+are to `3b1a644`.
+
+## 1. Summary
+
+tines v1 has **no trust layer by design**. The core spec lists security as a
+non-goal for v1, and the fleet spec repeats "v1 has no trust layer". So most
+of what an attacker can do today is expected:
+
+- Anyone in radio range can read everything.
+- Anyone in radio range can inject observations under any identity.
+- Anyone in radio range can take custody of addressed messages.
+
+That's acceptable while the fleet operates in a trusted RF environment, and
+not otherwise. Signing arrives in 1.1 (spec §2a), and link authentication is
+the likely 1.1 mechanism for everything that changes per hop (spec §2b).
+
+Separate from the by-design gaps, the assessment found defects that matter
+**now**, even with no attacker present. Several are correctness bugs that
+the fleet milestone needs fixed regardless of security:
+
+| # | Severity | Finding |
+|---|---|---|
+| F1 | **High** | A receiver whose store is full still acks, so the sender releases custody of a message nobody kept. |
+| F2 | **High** | The standalone `tines` service never polls its `Node`, so it never exchanges anything over BLE. |
+| F3 | **High** | `tines-bt` doesn't bind a connection to the advertised NodeId, has no inbound listener, and loses frame boundaries on a stream socket. |
+| F4 | **High** | No host calls `LogStore::flush`, and both seed `Node` from the config `first_seq`. Released flags and `next_seq` are never persisted, so seqs repeat after every restart. |
+| F5 | Medium | `LogStore` recovery truncates every record after a single corrupt one, and the writer can produce records the reader rejects. |
+| F6 | Medium | A peer's NodeId is taken from each frame's `from`, unchecked and changeable per frame, so a peer can claim any identity and be handed that identity's addressed mail. |
+| F7–F17 | Medium/Low | Resource exhaustion, amplification, local-IPC and ROS2 exposure, and smaller defects (§6). |
+
+Recommended order: fix F1–F5 in the fleet milestone (they're bugs), harden
+the hosts (F10–F12) before any robot leaves the lab, and settle the 1.1
+threat questions (§8) before designing signing.
+
+## 2. System and trust boundaries
+
+```mermaid
+flowchart LR
+  subgraph Robot["Robot (one tines instance per device)"]
+    direction TB
+    App["Robot software<br/>(ROS2 nodes or IPC clients)"]
+    Host["Host: tines-ros2 or tines service"]
+    Core["tines-core<br/>Node + Exchange"]
+    Store[("tines-store<br/>append-only log")]
+    BT["tines-bt<br/>BlueZ L2CAP"]
+    App -- "B2: DDS domain / Unix socket" --> Host
+    Host --> Core
+    Core --> Store
+    Core --> BT
+  end
+  Air(("B1: radio<br/>BLE advertising + L2CAP"))
+  BT <--> Air
+  Air <--> Other["Other robots<br/>(and anyone in range)"]
+  Disk["B3: filesystem"] -.- Store
+```
+
+| Boundary | What crosses it | Who can be on the other side today |
+|---|---|---|
+| **B1 radio** | Advertisements (NodeId in clear), L2CAP frames: Summary, Obs, Frag, Ack | Any BLE device in range. There's no pairing, encryption or allowlist. |
+| **B2 local IPC / ROS2** | Observations in, beliefs/payloads and events out | Any local user who can reach the socket (permissions come from umask); any participant on the ROS2 DDS domain (no SROS2). |
+| **B3 storage** | The observation log, released set, `next_seq` | Anyone with write access to the log file (mode from umask). |
+| Core ↔ transport | `Addr`, raw frames | Trusted code. Core relies on the transport to bind `Addr` to a NodeId (AGENTS.md: "core never maps Addr to NodeId"). |
+
+## 3. Assets
+
+1. **World state integrity:** the facts robots plan and navigate on. Forged
+   or stale facts can make a robot act wrongly.
+2. **Directive integrity and delivery:** addressed messages (tasks,
+   telemetry home), including that they arrive, arrive once, and don't
+   outlive their lifetime.
+3. **Custody:** "every unexpired addressed message has at least one holder".
+4. **Availability of exchange:** contacts are rare and short; wasting one is
+   costly.
+5. **Robot resources:** RAM (MCU-class targets), disk, battery, airtime.
+6. **Identity:** which robot said what (`observer`), which robot is on the
+   other end of a link.
+7. **Confidentiality:** world state and directives (not a v1 goal) and
+   robot location/movement privacy (stable advertised NodeId).
+8. **Durability:** the log, the released set and `next_seq` across reboots.
+
+## 4. Adversaries
+
+| Adversary | Capabilities | In scope for |
+|---|---|---|
+| **A1 radio outsider** | No fleet key. In BLE range: listens, advertises any NodeId, connects, injects arbitrary frames, replays, floods. Can't easily alter frames in flight on an established link, but can impersonate a peer. | v1 assessment; 1.1 design |
+| **A2 compromised robot (insider)** | Valid fleet member (and, from 1.1, a valid key). Can already drop, delay or withhold anything it carries; custody accepts carrier failure. | 1.1 design (what signatures do and don't buy) |
+| **A3 local user / process** | Unprivileged account or process on the robot's computer. | Host hardening (now) |
+| **A4 ROS2 domain participant** | Any process on the same DDS domain, local or on the network the ROS graph is exposed to. | Host hardening (now) |
+| **A5 physical / storage access** | Can read or edit the log, swap the SD card, or power-cycle the robot at will. | Partially (integrity and crash safety); full physical attack is out of scope |
+| **A0 no adversary** | Faults only: power loss, full disk, full store, radio loss, clock jumps. | Always. Several findings below are A0 bugs. |
+
+Out of scope: side channels, RF jamming (physical-layer DoS can't be fixed
+in software), compromise of BlueZ/the kernel, and supply chain.
+
+## 5. Security properties: claimed vs actual
+
+| Property | Claimed (specs/AGENTS.md) | Actual at `3b1a644` |
+|---|---|---|
+| No panic on untrusted input (core) | Hard constraint | **Holds** as far as reviewed: saturating age arithmetic, guarded shifts and indexing, `expect`s unreachable from wire input (exchange.rs:437, 1092; frag.rs:147). The sim's `garbage_frames_never_panic` covers random bytes only (§9). |
+| Malformed frames dropped | Hard constraint | **Holds** in core (wire.rs:64-69). The 1.0 spec adds reporting. |
+| Bounded memory in core | Fixed-capacity buffers | **Holds** for the exchange (§6 table). **Doesn't hold for the system**: MemStore and LogStore are unbounded without `trim`, and no host calls `trim` (F10). |
+| Custody: ≥ 1 holder (no carrier failure) | Fleet spec, sim property | **Breaks without an attacker** when a store is full (F1). Breaks trivially under A1 (F7). |
+| Frames bound to the advertised NodeId | Fleet spec ("frames whose `from` differs … are dropped at the transport") | **Doesn't hold** (F3, F6). |
+| Released messages not re-forwarded after reboot | Fleet spec | **Doesn't hold**: release flags are never flushed (F4). Safe direction (duplicate custodian), but wasteful. |
+| `next_seq` persisted across reboots | Core contract | **Doesn't hold** in either host (F4). |
+| Age continues across reboot | Fleet spec | Partly. Hosts open the store at tick 0, and the service's tick is wall-clock *seconds* (F17). |
+
+## 6. Findings
+
+Severity reflects impact on the fleet as it's meant to be deployed (trusted
+RF, single-user robot computers) unless stated. "By design (v1)" marks
+attacker capabilities that follow from having no trust layer; they're
+listed so the 1.1 work can check them off.
+
+### F1 — Full store acks what it didn't keep (High, A0/A1)
+
+`Exchange::accept` enqueues an ack for every receive except a released
+duplicate, including when `insert` fails (exchange.rs ~805-813, comment:
+"even an un-stored id"). `Err(Full)` counts as a duplicate and
+`released` is false, so the ack goes out. The sender then releases custody
+of a message the receiver didn't keep.
+
+- **Effect:** an addressed message is lost with no carrier failure. This
+  violates the custody invariant the fleet spec and sim property rely on.
+  An attacker doesn't need to do anything clever: filling a robot's store
+  (F10) turns it into a custody sink.
+- **Why it's not caught:** `MemStore` never returns `Full`, and the sim uses
+  `MemStore`.
+- **Fix:** never ack an addressed observation unless `insert` returned
+  `Ok(_)` (and, for duplicates, the copy isn't released). Add a sim/unit
+  test with a store that returns `Full`. This was the fleet spec's own rule
+  ("B never acks a … store-full receive").
+
+### F2 — The standalone service never runs the exchange (High, A0)
+
+`tines/src` never calls `Node::poll` or `Node::trim` (grep; the plan calls
+for a poll loop, `docs/superpowers/plans/2026-10-18-tines-fleet-deployment.md:209`).
+`serve()` only answers IPC requests.
+
+- **Effect:** a non-ROS2 robot never sends or receives anything. Inbound BLE
+  data accumulates in an unbounded channel (F10).
+- **Security relevance:** availability, plus unbounded memory growth while
+  connected. Mostly a functional bug.
+- **Fix:** a poll loop (with `trim` on a schedule and `flush` after
+  releases), off the IPC thread or interleaved with it.
+
+### F3 — tines-bt: no identity binding, no listener, no framing (High, A0/A1)
+
+- `read_loop` stamps every inbound chunk with `from: peer`, where `peer`
+  comes from config (tines-bt/src/transport.rs:340-363). The drop check
+  `if from != self.peer` (transport.rs:113-115) therefore never fires,
+  whichever device connected.
+- The scanner connects to the first device advertising the tines service
+  UUID and never decodes or compares the advertised NodeId
+  (transport.rs:290-308). There's no allowlist.
+- There's no `L2capListener`, so nothing accepts inbound connections, and
+  `is_central` is never consulted. Every instance dials out. Two robots
+  can only connect if something else accepts.
+- The L2CAP socket is in **stream** mode and each `read()` result is
+  treated as one frame (transport.rs:345-356). Frame boundaries aren't
+  preserved, so frames can be split or merged. Without an attacker, that
+  produces sporadic malformed drops. With the 1.0 drop reporting, it would
+  also produce false "malformed" alarms.
+- `Contact`/`Lost` events are never emitted, so core's per-contact state
+  (bounce records, ack validation "this contact", peer removal) never
+  resets (see F8).
+- No BLE security level (pairing, encryption, LE Secure Connections) is
+  requested.
+
+**Fix (fleet milestone):**
+- Use SeqPacket L2CAP, or add explicit length-prefix framing.
+- Add a listener plus the smaller-NodeId-initiates rule.
+- Decode the advertised NodeId and bind the connection to it.
+- Drop frames whose `from` differs from the bound NodeId.
+- Emit `Contact`/`Lost`.
+
+**Later (1.1):** authenticate the link (spec §2b). Advertised NodeIds are
+unauthenticated, so the binding only becomes meaningful once there's a
+handshake.
+
+### F4 — Durability promises aren't kept by the hosts (High, A0)
+
+- No host calls `LogStore::flush` (grep of `tines-ros2/src`, `tines/src`).
+  `Meta { next_seq, released }` is only written by `flush`. So the
+  released set never reaches disk, and after a restart every released
+  message is forwarded again. That's the safe direction (a duplicate
+  custodian) but contradicts the fleet spec.
+- Both hosts build `Node` with the config `first_seq`
+  (`tines/src/main.rs:44-48`, `tines-ros2/src/node.rs:147-149`) instead of
+  a persisted value. Core requires `next_seq` to be persisted
+  (`boot_count << 32 | counter`). After a restart, seqs repeat. A new
+  observation with the same topic, payload and recipient as an earlier one
+  then has the same id and **dedupes silently**: the robot reports
+  something and it vanishes.
+- `LogStore::next_seq` counts *all* inserts, including received ones
+  (log.rs:352), so it isn't the node's seq either.
+
+**Fix:**
+- Persist the node's `next_seq` (boot counter plus counter), and seed
+  `Node` from it.
+- Flush on release and on a timer.
+- Add a host-level restart test.
+
+### F5 — Log recovery can destroy good data (Medium, A0/A5)
+
+- `LogStore::new` stops replay at the first record that fails to parse and
+  truncates the file there (log.rs:180-206). A single corrupt record in the
+  *middle* (a bad sector, a bit flip, a hand edit) deletes every record
+  after it. The code comment says "only the partial tail of a crashed
+  append is lost, never a complete record", which is true only for tail
+  damage.
+- `write_record` doesn't enforce `MAX_RECORD_BYTES` (log.rs:274-281), but
+  the reader rejects longer records. A `Meta` record grows by 16 bytes per
+  released id, so above roughly 500 released ids the store writes a record
+  that makes it truncate itself on the next open.
+- There's no checksum, so silent corruption that still decodes is accepted.
+  The stored `id` is trusted without recomputing `obs.id()` (log.rs:154).
+- There's no file locking. Two processes on one log interleave appends, and
+  one's recovery `set_len` can cut the other's records.
+- The log is read whole into memory (log.rs:127). The file is created with
+  umask permissions, and the truncation isn't fsynced.
+
+**Fix:**
+- Add a per-record CRC (or a keyed MAC later).
+- On a bad record in the middle, skip to the next valid one (a sync marker)
+  instead of truncating; truncate only a torn *tail*.
+- Enforce the size cap on write, and keep `Meta` small (store release
+  flags per record, or compact).
+- Take an exclusive `flock` on open.
+- Create the file with mode `0600`.
+- Recompute ids on load.
+
+### F6 — Peer identity is whatever the last frame said (Medium; High combined with F3)
+
+`on_frame` sets `peer.id = Some(frame.sender())` on every frame, unchecked
+(exchange.rs:723). The `from` field inside Obs/Frag is ignored, and
+`observer` is never compared to anything.
+
+- **Effect (A1):** send one frame with `from = X`, and `forward_addressed`
+  hands you every message addressed to X (exchange.rs:584-593), as
+  "delivery". Combined with F7 you can then ack them, and the honest
+  carrier releases them.
+- **Design note:** core deliberately leaves the `Addr` ↔ NodeId binding to
+  the transport, so this is F3's consequence. Still, core could cheaply
+  refuse a NodeId *change* for an existing peer within a contact, and
+  should, once the transport binds identities.
+
+### F7 — Custody can be taken by anyone the carrier sends to (Medium; by design v1)
+
+An ack is accepted if it comes from the address the message was sent to
+(bounce `Sent` record, exchange.rs:756-784). Under the custody chain, a
+carrier hands an addressed message to *any* peer with a known id
+(exchange.rs:594-595), then releases on that peer's ack. A1 can collect
+custody of every addressed message in range and drop it.
+
+- That matches "carrier failure" (accepted for v1) but needs no key and no
+  compromise. 1.1's link authentication limits it to fleet members (A2),
+  where it really is carrier failure.
+- Also: repeated Acks produce duplicate confidence events (`bcast_sent`
+  isn't consumed).
+
+### F8 — Peer-table lockout (Medium, A1)
+
+`MAX_PEERS = 8`. Peers are added on `Contact` or on the first decodable
+frame, and removed only on `Lost` (exchange.rs:674-708). A full table drops
+all frames from new addresses. There's no idle eviction. With BLE never
+emitting `Lost` (F3), entries effectively never leave on real hardware.
+Eight spoofed addresses lock a robot out of exchange until restart.
+
+**Fix:** idle-timeout eviction in core (a local constant), and real
+`Lost` events from tines-bt.
+
+### F9 — Summary amplification (Medium, A1)
+
+A Summary of about 20 bytes with an all-zero filter makes the receiver
+rebuild that peer's send queue with up to 256 of its youngest broadcasts
+(exchange.rs:1065-1125). Each one can be up to 64 fragments, so the worst
+case is about 16,000 frames of airtime per crafted summary. That's
+throttled to one frame per `poll`, but sustained. Re-sending the summary
+re-queues what was already sent.
+
+- Each rebuild also scans every broadcast and clones payloads, which costs
+  CPU and allocation per summary, with no rate limit.
+- **Fix:** rate-limit summary processing per peer (honour at most one per
+  `SUMMARY_INTERVAL_MS`), and remember what was already sent this contact
+  (`bcast_sent` already exists) so a repeated summary doesn't re-queue it.
+
+### F10 — Unbounded growth (Medium, A0/A1/A4)
+
+- `MemStore` and `LogStore` are bounded only by `Node::trim`. Neither host
+  calls it. The log also never compacts (log.rs: append-only, and every
+  flush appends the full released list).
+- Unbounded channels: tines-bt's inbound and outbound `mpsc`
+  (transport.rs:207-208), and tines-ros2's inbound `mpsc` (node.rs:152).
+- The IPC server allocates up to 1 MiB per request frame.
+- **Effect:** A1 can fill memory and disk by gossiping junk. A4 can do it by
+  publishing on a bridged topic. Either drives F1 (store full) once a
+  bounded store exists.
+- **Fix:**
+  - Hosts trim on a schedule with a documented default policy.
+  - Use bounded channels (drop or backpressure).
+  - Add log compaction.
+  - Add per-peer and per-observer insert quotas (for example, a per-peer
+    token bucket on new inserts).
+
+### F11 — Local IPC is open to any local user (Medium, A3)
+
+- The socket gets umask permissions, and there's no `SO_PEERCRED` check
+  (tines/src/ipc.rs:194-200; grep finds no `set_permissions` or peer-cred
+  code).
+- Any local process that can reach it can:
+  - publish observations **as this robot** (`Observe`), which are then
+    gossiped fleet-wide under its identity;
+  - read any belief;
+  - drain the shared event queue, destructively.
+- The configured socket path is unlinked unconditionally before binding,
+  whatever file is there (ipc.rs:197).
+- **Availability:** clients are served one at a time with no timeouts, so
+  an idle client blocks everyone. An `accept` error ends the daemon. An
+  oversized frame (> 1 MiB) gets an error reply without consuming its body,
+  which desynchronizes the stream (contrary to the module docs).
+- **Fix:**
+  - Create the socket in a `0700` runtime directory with mode `0600` (or a
+    group-restricted mode).
+  - Check `SO_PEERCRED` against an allowed uid/gid.
+  - Only unlink a path that is a socket.
+  - Set per-connection read timeouts, or serve clients concurrently.
+  - Close the connection on an oversized frame.
+  - Survive `accept` errors.
+
+### F12 — ROS2 bridge trusts the whole DDS domain (Medium, A4)
+
+- **Read:** any participant on the domain can read the latest payload of
+  every bridged topic and every receipt.
+- **Write:** any participant can inject observations on a managed topic.
+  They're stored and gossiped as this robot's own (`observe(..., None, now)`,
+  tines-ros2/src/node.rs:197), with no rate limit.
+- SROS2/DDS security isn't mentioned or configured anywhere.
+- **Likely self-echo loop:** the node subscribes to the topics it
+  publishes, with no filter for its own messages (node.rs:207-238). If DDS
+  delivers its own publications back, which the default settings allow
+  (not verified on hardware), each republish is re-observed with a new seq.
+  That's a feedback loop that grows the log and floods the fleet.
+- **Fix:**
+  - Ignore local publications (`ignore_local_publications` or a
+    publisher-GID filter).
+  - Document running with SROS2 enclaves and a dedicated domain id.
+  - Rate-limit inbound.
+  - Bound the channel.
+
+### F13 — Smaller core defects (Low)
+
+- **Event queue drops newest, not oldest** (`let _ = self.events.push`,
+  exchange.rs:777), contrary to its docs and the fleet spec.
+- **Pending acks for a lost peer aren't purged** on `remove_peer`. On
+  send errors they're re-queued, and since acks go ahead of data, retries
+  to a dead peer can starve data frames.
+- **Reassembler displacement:** one fragment with a different id or count
+  resets a peer's in-progress stream (frag.rs:121-133). Same-address only,
+  so it's limited by F3/F6 binding.
+- **Trailing bytes:** `postcard::from_bytes` accepts trailing bytes after a
+  valid frame. That's harmless now, but the 1.0 vectors should pin
+  rejection so the wire format is canonical.
+
+### F14 — Belief policies trust attacker-controlled fields (Medium; by design v1)
+
+- `LatestWins` picks the smallest `age_ms` (belief.rs:36-39). An attacker
+  sets age 0 to win any topic (see spec §2b).
+- `SelfFirst` trusts `obs.observer == me` (belief.rs:75-77). A forged
+  observation claiming to be from *this* robot beats everything. Signing in
+  1.1 fixes the observer claim. Until then, a host could refuse inbound
+  observations whose `observer` is its own NodeId (a robot never needs to
+  receive its own observations from a peer if it still holds them).
+- First-copy-wins dedupe fixes `age_ms`, `observed_at` and `lifetime_ms`
+  forever at a receiver (mem_store.rs:72-75). A huge `lifetime_ms` makes an
+  addressed message effectively immortal.
+
+### F15 — No confidentiality, trackable robots (Low for v1; by design)
+
+The BLE link is unencrypted, so world state and directives are readable by
+anyone in range. Each robot advertises a stable NodeId in cleartext and is
+discoverable (transport.rs:276-282), so it can be tracked across BLE address
+rotation. That's the design (the NodeId *is* the rendezvous). If tracking
+matters, 1.1+ needs rotating, keyed rendezvous identifiers.
+
+### F16 — The 16-byte id is unkeyed and truncated (Low, A1)
+
+Ids are the first 128 bits of Blake2s-256 (64-bit collision resistance).
+Producing a collision with a *specific* existing id needs a second
+preimage, which is infeasible, so an attacker can't squat a particular
+id. Generic 64-bit collisions are within reach of a determined attacker,
+but only between two observations they produced themselves, which gains
+nothing. This is acceptable for dedupe. It's the reason spec §2a signs the
+full preimage, not the id.
+
+### F17 — Service clock is wall-clock seconds (Medium, A0)
+
+`tines/src/ipc.rs` `now_ms()` returns `as_secs()` from `SystemTime`
+(ipc.rs:276-281). Core's `Tick` is monotonic milliseconds.
+
+- Ages advance 1000× too slowly, so addressed lifetimes last 1000× too
+  long.
+- An NTP step backwards freezes ages, because they saturate.
+- The store is opened at tick 0 while requests use epoch values, so the
+  first read can add the whole epoch to every age.
+
+**Fix:** use a monotonic millisecond clock (`Instant` since process start)
+everywhere in the host, and open the store with the same clock.
+
+## 7. Threats by STRIDE, mapped to findings
+
+| | Threat | Status today | Findings | Planned mitigation |
+|---|---|---|---|---|
+| **S**poofing | Impersonate a robot on the link | Trivial (A1) | F3, F6 | Transport binding now; link auth (1.1) |
+| | Forge an observation's `observer` | Trivial (A1, A3, A4) | F11, F12, F14 | Host hardening now; signatures (1.1) |
+| **T**ampering | Alter content in transit | No integrity (A1) | — | Signatures cover content (1.1) |
+| | Alter age / lifetime | Unprotected | F14, §2b | 1.1 threat-model decision |
+| | Alter the log on disk | No integrity (A5) | F5 | CRC now; MAC optional |
+| **R**epudiation | Deny having said something | Unattributable | — | Signatures (1.1) |
+| **I**nformation disclosure | Read world state / directives | Cleartext (A1, A4) | F12, F15 | Out of scope v1; link encryption candidate |
+| | Track robots | Stable NodeId adverts | F15 | Rotating identifiers (post-1.1) |
+| **D**enial of service | Lose custody traffic | Easy (A0!, A1) | F1, F7 | Fix F1 now; link auth (1.1) |
+| | Lock out peers / waste airtime | Easy (A1) | F8, F9 | Eviction and rate limits now |
+| | Exhaust memory / disk | Easy (A1, A4) | F10 | Trim, bounded channels, quotas now |
+| | Block local clients | Easy (A3) | F11 | Timeouts, concurrency now |
+| **E**levation of privilege | Act as the robot from a local account | Any local user (A3) | F11 | Socket permissions + peer creds now |
+| | Act as the robot from the ROS graph | Any domain participant (A4) | F12 | SROS2, domain isolation |
+
+## 8. The age question (for 1.1)
+
+Spec §2b asks whether `age_ms` must be authenticated. This assessment
+supports its framing, and adds evidence:
+
+- Today the question is moot. Everything is forgeable, and fixing F14
+  needs signatures first.
+- After 1.1 signs content, age is the main remaining *freshness* lever:
+  stale facts winning `LatestWins`, expired directives coming back to life,
+  and fresh facts suppressed. For A1 it's fully exploitable without link
+  authentication. For A2 it adds freshness attacks to what a bad carrier
+  can already do by dropping.
+- **Recommendation for 1.1:** link authentication (handshake plus per-frame
+  tag), which removes A1 from age, acks, summaries and identity in one
+  mechanism. Accept A2 age forgery as equivalent to carrier misbehaviour,
+  and document it. Cross-check against signed `observed_at` where robots
+  have clocks.
+
+## 9. Test gaps
+
+The sim covers honest-node custody properties and random garbage frames
+(`tests/props.rs:281`, `tests/relay.rs`). It doesn't cover:
+
+- well-formed malicious frames: forged acks, spoofed `from`/`observer`,
+  NodeId changes mid-contact;
+- a store returning `Full` (F1);
+- summary floods and peer-table exhaustion (F8, F9);
+- reassembly abuse;
+- `LogStore` corruption in the middle, an oversized `Meta`, concurrent
+  openers, a full disk, and restart and seq continuity (F4, F5);
+- anything in the hosts: IPC abuse, ROS2 injection and self-echo
+  (F11, F12).
+
+The 1.0 fuzz harness (spec §7) should take an *adversarial peer* mode, not
+just random bytes: structured frames with chosen ids and identities.
+
+## 10. Where each finding is being fixed
+
+| Findings | Where | Spec |
+|---|---|---|
+| F1–F5, F17 | Fleet milestone (M3), now | `docs/superpowers/specs/2026-10-19-tines-fleet-fixes.md` |
+| F10–F12 | Host hardening, before a robot leaves the lab | `docs/superpowers/specs/2026-10-19-tines-host-hardening.md` |
+| F6, F8, F9, F13 | tines-core 1.0 | `docs/superpowers/specs/2026-10-18-tines-1-0-design.md` §10 |
+| F7, F14, §8 | 1.1 (threat model, link authentication, signing) | 1.0 spec §2a, §2b |
+| F15, F16 | Accepted for now | — |
+
+Mark each finding fixed here, with its commit, when it lands.
+
+## 11. Recommendations, in order
+
+1. **Fleet milestone bugs:**
+   - F1 (ack only what was stored).
+   - F2 (poll loop).
+   - F3 (framing, listener, NodeId binding, Contact/Lost).
+   - F4 (persist seq, flush).
+   - F5 (CRC, recovery that skips rather than truncates, write cap,
+     locking).
+   - F17 (monotonic ms clock).
+   - Each with a regression test.
+2. **Host hardening before any robot leaves the lab:**
+   - F10 (trim, bounded channels, compaction).
+   - F11 (socket permissions, peer creds, timeouts).
+   - F12 (ignore own publications, SROS2 guidance, rate limits).
+3. **Core hardening (can ride with 1.0):**
+   - F8 (idle eviction).
+   - F9 (summary rate limit, no re-queue).
+   - F13 (event drop-oldest, purge acks on peer loss, reject trailing
+     bytes).
+   - F6 (refuse NodeId change within a contact).
+4. **1.1:**
+   - Write the full threat model from §4/§8.
+   - Choose link authentication.
+   - Add signing per spec §2a (F14, F7).
+   - Add "replace if better signed" dedupe.
+5. **Later:** confidentiality and rotating rendezvous identifiers (F15),
+   only if the deployment needs them.
