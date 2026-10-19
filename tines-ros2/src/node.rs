@@ -122,15 +122,16 @@ impl TinesNode {
     ///
     /// * `log_path` — where the backing [`LogStore`] lives (created if missing).
     /// * `peer` / `radio` — the BLE connection this node exchanges over.
-    /// * `first_seq` — the next tines observation sequence to use.
     /// * `topic_cap` — the maximum number of ROS2 topics to manage at once.
     ///
-    /// The ROS2 context is created internally via [`rclrs::Context::default_from_env`];
-    /// the store's anchor tick is `0`; ages then advance under the `Tick`
-    /// values passed to [`TinesNode::poll`].
+    /// The tines sequence numbers are seeded from the LogStore's boot counter
+    /// (`store.first_seq()`), so a resumed node never reuses a sequence
+    /// number. The ROS2 context is created internally via
+    /// [`rclrs::Context::default_from_env`]; the store's anchor tick is `0`;
+    /// ages then advance under the `Tick` values passed to
+    /// [`TinesNode::poll`].
     pub fn new(
         me: NodeId,
-        first_seq: u64,
         log_path: &std::path::Path,
         peer: NodeId,
         radio: impl Radio + 'static,
@@ -144,9 +145,9 @@ impl TinesNode {
         let executor = context.create_basic_executor();
         let node = executor.create_node("tines")?;
 
-        let store = LogStore::new(log_path, 0, first_seq)?;
+        let store = LogStore::open(log_path, 0)?;
         let transport = BtTransport::new(me, peer, radio);
-        let tines = TinesNodeCore::new(me, first_seq, store, transport);
+        let tines = TinesNodeCore::new(me, store.first_seq(), store, transport);
 
         let receipt_pub = node.create_publisher::<UInt8MultiArray>(RECEIPTS_TOPIC)?;
         let (inbound_tx, inbound_rx) = channel::<InboundMsg>();

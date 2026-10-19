@@ -12,14 +12,23 @@
 //!   inserted at (`stored_at`). Deduped on `id` at load.
 //! * `Record::Trim` — the id of an observation removed by `trim`; the last
 //!   event for an id wins, so a re-inserted (new `Obs` record) id survives.
-//! * `Record::Meta` — the current `next_seq` and the full set of released ids.
-//!   The last `Meta` on disk wins, so it always reflects the latest flushed
-//!   state.
+//! * `Record::Release` — the id of an observation that was released; the last
+//!   event for an id wins, so a re-inserted (new `Obs` record) id becomes
+//!   un-released again. Appended immediately by [`Store::release`], so a
+//!   release survives a kill without a flush.
+//! * `Record::Boot` — the boot counter, written by [`LogStore::open`] and
+//!   incremented on every open. `first_seq() = boot_count << 32`, which is
+//!   core's documented contract; a resumed node therefore never reuses a
+//!   sequence number.
+//! * `Record::Clock` — a tick marker written by [`LogStore::flush`]. On load
+//!   each live observation's age is folded up to the last clock marker so
+//!   pre-reboot elapsed time is recovered (see [`LogStore::open`]).
 //!
 //! On load the index is rebuilt by replaying the log, then every age is
 //! rebased to load time: each entry's `age_ms` is folded by the time elapsed
 //! since its own `stored_at` (the tick it was inserted, carried on the `Obs`
-//! record). Anchoring the fold to each entry's insert tick rather than to a
+//! record) up to the last persisted clock marker, and then from the marker to
+//! load time. Anchoring the fold to each entry's insert tick rather than to a
 //! single persisted clock marker makes the reopen fold exact for idle stores
 //! and for observations inserted before the last flush — ages continue across a
 //! reboot instead of freezing at (and under-counting from) their pre-shutdown
@@ -29,7 +38,7 @@
 //!
 //! * Torn trailing records. The log is append-only, so a crash mid-append can
 //!   leave a partial trailing record — a length prefix whose body ran past
-//!   end-of-file — or a bit-roted/corrupt record. [`LogStore::new`] recovers by
+//!   end-of-file — or a bit-roted/corrupt record. [`LogStore::open`] recovers by
 //!   truncating the file back to the last *complete* record boundary and
 //!   loading what survived: the partial tail is dropped, complete records are
 //!   preserved. A corrupt length prefix that claims an absurd body size is
@@ -37,12 +46,14 @@
 //!   same way, so a malformed prefix cannot exhaust memory or make the store
 //!   unloadable.
 //!
-//! * Durability contract. `flush()` appends a `Record::Meta` and
-//!   `sync_all`s, making the released set, `next_seq`, and the appended
-//!   observation records durable across a power loss. `insert`, `release`, and
-//!   `trim` update the in-memory index and (for `insert`/`trim`) append
-//!   records, but those records reach disk only on the next `flush()`. Hosts
-//!   that need crash durability must `flush()` before shutdown.
+//! * Durability contract. `flush()` appends a `Record::Clock` and `sync_all`s,
+//!   making the appended observation and release records durable across a power
+//!   loss. `insert`, `release`, and `trim` update the in-memory index and (for
+//!   `insert`/`trim`) append records, but those records reach disk only on the
+//!   next `flush()`. Hosts that need crash durability must `flush()` before
+//!   shutdown. `release`, by contrast, appends its `Release` record immediately
+//!   (best-effort: an append error is logged), so a single release is durable
+//!   across a kill-without-flush without waiting for a flush.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{File, OpenOptions};
@@ -78,9 +89,14 @@ enum Record {
     Trim {
         id: ObservationId,
     },
-    Meta {
-        next_seq: u64,
-        released: Vec<ObservationId>,
+    Release {
+        id: ObservationId,
+    },
+    Boot {
+        count: u64,
+    },
+    Clock {
+        tick: Tick,
     },
 }
 
@@ -94,26 +110,33 @@ struct Entry {
 /// A persistent, append-only [`Store`] backed by a single observation log.
 ///
 /// See the [module documentation](crate) for the on-disk record format and the
-/// rebase-on-load behavior.
+/// boot counter, durable releases, and rebase-on-load behavior.
 pub struct LogStore {
     file: File,
     index: BTreeMap<ObservationId, Entry>,
-    next_seq: u64,
+    boot_count: u64,
     now: Tick,
 }
 
 impl LogStore {
     /// Open (creating if necessary) the log at `path` and rebuild the index.
     ///
-    /// `now` is the current tick and is used both as the base for rebasing ages
-    /// and as the store's current clock. `first_seq` is the next sequence
-    /// number to hand out; the persisted `next_seq` (if any) is honored when it
-    /// is larger, so a resumed run never reuses a sequence.
-    pub fn new(path: &Path, now: Tick, first_seq: u64) -> Result<Self, StoreError> {
+    /// `now` is the current tick: it is the base for rebasing ages and the
+    /// store's current clock. On open the log's boot counter is read,
+    /// incremented, and durably written (`fsync`) before returning, so
+    /// [`Self::first_seq`] strictly increases across reboots and a resumed node
+    /// never reuses a sequence number.
+    ///
+    /// The boot counter is the number of times this log has been opened (a
+    /// fresh log starts at boot 1). It is exposed as
+    /// `first_seq() = boot_count << 32`, core's documented contract: a boot can
+    /// hand out up to 2³² sequence numbers before the high word would roll
+    /// over, which is more than any robot needs.
+    pub fn open(path: &Path, now: Tick) -> Result<Self, StoreError> {
         // Open for reads (to load) and appends (to write later). Append mode is
         // correct because we load by reading the whole file below, and every
         // mutation appends to the end of the log.
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .create(true)
             .append(true)
@@ -128,7 +151,6 @@ impl LogStore {
 
         let mut index: BTreeMap<ObservationId, Entry> = BTreeMap::new();
         let mut dead: HashSet<ObservationId> = HashSet::new();
-        let mut next_seq = first_seq;
         let mut records_loaded: usize = 0;
 
         // Byte offset just past the last *complete* record replayed so far. A
@@ -139,6 +161,11 @@ impl LogStore {
         let mut pos = 0usize;
         let mut good_end = 0usize;
 
+        // The boot counter read off the last `Record::Boot` on disk, and the
+        // tick of the last `Record::Clock` (the load-time age fold's anchor).
+        let mut last_boot_count: Option<u64> = None;
+        let mut last_clock_tick: Option<Tick> = None;
+
         loop {
             match parse_record(&data, pos) {
                 Ok(Some((new_pos, rec))) => {
@@ -146,14 +173,13 @@ impl LogStore {
                         Record::Obs { id, obs, stored_at } => {
                             // A preceding Trim for this id is cancelled by the
                             // re-insert, so revive it; otherwise dedupe to the
-                            // first (oldest) occurrence. Fold in the time
-                            // elapsed since the record's own insert tick so the
-                            // age is exact regardless of when the last flush
-                            // happened.
+                            // first (oldest) occurrence. The age is folded after
+                            // the loop (once the last clock marker is known), so
+                            // it starts from its stored, insert-time age.
                             dead.remove(&id);
                             index.entry(id).or_insert_with(|| Entry {
-                                obs: obs.aged(now.saturating_sub(stored_at)),
-                                stored_at: now,
+                                obs: *obs,
+                                stored_at,
                                 released: false,
                             });
                         }
@@ -161,16 +187,18 @@ impl LogStore {
                             dead.insert(id);
                             index.remove(&id);
                         }
-                        Record::Meta {
-                            next_seq: ns,
-                            released,
-                        } => {
-                            next_seq = ns.max(next_seq);
-                            for rid in released {
-                                if let Some(entry) = index.get_mut(&rid) {
-                                    entry.released = true;
-                                }
+                        Record::Release { id } => {
+                            // Mark released if the id is still live; a later
+                            // re-insert (a fresh `Obs`) makes it un-released.
+                            if let Some(entry) = index.get_mut(&id) {
+                                entry.released = true;
                             }
+                        }
+                        Record::Boot { count } => {
+                            last_boot_count = Some(count);
+                        }
+                        Record::Clock { tick } => {
+                            last_clock_tick = Some(tick);
                         }
                     }
                     records_loaded += 1;
@@ -211,33 +239,63 @@ impl LogStore {
             );
         }
 
+        // Increment the boot counter and durably persist it before returning, so
+        // a later open reads a strictly higher value and first_seq() climbs.
+        let boot_count = last_boot_count.map(|c| c + 1).unwrap_or(1);
+        let record = Record::Boot { count: boot_count };
+        write_record(&mut file, &record)?;
+        file.sync_all().map_err(|_| StoreError::Backend)?;
+
+        // Fold each live observation's age up to the last clock marker and then
+        // to load time. Anchoring to each entry's insert tick keeps the fold
+        // exact even for observations inserted before the last flush (see the
+        // module docs).
+        for entry in index.values_mut() {
+            entry.obs.age_ms = match last_clock_tick {
+                Some(marker) if marker >= entry.stored_at => entry
+                    .obs
+                    .age_ms
+                    .saturating_add(marker.saturating_sub(entry.stored_at))
+                    .saturating_add(now.saturating_sub(marker)),
+                _ => entry
+                    .obs
+                    .age_ms
+                    .saturating_add(now.saturating_sub(entry.stored_at)),
+            };
+            entry.stored_at = now;
+        }
+
         Ok(LogStore {
             file,
             index,
-            next_seq,
+            boot_count,
             now,
         })
     }
 
-    /// The next sequence number this store will hand out.
-    pub fn next_seq(&self) -> u64 {
-        self.next_seq
+    /// The sequence number the next `Node::observe` should use for this boot.
+    ///
+    /// Equals `boot_count << 32` (see [`LogStore::open`]). It strictly increases
+    /// across reboots, so a resumed node's sequence numbers can't collide
+    /// (content-id dedupe) with the previous boot's observations.
+    pub fn first_seq(&self) -> u64 {
+        self.boot_count << 32
     }
 
-    /// Persist the current index state (released flags, `next_seq`, and the
-    /// observation log) to disk.
+    /// Persist the current index state to disk.
     ///
-    /// This is the durability boundary: `flush()` appends a `Record::Meta`
-    /// and calls `sync_all`, after which the released set, `next_seq`, and the
-    /// appended observation records are durable across a power loss. Because
-    /// `insert`, `release`, and `trim` only reach disk via a subsequent
-    /// `flush()`, hosts that need crash durability must call `flush()` before
-    /// shutdown (see the durability contract in the module docs).
+    /// This is the durability boundary: `flush()` advances each entry's age to
+    /// the current tick, appends a `Record::Clock` tick marker, and calls
+    /// `sync_all`, after which the appended observation and release records are
+    /// durable across a power loss. Because `insert` only reaches disk via a
+    /// subsequent `flush()`, hosts that need crash durability must call
+    /// `flush()` before shutdown (see the durability contract in the module
+    /// docs).
     pub fn flush(&mut self) -> Result<(), StoreError> {
         // Advance every entry's age up to this tick in memory, so each
         // `entry.obs.age_ms` is the true current age and `stored_at` marks when
         // that age was computed. Ages are recomputed from each entry's own
-        // `stored_at` on the next load (see [`LogStore::new`]), so this keeps
+        // `stored_at` on the next load (see [`LogStore::open`]), so this keeps
         // the in-memory representation coherent within this run.
         for entry in self.index.values_mut() {
             entry.obs.age_ms = entry
@@ -247,18 +305,9 @@ impl LogStore {
             entry.stored_at = self.now;
         }
 
-        let mut released: Vec<ObservationId> = self
-            .index
-            .iter()
-            .filter(|(_, entry)| entry.released)
-            .map(|(id, _)| *id)
-            .collect();
-        released.sort_unstable();
-
-        let record = Record::Meta {
-            next_seq: self.next_seq,
-            released,
-        };
+        // Record a clock marker so the load-time age fold has a durable anchor
+        // for the time elapsed up to this flush.
+        let record = Record::Clock { tick: self.now };
         write_record(&mut self.file, &record)?;
         self.file.sync_all().map_err(|_| StoreError::Backend)?;
         Ok(())
@@ -284,7 +333,7 @@ fn write_record(file: &mut File, record: &Record) -> Result<(), StoreError> {
 ///
 /// This is a pure slice parser (no file I/O), so a torn or corrupt trailing
 /// record is detectable purely by byte offsets, which is exactly what
-/// [`LogStore::new`] needs to truncate to the last complete boundary.
+/// [`LogStore::open`] needs to truncate to the last complete boundary.
 ///
 /// * `Ok(None)` — clean end-of-file: `pos` is exactly at the end of `data`.
 /// * `Ok(Some((new_pos, rec)))` — a complete record was parsed; `new_pos` is
@@ -294,7 +343,7 @@ fn write_record(file: &mut File, record: &Record) -> Result<(), StoreError> {
 ///   declared body length exceeds [`MAX_RECORD_BYTES`] (rejected *before* any
 ///   allocation, so a corrupt `0xFFFFFFFF` prefix cannot exhaust memory), the
 ///   body runs past `data.len()`, or the body fails to decode.
-///   [`LogStore::new`] treats this as a torn tail and truncates the file.
+///   [`LogStore::open`] treats this as a torn tail and truncates the file.
 fn parse_record(data: &[u8], pos: usize) -> Result<Option<(usize, Record)>, StoreError> {
     // Clean EOF: nothing left.
     if pos == data.len() {
@@ -349,7 +398,6 @@ impl Store for LogStore {
                 released: false,
             },
         );
-        self.next_seq += 1;
         Ok(true)
     }
 
@@ -399,12 +447,20 @@ impl Store for LogStore {
     /// Mark the observation with `id` as released: it has been sent and must
     /// not be offered for exchange again.
     ///
-    /// The mark is set in memory immediately, but is only persisted to disk on
-    /// the next [`Self::flush`]; without a flush the release is lost across a
-    /// power loss (see the durability contract in the module docs).
+    /// The mark is set in memory immediately and a `Record::Release` is
+    /// appended to the log at the same time (best-effort: an append error is
+    /// logged, not raised, keeping [`Store::release`] infallible). The release
+    /// is therefore durable across a kill-without-flush — unlike a flush-only
+    /// release, it does not wait for a later [`Self::flush`].
     fn release(&mut self, id: &ObservationId) {
         if let Some(entry) = self.index.get_mut(id) {
             entry.released = true;
+        }
+        // Best-effort durable append: `release` is infallible, so a backend
+        // failure is logged rather than raised (the worst case is a duplicate
+        // custodian after a reboot).
+        if let Err(e) = self.append(&Record::Release { id: *id }) {
+            eprintln!("tines-store: failed to append release record for {id:?}: {e:?}");
         }
     }
 
@@ -451,6 +507,7 @@ impl Store for LogStore {
                     continue;
                 }
                 let mut ids = member_ids.clone();
+                ids.sort_unstable();
                 ids.sort_by(|&a, &b| self.age_cmp(&a, &b, now));
                 for id in ids.into_iter().skip(keep) {
                     removed.insert(id);

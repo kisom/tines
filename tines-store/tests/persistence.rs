@@ -47,7 +47,7 @@ fn reopen_preserves_store() {
     let path = store_path("reopen");
 
     {
-        let mut s = LogStore::new(&path, 0, 1).expect("open fresh store");
+        let mut s = LogStore::open(&path, 0).expect("open fresh store");
         let a = obs([1; 16], 1, 0, Some(10));
         let b = obs([2; 16], 2, 0, Some(20));
         let ib = b.id();
@@ -57,19 +57,17 @@ fn reopen_preserves_store() {
         assert!(!s.is_released(&ib));
         s.release(&ib);
         assert!(s.is_released(&ib));
-        assert_eq!(s.next_seq(), 3);
         s.flush().expect("flush before drop");
     }
 
     {
-        let s = LogStore::new(&path, 2000, 3).expect("reopen store");
+        let s = LogStore::open(&path, 2000).expect("reopen store");
         let a = obs([1; 16], 1, 0, Some(10));
         let b = obs([2; 16], 2, 0, Some(20));
         assert!(s.contains(&a.id()));
         assert!(s.contains(&b.id()));
         assert!(!s.is_released(&a.id()));
         assert!(s.is_released(&b.id()));
-        assert_eq!(s.next_seq(), 3);
     }
 }
 
@@ -78,14 +76,14 @@ fn ages_rebase_on_load() {
     let path = store_path("ages");
 
     {
-        let mut s = LogStore::new(&path, 1000, 1).unwrap();
+        let mut s = LogStore::open(&path, 1000).unwrap();
         let o = obs([1; 16], 1, 500, Some(10));
         assert!(s.insert(o, 1000).unwrap());
         s.flush().unwrap();
     }
 
     {
-        let s = LogStore::new(&path, 5000, 1).unwrap();
+        let s = LogStore::open(&path, 5000).unwrap();
         let o = obs([1; 16], 1, 500, Some(10));
         let id = o.id();
         // 500ms original age plus the 4000ms that elapsed while the store was
@@ -104,7 +102,7 @@ fn ages_rebase_after_nonidle_flush() {
     let path = store_path("ages_nonidle");
 
     {
-        let mut s = LogStore::new(&path, 1000, 1).unwrap();
+        let mut s = LogStore::open(&path, 1000).unwrap();
         let a = obs([1; 16], 1, 100, Some(10));
         assert!(s.insert(a, 1000).unwrap());
         // Advance the store clock via a second, distinct insert so the flush
@@ -120,7 +118,7 @@ fn ages_rebase_after_nonidle_flush() {
         // = 8100. A flush that fails to catch `age_ms` up folds the reopen
         // against the flush clock (3000) and under-counts by the 2000ms
         // between insert and flush, reporting only 6100.
-        let s = LogStore::new(&path, 9000, 1).unwrap();
+        let s = LogStore::open(&path, 9000).unwrap();
         let a = obs([1; 16], 1, 100, Some(10));
         let g = s.get(&a.id(), 9000).unwrap();
         assert_eq!(g.age_ms, 8100);
@@ -128,22 +126,112 @@ fn ages_rebase_after_nonidle_flush() {
 }
 
 #[test]
-fn next_seq_persists() {
-    let path = store_path("seq");
+fn ages_include_time_to_clock_marker() {
+    // A flush records a Clock marker; on load the age fold has to recover the
+    // elapsed time from each observation's insert tick up to that marker as
+    // well as from the marker to now, so an observation idle across the flush
+    // keeps its true age rather than freezing at the flush tick.
+    let path = store_path("clock_age");
 
     {
-        let mut s = LogStore::new(&path, 0, 1).unwrap();
-        for i in 0..3u64 {
-            let o = obs([1; 16], 1 + i, 0, Some(10));
-            assert!(s.insert(o, 1 + i).unwrap());
-        }
-        assert_eq!(s.next_seq(), 4);
+        let mut s = LogStore::open(&path, 1000).unwrap();
+        let o = obs([1; 16], 1, 500, Some(10));
+        assert!(s.insert(o, 1000).unwrap());
+        // A second insert advances the store clock to 3000; the flush below
+        // records a Clock marker at that tick even though `o` was inserted
+        // earlier (at 1000) and sits idle until the store is dropped.
+        let d = obs([2; 16], 2, 0, Some(20));
+        assert!(s.insert(d, 3000).unwrap());
         s.flush().unwrap();
     }
 
     {
-        let s = LogStore::new(&path, 100, 1).unwrap();
-        assert_eq!(s.next_seq(), 4);
+        // Reopen at 9000. `o`'s true age is 500 (insert-time) + (9000 - 1000)
+        // = 8500; the marker at 3000 must fold both the pre-flush 2000ms and
+        // the post-flush 6000ms.
+        let s = LogStore::open(&path, 9000).unwrap();
+        let o = obs([1; 16], 1, 500, Some(10));
+        let g = s.get(&o.id(), 9000).unwrap();
+        assert_eq!(g.age_ms, 8500);
+    }
+}
+
+#[test]
+fn boot_counter_first_seq_increases_and_no_collision() {
+    // A boot counter makes `first_seq` strictly increase across reboots, so a
+    // resumed node's sequence numbers land in a disjoint range and cannot
+    // collide (content-id dedupe) with the previous boot's observations.
+    let path = store_path("boot");
+
+    let first1;
+    let first2;
+
+    // Boot 1: first_seq is 1 << 32.
+    {
+        let mut s = LogStore::open(&path, 0).expect("open boot 1");
+        first1 = s.first_seq();
+        assert_eq!(first1, 1u64 << 32);
+        // A node seeded here observes first1, first1 + 1, ...
+        let a = obs([1; 16], first1, 0, Some(10));
+        let a2 = obs([1; 16], first1 + 1, 0, Some(10));
+        assert!(s.insert(a, 10).unwrap());
+        assert!(s.insert(a2, 11).unwrap());
+        drop(s);
+    }
+
+    // Boot 2: first_seq strictly increased. A fresh observation at the new
+    // first_seq is a *new* id (Ok(true)), not deduped against boot 1's ids
+    // that would happen if the seq range were reused.
+    {
+        let mut s = LogStore::open(&path, 100).expect("open boot 2");
+        first2 = s.first_seq();
+        assert!(first2 > first1);
+        let c = obs([1; 16], first2, 0, Some(20));
+        assert!(
+            s.insert(c, 101).unwrap(),
+            "first_seq must advance so boot-2 ids don't collide with boot-1 ids"
+        );
+        // Boot 1's observations are still present (content-addressed).
+        assert!(s.contains(&obs([1; 16], first1, 0, Some(10)).id()));
+        drop(s);
+    }
+
+    // Boot 3: still strictly increasing.
+    {
+        let s = LogStore::open(&path, 200).expect("open boot 3");
+        assert!(s.first_seq() > first2);
+    }
+}
+
+#[test]
+fn release_survives_kill_without_flush() {
+    // release appends a durable Release record immediately, so a release that
+    // is never followed by a flush (a kill without graceful shutdown) still
+    // survives a reopen.
+    let path = store_path("release");
+
+    {
+        let mut s = LogStore::open(&path, 0).expect("open release store");
+        let a = obs([1; 16], 1, 0, Some(10));
+        let b = obs([2; 16], 2, 0, Some(20));
+        assert!(s.insert(a, 100).unwrap());
+        assert!(s.insert(b.clone(), 101).unwrap());
+        let ib = b.id();
+        s.release(&ib);
+        assert!(s.is_released(&ib));
+        // Drop WITHOUT flush: the release record must already be on disk
+        // (appended immediately), not waiting for a flush to persist it.
+        drop(s);
+    }
+
+    {
+        let s = LogStore::open(&path, 200).expect("reopen after kill w/o flush");
+        let b = obs([2; 16], 2, 0, Some(20));
+        assert!(s.contains(&b.id()));
+        assert!(
+            s.is_released(&b.id()),
+            "a release must survive a kill without a flush"
+        );
     }
 }
 
@@ -155,7 +243,7 @@ fn reopen_recovers_from_torn_trailing_record() {
     let path = store_path("torn");
 
     {
-        let mut s = LogStore::new(&path, 0, 1).expect("open fresh store");
+        let mut s = LogStore::open(&path, 0).expect("open fresh store");
         let a = obs([1; 16], 1, 0, Some(10));
         let b = obs([2; 16], 2, 0, Some(20));
         assert!(s.insert(a, 1000).unwrap());
@@ -177,11 +265,12 @@ fn reopen_recovers_from_torn_trailing_record() {
     }
 
     // Reopen: the torn tail is truncated, the two complete records survive.
+    // The boot counter has advanced one boot (this is the store's second open).
     {
-        let s = LogStore::new(&path, 3000, 1).expect("reopen after torn tail");
+        let s = LogStore::open(&path, 3000).expect("reopen after torn tail");
         assert!(s.contains(&obs([1; 16], 1, 0, Some(10)).id()));
         assert!(s.contains(&obs([2; 16], 2, 0, Some(20)).id()));
-        assert_eq!(s.next_seq(), 3);
+        assert_eq!(s.first_seq(), 2u64 << 32);
     }
 }
 
@@ -193,14 +282,14 @@ fn reopen_recovers_from_oversized_record_length() {
     let path = store_path("oversize");
 
     {
-        let mut s = LogStore::new(&path, 0, 1).expect("open fresh store");
+        let mut s = LogStore::open(&path, 0).expect("open fresh store");
         let a = obs([1; 16], 1, 0, Some(10));
         assert!(s.insert(a, 1000).unwrap());
         s.flush().expect("flush before drop");
     }
 
     {
-        // Declare a body of u32::MAX bytes with no actual body. read_record
+        // Declare a body of u32::MAX bytes with no actual body. parse_record
         // must reject it before allocating any buffer.
         let mut f = std::fs::OpenOptions::new()
             .append(true)
@@ -212,7 +301,7 @@ fn reopen_recovers_from_oversized_record_length() {
     }
 
     {
-        let s = LogStore::new(&path, 3000, 1).expect("reopen after oversized prefix");
+        let s = LogStore::open(&path, 3000).expect("reopen after oversized prefix");
         assert!(s.contains(&obs([1; 16], 1, 0, Some(10)).id()));
     }
 }

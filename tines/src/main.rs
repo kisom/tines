@@ -5,8 +5,8 @@
 //! One instance per device — the typical deployment on robots without ROS2.
 //!
 //! The node/peer ids are 32 lowercase hex chars (the 16-byte `NodeId`), and
-//! `first_seq` is the next tines sequence number to use (persisted across
-//! reboots, starting from `tines`'s 1-based numbering).
+//! The tines sequence numbers are seeded from the LogStore's boot counter, so
+//! they persist across reboots without a separate config field.
 
 use std::error::Error;
 use std::path::Path;
@@ -23,8 +23,6 @@ struct Config {
     node_id: String,
     /// The peer's advertised `NodeId`, 32 lowercase hex chars.
     peer: String,
-    /// Next tines sequence number to use (persisted across reboots).
-    first_seq: u64,
     /// Absolute path to the LogStore append-only log.
     log_path: String,
     /// Unix-domain socket path the IPC listens on.
@@ -42,11 +40,11 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // LogStore is the Store (S); BtTransport wraps it as the Transport (T).
     let clock = HostClock::start();
-    let store = LogStore::new(Path::new(&config.log_path), clock.now(), config.first_seq)
+    let store = LogStore::open(Path::new(&config.log_path), clock.now())
         .map_err(|e| format!("failed to open log store: {e:?}"))?;
     let radio = BluerRadio::new(me, peer);
     let transport = BtTransport::new(me, peer, radio);
-    let node = Node::new(me, config.first_seq, store, transport);
+    let node = Node::new(me, store.first_seq(), store, transport);
 
     println!(
         "tines: listening on {} (node {})",

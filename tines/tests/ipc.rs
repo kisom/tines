@@ -127,8 +127,8 @@ fn unique_dir(tag: &str) -> PathBuf {
 
 fn build_node(peer: NodeId, dir: &Path) -> Node<LogStore, MockTransport> {
     let store_path = dir.join("store.log");
-    let store = LogStore::new(&store_path, 0, 1).expect("store open");
-    Node::new(peer, 1, store, MockTransport::new(peer))
+    let store = LogStore::open(&store_path, 0).expect("store open");
+    Node::new(peer, store.first_seq(), store, MockTransport::new(peer))
 }
 
 fn connect(path: &Path) -> UnixStream {
@@ -174,7 +174,9 @@ fn handle_status_and_belief_direct() {
             stored,
         } => {
             assert_eq!(id, hex_encode(&node.id()));
-            assert_eq!(next_seq, 2);
+            // Seeded from the boot counter (first_seq = boot_count << 32 = 1<<32
+            // on a fresh store); after one observe next_seq is that + 1.
+            assert_eq!(next_seq, (1u64 << 32) + 1);
             assert_eq!(stored, 1);
         }
         other => panic!("expected status, got {other:?}"),
