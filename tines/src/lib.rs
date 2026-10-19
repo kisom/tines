@@ -10,6 +10,8 @@
 //! The IPC protocol is documented in [`ipc`].
 #![deny(missing_docs)]
 
+pub mod clock;
 pub mod ipc;
 
+pub use clock::HostClock;
 pub use ipc::{handle, serve, BeliefOut, EventOut, Request, Response};

@@ -11,7 +11,7 @@
 use std::error::Error;
 use std::path::Path;
 
-use tines::serve;
+use tines::{serve, HostClock};
 use tines_bt::{BluerRadio, BtTransport};
 use tines_core::{Node, NodeId};
 use tines_store::LogStore;
@@ -41,7 +41,8 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let peer = parse_node_id(&config.peer)?;
 
     // LogStore is the Store (S); BtTransport wraps it as the Transport (T).
-    let store = LogStore::new(Path::new(&config.log_path), 0, config.first_seq)
+    let clock = HostClock::start();
+    let store = LogStore::new(Path::new(&config.log_path), clock.now(), config.first_seq)
         .map_err(|e| format!("failed to open log store: {e:?}"))?;
     let radio = BluerRadio::new(me, peer);
     let transport = BtTransport::new(me, peer, radio);
@@ -52,7 +53,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         config.socket_path,
         node_hex(me)
     );
-    serve(node, Path::new(&config.socket_path))?;
+    serve(node, Path::new(&config.socket_path), clock)?;
     Ok(())
 }
 

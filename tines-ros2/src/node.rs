@@ -175,6 +175,11 @@ impl TinesNode {
     /// One bridge tick: consume inbound ROS2 observations, drive the tines
     /// exchange, publish live topics, and publish any confidence events.
     ///
+    /// `now` is a monotonic millisecond [`Tick`]: milliseconds since the host
+    /// process started (a single `Instant`-based clock, `0` at startup), never
+    /// wall-clock time. Pass the same clock's value every call so ages and
+    /// addressed lifetimes advance in real milliseconds.
+    ///
     /// Returns the number of *new* observations stored this round (from
     /// [`TinesNodeCore::poll`]).
     pub fn poll(&mut self, now: Tick) -> Result<usize, TinesNodeError> {

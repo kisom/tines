@@ -26,9 +26,11 @@
 //!
 //! # Sequence numbers
 //!
-//! `now` is the tines tick passed to `observe`/`belief`; the service reads it
-//! from its own wall clock (`now_ms()`) and ignores any caller-supplied value,
-//! so the wire request carries no timestamp.
+//! `now` is the tines tick passed to `observe`/`belief`. The service reads it
+//! from its own monotonic millisecond [`HostClock`] (an `Instant` captured at
+//! process start; see [`crate::clock`]) and ignores any caller-supplied value,
+//! so the wire request carries no timestamp. The store is opened with the same
+//! clock's `now` (0 at startup), so the service and the store agree on "now".
 
 use std::fmt::Write as _;
 use std::io::{Read, Write};
@@ -37,6 +39,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tines_core::{Node, Store, Transport};
+
+use crate::HostClock;
 
 const MAX_FRAME: usize = 1 << 20; // 1 MiB cap on a single JSON frame
 
@@ -183,9 +187,18 @@ where
 /// Serve IPC on `socket_path` until the listener dies or a response write
 /// fails. Blocks; each accepted connection is served request-by-request.
 ///
+/// `now` for each request comes from `clock`, the host's single monotonic
+/// millisecond [`HostClock`] (an `Instant` at process start), so the tick the
+/// exchange advances on is in real milliseconds. Open the store with the same
+/// clock's `now` (0 at startup) so the service and store agree on "now".
+///
 /// `Node<S, T>` may be any concrete store/transport, so the real binary passes
 /// `Node<LogStore, BtTransport>` and tests pass a mock.
-pub fn serve<S, T>(node: Node<S, T>, socket_path: impl AsRef<Path>) -> std::io::Result<()>
+pub fn serve<S, T>(
+    node: Node<S, T>,
+    socket_path: impl AsRef<Path>,
+    clock: HostClock,
+) -> std::io::Result<()>
 where
     S: Store + 'static,
     T: Transport + 'static,
@@ -204,7 +217,7 @@ where
         loop {
             match read_request(&mut stream) {
                 Ok(req) => {
-                    let now = now_ms();
+                    let now = clock.now();
                     let resp = {
                         // Recover from a poisoned lock so one panicking
                         // handler can't take down the daemon.
@@ -273,13 +286,6 @@ fn error(msg: impl std::fmt::Display) -> Response {
     }
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 fn encode_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -310,5 +316,27 @@ fn hex_val(c: u8) -> Result<u8, String> {
         b'a'..=b'f' => Ok(c - b'a' + 10),
         b'A'..=b'F' => Ok(c - b'A' + 10),
         other => Err(format!("invalid hex char: {other:02x}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    // Regression for F17: the tines `Tick` is milliseconds. A wall-clock
+    // *seconds* clock (the old `now_ms`) advances by at most ~1 over a
+    // short interval, so an observation's `lifetime_ms` would expire ~1000×
+    // too slowly. This asserts the service clock advances in milliseconds.
+    #[test]
+    fn tick_advances_in_milliseconds() {
+        let clock = crate::HostClock::start();
+        let a = clock.now();
+        std::thread::sleep(Duration::from_millis(150));
+        let b = clock.now();
+        let delta = b.saturating_sub(a);
+        assert!(
+            delta >= 120,
+            "tines tick advances in milliseconds: expected >=120 ms over a 150 ms sleep, got {delta} ms",
+        );
     }
 }
