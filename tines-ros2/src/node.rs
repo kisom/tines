@@ -45,9 +45,7 @@ use rclrs::{Context, CreateBasicExecutor, Node as RclNode, Publisher, RclrsError
 use ros_env::std_msgs::msg::{MultiArrayLayout, UInt8MultiArray};
 
 use tines_bt::{BtTransport, Radio};
-use tines_core::{
-    Node as TinesNodeCore, NodeId, Observation, ObservationId, Store, Tick,
-};
+use tines_core::{Node as TinesNodeCore, NodeId, Observation, ObservationId, Store, Tick};
 use tines_store::LogStore;
 
 use crate::topics::topic_name;
@@ -221,16 +219,11 @@ impl TinesNode {
         let tines_topic_cb = tines_topic.to_vec();
         let subscriber = self
             .node
-            .create_subscription(
-                &name,
-                move |msg: UInt8MultiArray| {
-                    // `msg.data` is the raw payload bytes verbatim.
-                    let _ = inbound_tx.send((tines_topic_cb.clone(), msg.data.clone()));
-                },
-            )?;
-        let publisher = self
-            .node
-            .create_publisher::<UInt8MultiArray>(&name)?;
+            .create_subscription(&name, move |msg: UInt8MultiArray| {
+                // `msg.data` is the raw payload bytes verbatim.
+                let _ = inbound_tx.send((tines_topic_cb.clone(), msg.data.clone()));
+            })?;
+        let publisher = self.node.create_publisher::<UInt8MultiArray>(&name)?;
 
         self.managed.insert(
             name,
@@ -299,8 +292,13 @@ impl TinesNode {
             }
             // Publish the raw payload bytes as a `UInt8MultiArray`.
             let data = obs.payload.to_vec();
-            let msg =
-                UInt8MultiArray { data, layout: MultiArrayLayout { dim: vec![], data_offset: 0 } };
+            let msg = UInt8MultiArray {
+                data,
+                layout: MultiArrayLayout {
+                    dim: vec![],
+                    data_offset: 0,
+                },
+            };
             if let Some(publisher) = topic.publisher.as_mut() {
                 let _ = publisher.publish(&msg);
                 topic.last_pub = Some(obs.id());
@@ -333,7 +331,10 @@ impl TinesNode {
             data[16..32].copy_from_slice(&ev.id);
             let msg = UInt8MultiArray {
                 data: data.to_vec(),
-                layout: MultiArrayLayout { dim: vec![], data_offset: 0 },
+                layout: MultiArrayLayout {
+                    dim: vec![],
+                    data_offset: 0,
+                },
             };
             let _ = self.receipt_pub.publish(&msg);
         }
