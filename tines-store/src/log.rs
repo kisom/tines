@@ -662,10 +662,16 @@ fn ensure_parent_dir(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// fsync a directory so a truncation/rewrite of a file in it is durable.
+/// fsync the parent directory so a truncation/rewrite of a file in it is durable.
 #[cfg(unix)]
 fn sync_dir(path: &Path) -> Result<(), StoreError> {
-    let dir = File::open(path).map_err(|_| StoreError::Backend)?;
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let dir = File::open(parent).map_err(|_| StoreError::Backend)?;
     dir.sync_all().map_err(|_| StoreError::Backend)?;
     Ok(())
 }
