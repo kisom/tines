@@ -305,3 +305,171 @@ fn reopen_recovers_from_oversized_record_length() {
         assert!(s.contains(&obs([1; 16], 1, 0, Some(10)).id()));
     }
 }
+
+// The five F5 integrity/recovery tests. They run on unix only: they exercise
+// the exclusive lock and file permissions, which are unix APIs.
+#[cfg(unix)]
+mod fleet_fixes_f5 {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+    use tines_core::{Observation, Payload, Store, Topic};
+    use tines_store::LogStore;
+
+    fn a_obs(observer: [u8; 16], seq: u64) -> Observation {
+        Observation {
+            observer,
+            seq,
+            age_ms: 0,
+            observed_at: Some(10),
+            topic: Topic::from_slice(b"door/3").unwrap(),
+            payload: Payload::from_slice(b"open").unwrap(),
+            to: None,
+            lifetime_ms: None,
+        }
+    }
+
+    /// Flip a byte in the body of the `n`-th record after the header (0 = Boot),
+    /// mirroring on-disk corruption of a complete record.
+    fn corrupt_record(path: &Path, n: usize) {
+        let mut data = std::fs::read(path).expect("read log");
+        let mut pos = 12usize; // past the v1 header
+        let mut i = 0;
+        while i < n {
+            assert!(pos + 12 <= data.len(), "record {i} out of range");
+            let len =
+                u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                    as usize;
+            pos += 12 + len;
+            i += 1;
+        }
+        assert!(pos + 12 <= data.len(), "record {n} out of range");
+        data[pos + 12] ^= 0xFF; // a body byte (after the 12-byte record header)
+        std::fs::write(path, data).expect("write corrupted log");
+    }
+
+    #[test]
+    fn corrupt_middle_record_later_records_survive() {
+        // A corrupt record in the middle costs that record only: the records
+        // before and after it survive, and nothing is truncated.
+        let path = store_path("f5_corrupt");
+        {
+            let mut s = LogStore::open(&path, 0).expect("open fresh");
+            assert!(s.insert(a_obs([1; 16], 1), 1000).unwrap());
+            assert!(s.insert(a_obs([2; 16], 2), 1001).unwrap());
+            assert!(s.insert(a_obs([3; 16], 3), 1002).unwrap());
+            s.flush().expect("flush");
+        }
+        // Corrupt the middle observation (record index 2: Boot, obs-1, obs-2).
+        corrupt_record(&path, 2);
+        {
+            let s = LogStore::open(&path, 3000).expect("reopen");
+            assert!(
+                s.contains(&a_obs([1; 16], 1).id()),
+                "earlier record survives"
+            );
+            assert!(
+                !s.contains(&a_obs([2; 16], 2).id()),
+                "the corrupt record is dropped"
+            );
+            assert!(s.contains(&a_obs([3; 16], 3).id()), "later record survives");
+            assert_eq!(s.skipped_records(), 1);
+        }
+    }
+
+    #[test]
+    fn torn_tail_is_truncated_on_reopen() {
+        // A trailing record whose body ran past EOF is truncated; the complete
+        // records before it survive, and it is truncated (not skipped).
+        let path = store_path("f5_torn");
+        {
+            let mut s = LogStore::open(&path, 0).expect("open fresh");
+            assert!(s.insert(a_obs([1; 16], 1), 1000).unwrap());
+            assert!(s.insert(a_obs([2; 16], 2), 1001).unwrap());
+            s.flush().expect("flush");
+        }
+        // Append a record header (sync + len = 64) with only 20 of the body bytes.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open for torn write");
+            f.write_all(&tines_store::log::SYNC_MARKER.to_le_bytes())
+                .expect("torn sync");
+            f.write_all(&64u32.to_le_bytes()).expect("torn len");
+            f.write_all(&[0u8; 20]).expect("torn partial body");
+        }
+        {
+            let s = LogStore::open(&path, 4000).expect("reopen");
+            assert!(s.contains(&a_obs([1; 16], 1).id()));
+            assert!(s.contains(&a_obs([2; 16], 2).id()));
+            assert_eq!(
+                s.skipped_records(),
+                0,
+                "a torn tail is truncated, never counted as a skipped record"
+            );
+        }
+    }
+
+    #[test]
+    fn second_open_fails_while_locked() {
+        // `open` takes an exclusive lock; a second opener fails while the first
+        // still holds it.
+        let path = store_path("f5_lock");
+        {
+            let mut first = LogStore::open(&path, 0).expect("open first");
+            assert!(first.insert(a_obs([1; 16], 1), 1000).unwrap());
+            assert!(
+                LogStore::open(&path, 1).is_err(),
+                "a second open must fail while the first holds the lock"
+            );
+            assert!(
+                LogStore::open(&path, 2).is_err(),
+                "a third open must also fail"
+            );
+            // Keep the lock held across a read to prove the first still works.
+            assert!(first.contains(&a_obs([1; 16], 1).id()));
+            drop(first);
+        }
+        // After the first opener drops, the lock is released and reopen works.
+        let _ = LogStore::open(&path, 3).expect("open after lock released");
+    }
+
+    #[test]
+    fn log_file_is_mode_0600() {
+        // The log file is created mode 0600.
+        let path = store_path("f5_perms");
+        {
+            let _s = LogStore::open(&path, 0).expect("open");
+        }
+        let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o600, "log file must be mode 0600, got {mode:o}");
+    }
+
+    #[test]
+    fn oversized_record_is_refused_at_write() {
+        // The framing refuses to emit a record whose body exceeds
+        // MAX_RECORD_BYTES, so a writer can no longer produce a record the
+        // reader would reject. The store only writes bounded records, so this
+        // is exercised against the public framing entry point.
+        use tines_store::log::write_record_for_test;
+
+        let path = store_path("f5_oversize");
+        std::fs::File::create(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+
+        // Exactly at the cap is accepted.
+        let ok_body = vec![0u8; tines_store::log::MAX_RECORD_BYTES];
+        assert!(write_record_for_test(&mut f, &ok_body).is_ok());
+
+        // One byte over the cap is refused.
+        let too_big = vec![0u8; tines_store::log::MAX_RECORD_BYTES + 1];
+        assert!(
+            write_record_for_test(&mut f, &too_big).is_err(),
+            "a body over MAX_RECORD_BYTES must be refused at write"
+        );
+    }
+}
