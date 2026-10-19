@@ -17,12 +17,19 @@ categories = ["science::robotics", "network-programming"]
 # and are tested without a ROS2 toolchain. Enable `--features ros2` to compile
 # the rclrs-backed `TinesNode`.
 default = []
-ros2 = ["dep:rclrs"]
+ros2 = ["dep:rclrs", "dep:ros-env"]
 
 [dependencies]
 tines-core = { path = "../tines-core", version = "0.3.0" }
 tines-store = { path = "../tines-store", version = "0.3.0" }
 tines-bt = { path = "../tines-bt", version = "0.3.0" }
 rclrs = { version = "0.8", optional = true }
+# ros_env provides the ROS 2 message types (std_msgs, including
+# UInt8MultiArray) by include!()ing the generated crates from
+# AMENT_PREFIX_PATH; only needed behind the `ros2` feature alongside rclrs.
+# Pinned to 0.3 so it shares rclrs 0.8's rosidl_runtime_rs 0.7 rather than the
+# 0.6 that ros_env 0.1 pulls in. (The crates.io package is `ros-env`; Cargo maps
+# it to the `ros_env` crate id.)
+ros-env = { version = "0.3", optional = true }
 
 [dev-dependencies]

@@ -1498,6 +1498,7 @@ name = "tines-ros2"
 version = "0.3.0"
 dependencies = [
  "rclrs",
+ "ros-env",
  "tines-bt",
  "tines-core",
  "tines-store",
