@@ -3,6 +3,7 @@
 //! Each test runs against its own unique file under the temp directory so the
 //! parallel test runner cannot collide on disk state.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -143,5 +144,75 @@ fn next_seq_persists() {
     {
         let s = LogStore::new(&path, 100, 1).unwrap();
         assert_eq!(s.next_seq(), 4);
+    }
+}
+
+#[test]
+fn reopen_recovers_from_torn_trailing_record() {
+    // A crash mid-append can leave a partial trailing record — a length prefix
+    // whose body never reached disk. Reopen must truncate the torn tail and
+    // load the complete records, not fail the whole store.
+    let path = store_path("torn");
+
+    {
+        let mut s = LogStore::new(&path, 0, 1).expect("open fresh store");
+        let a = obs([1; 16], 1, 0, Some(10));
+        let b = obs([2; 16], 2, 0, Some(20));
+        assert!(s.insert(a, 1000).unwrap());
+        assert!(s.insert(b, 1001).unwrap());
+        s.flush().expect("flush before drop");
+    }
+
+    // Simulate a torn append: write a length prefix claiming 64 body bytes but
+    // only write 20 of them. The body runs past end-of-file.
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open log for torn write");
+        f.write_all(&64u32.to_le_bytes())
+            .expect("write torn prefix");
+        f.write_all(&[0u8; 20]).expect("write partial body");
+        f.flush().expect("flush torn tail");
+    }
+
+    // Reopen: the torn tail is truncated, the two complete records survive.
+    {
+        let s = LogStore::new(&path, 3000, 1).expect("reopen after torn tail");
+        assert!(s.contains(&obs([1; 16], 1, 0, Some(10)).id()));
+        assert!(s.contains(&obs([2; 16], 2, 0, Some(20)).id()));
+        assert_eq!(s.next_seq(), 3);
+    }
+}
+
+#[test]
+fn reopen_recovers_from_oversized_record_length() {
+    // A corrupt length prefix (e.g. u32::MAX) must neither trigger a giant
+    // allocation nor make the store unloadable; it should be dropped like a
+    // torn record, leaving the earlier complete records intact.
+    let path = store_path("oversize");
+
+    {
+        let mut s = LogStore::new(&path, 0, 1).expect("open fresh store");
+        let a = obs([1; 16], 1, 0, Some(10));
+        assert!(s.insert(a, 1000).unwrap());
+        s.flush().expect("flush before drop");
+    }
+
+    {
+        // Declare a body of u32::MAX bytes with no actual body. read_record
+        // must reject it before allocating any buffer.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open log for oversized write");
+        f.write_all(&u32::MAX.to_le_bytes())
+            .expect("write oversized length prefix");
+        f.flush().expect("flush oversized tail");
+    }
+
+    {
+        let s = LogStore::new(&path, 3000, 1).expect("reopen after oversized prefix");
+        assert!(s.contains(&obs([1; 16], 1, 0, Some(10)).id()));
     }
 }
