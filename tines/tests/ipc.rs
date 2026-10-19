@@ -313,3 +313,37 @@ fn confidence_event_direct_probe() {
     assert_eq!(evs[0].id, x);
     assert_eq!(evs[0].peer, [7; 16]);
 }
+
+/// A malformed JSON frame must yield an `Error` response and leave the
+/// connection alive, so a following valid request is still served.
+#[test]
+fn malformed_frame_gets_error_and_connection_survives() {
+    let dir = unique_dir("malformed");
+    let socket = dir.join("ipc.sock");
+    let node = build_node([3; 16], &dir);
+    let serve_path = socket.clone();
+    let _handle = thread::spawn(move || serve(node, serve_path).unwrap());
+    let mut stream = connect(&socket);
+
+    // A length-prefixed frame whose body is not valid JSON.
+    let body = b"{ this is not valid json";
+    let len = (body.len() as u32).to_le_bytes();
+    stream.write_all(&len).unwrap();
+    stream.write_all(body).unwrap();
+    stream.flush().unwrap();
+
+    // The server must reply with an Error, not drop the socket.
+    match read_response(&mut stream) {
+        Response::Error { .. } => {}
+        other => panic!("expected Error for malformed frame, got {other:?}"),
+    }
+
+    // The connection is still alive: a valid request now succeeds.
+    rpc(&mut stream, &Request::Status);
+    match read_response(&mut stream) {
+        Response::Status { .. } => {}
+        other => panic!("expected Status after a malformed frame, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_file(&socket);
+}

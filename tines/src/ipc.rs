@@ -199,18 +199,35 @@ where
 
     for stream in listener.incoming() {
         let mut stream = stream?;
-        // Serve this connection request-by-request until the peer disconnects
-        // or sends a malformed frame, then move on to the next connection.
-        while let Ok(req) = read_request(&mut stream) {
-            let now = now_ms();
-            let resp = {
-                let mut guard = node.lock().unwrap();
-                handle(&mut guard, req, now)
-            };
-            // A client that vanished mid-connection shouldn't take down the
-            // whole service; just drop this one socket.
-            if write_response(&mut stream, &resp).is_err() {
-                break;
+        // Serve this connection request-by-request until the peer cleanly
+        // disconnects, then move on to the next connection.
+        loop {
+            match read_request(&mut stream) {
+                Ok(req) => {
+                    let now = now_ms();
+                    let resp = {
+                        // Recover from a poisoned lock so one panicking
+                        // handler can't take down the daemon.
+                        let mut guard =
+                            node.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        handle(&mut guard, req, now)
+                    };
+                    if write_response(&mut stream, &resp).is_err() {
+                        // A client that vanished mid-connection shouldn't
+                        // take down the whole service; just drop this socket.
+                        break;
+                    }
+                }
+                // A clean disconnect (peer closed the socket) ends the loop.
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                // A malformed frame isn't a disconnect: tell the client and
+                // keep serving this connection rather than dropping it. The
+                // frame can't be identified, so the error is generic.
+                Err(_) => {
+                    if write_response(&mut stream, &error("malformed request")).is_err() {
+                        break;
+                    }
+                }
             }
         }
     }
