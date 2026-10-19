@@ -199,7 +199,7 @@ fn handle_status_and_belief_direct() {
 
 #[test]
 fn handle_unknown_obs_is_belief_none() {
-    let dir = unique_dir("direct");
+    let dir = unique_dir("unknown");
     let mut node = build_node([3; 16], &dir);
     let resp = handle(
         &mut node,
