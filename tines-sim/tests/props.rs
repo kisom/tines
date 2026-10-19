@@ -20,7 +20,7 @@
 
 use proptest::prelude::*;
 use tines_core::{FrameBuf, Store};
-use tines_sim::{Contact, ContactTrace, Sim, WorldConfig};
+use tines_sim::{CappedStore, Contact, ContactTrace, Sim, WorldConfig};
 
 /// A fixed set of short observation topics the tests reuse so the generated
 /// observations round-trip cleanly through the core (`MAX_TOPIC` is 64 bytes).
@@ -338,6 +338,54 @@ proptest! {
             held,
             "addressed task from node {tasker} must still be held by a carrier \
              or the recipient {recipient_idx}; custody never vanishes mid-path",
+            recipient_idx = nodes.saturating_sub(1)
+        );
+    }
+
+    /// Like the holder-invariant test above, but every node is backed by a
+    /// [`CappedStore`] whose `insert` returns `StoreError::Full` once the store
+    /// has held `8` observations. This drives F1's full-store path: once a
+    /// receiver's store is full it must not ack what it could not keep, or
+    /// custody for the addressed task is released for a message nobody holds.
+    /// Six of each node's own broadcasts are seeded in (all land, since 6 < 8)
+    /// and the run's gossiped broadcasts tip each node past capacity, so many
+    /// nodes reject inserts and the "at least one holder" invariant must still
+    /// hold.
+    #[test]
+    fn addressed_always_held_by_carrier_or_recipient_with_full_store(
+        (tasker, nodes, trace) in addressed_scenario(),
+    ) {
+        let end = trace.end();
+        let cfg = WorldConfig {
+            nodes,
+            mtu: 512,
+            loss: 0.0,
+            dup: 0.05,
+            seed: 1,
+        };
+        let mut sim = Sim::<CappedStore>::with_store(cfg, trace);
+        // Seed 6 of each node's own broadcasts: 6 < CappedStore's default cap
+        // (8), so every seed lands and the run's received broadcasts push each
+        // node into the full-store ack path.
+        for node in 0..nodes {
+            for seq in 0..6u64 {
+                let _ = sim.observe(node, b"temp", &seq.to_le_bytes());
+            }
+        }
+        // The max-id node is the recipient.
+        let recipient = [nodes.saturating_sub(1) as u8; 16];
+        let id = sim.observe_to(tasker, recipient, 600_000, b"task", b"investigate");
+        sim.run_until(end + 1_000);
+
+        let held = sim.nodes.iter().any(|n| {
+            let s = n.store();
+            s.contains(&id) && !s.is_released(&id)
+        });
+        prop_assert!(
+            held,
+            "addressed task from node {tasker} must still be held by a carrier \
+             or the recipient {recipient_idx}; custody never vanishes mid-path \
+             even when a node's store is full",
             recipient_idx = nodes.saturating_sub(1)
         );
     }

@@ -9,11 +9,13 @@
 
 #![deny(warnings)]
 
+pub mod capped;
 pub mod sim;
 pub mod trace;
 pub mod transport;
 pub mod world;
 
+pub use capped::CappedStore;
 pub use sim::{Sim, SimNode};
 pub use trace::{Contact, ContactTrace};
 pub use transport::SimTransport;

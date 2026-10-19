@@ -19,15 +19,30 @@ use tines_core::{MemStore, Node, NodeId, ObservationId, Store};
 pub type SimNode = Node<MemStore, SimTransport>;
 
 /// A run of the simulation, owned by the test.
-pub struct Sim {
+///
+/// Generic over the store backend `S` so tests can drive custody with a store
+/// that fills (see [`CappedStore`](crate::CappedStore)); the default is the
+/// unbounded [`MemStore`].
+pub struct Sim<S = MemStore>
+where
+    S: Store,
+{
     pub world: Rc<RefCell<SimWorld>>,
-    pub nodes: Vec<SimNode>,
+    pub nodes: Vec<Node<S, SimTransport>>,
     pub t: u64,
     pub step_ms: u64,
 }
 
 impl Sim {
+    /// A run over `nodes` nodes, each with its own unbounded [`MemStore`].
     pub fn new(cfg: WorldConfig, trace: ContactTrace) -> Sim {
+        Sim::with_store(cfg, trace)
+    }
+}
+
+impl<S: Store + Default> Sim<S> {
+    /// A run over `nodes` nodes, each given a fresh `S::default()` store.
+    pub fn with_store(cfg: WorldConfig, trace: ContactTrace) -> Sim<S> {
         let n = cfg.nodes;
         let world = SimWorld::new(cfg, trace);
         let mut nodes = Vec::with_capacity(n);
@@ -35,7 +50,7 @@ impl Sim {
             nodes.push(Node::new(
                 [i as u8; 16],
                 0,
-                MemStore::new(),
+                S::default(),
                 SimTransport::new(world.clone(), i),
             ));
         }

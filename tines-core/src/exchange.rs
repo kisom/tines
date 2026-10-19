@@ -802,15 +802,21 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         let addressed = obs.to.is_some();
         let returned = obs.clone();
         let res = store.insert(obs, now);
-        // Enqueue a pending ack for what we received: a newly stored
-        // observation, any duplicate, and even an un-stored id (its id is
-        // validated by the receiver). The single exception is a duplicate
-        // *addressed* offer whose local copy has been released — a released
-        // holder must not ack — so that one is held back.
-        let duplicate = !matches!(res, Ok(true));
-        let released = res.is_ok() && store.is_released(&id);
-        if !(duplicate && addressed && released) {
-            self.enqueue_pending_ack(id, addr.clone(), addressed);
+        // Enqueue a pending ack only for what the store actually kept: a newly
+        // stored observation, or a duplicate whose local copy is still held. A
+        // store that rejected the observation (full, backend error) holds
+        // nothing, so it must not ack — for an addressed offer that would
+        // release the sender's custody for a message nobody holds, and for a
+        // broadcast it would fire a false confidence event at the sender. The
+        // single exception among the kept copies is a duplicate *addressed*
+        // offer whose local copy has been released — a released holder must
+        // not ack.
+        if res.is_ok() {
+            let duplicate = !matches!(res, Ok(true));
+            let released = store.is_released(&id);
+            if !(duplicate && addressed && released) {
+                self.enqueue_pending_ack(id, addr.clone(), addressed);
+            }
         }
         if addressed && res.is_ok() {
             record_bounce(&mut self.bounce, id, addr, BounceKind::Received);
@@ -1127,7 +1133,7 @@ fn insert_pos(heap: &Vec<(ObservationId, u64), { consts::SEND_QUEUE_CAP }>, age:
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
-    use crate::{MemStore, Observation, Payload, SendError, Topic};
+    use crate::{MemStore, Observation, Payload, SendError, Store, StoreError, Topic, TrimPolicy};
     use std::vec::Vec;
 
     const ME: NodeId = [42; 16];
@@ -1369,6 +1375,137 @@ mod tests {
         assert!(
             ex.acks.entries.is_empty(),
             "the released duplicate never left the buffer"
+        );
+    }
+
+    /// A `Store` that delegates to a [`MemStore`] but rejects `insert` with
+    /// `StoreError::Full` once it has held `cap` observations — a stand-in for
+    /// a real backend that refuses when full. `MemStore` itself never fills.
+    struct FullStore {
+        cap: usize,
+        inner: MemStore,
+    }
+
+    impl FullStore {
+        fn new(cap: usize) -> Self {
+            Self {
+                cap,
+                inner: MemStore::new(),
+            }
+        }
+    }
+
+    impl Store for FullStore {
+        fn insert(&mut self, obs: Observation, now: Tick) -> Result<bool, StoreError> {
+            if self.inner.len() >= self.cap {
+                return Err(StoreError::Full);
+            }
+            self.inner.insert(obs, now)
+        }
+
+        fn contains(&self, id: &ObservationId) -> bool {
+            self.inner.contains(id)
+        }
+
+        fn get(&self, id: &ObservationId, now: Tick) -> Option<Observation> {
+            self.inner.get(id, now)
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn for_each_id(&self, f: &mut dyn FnMut(&ObservationId)) {
+            self.inner.for_each_id(f)
+        }
+
+        fn for_each_broadcast_id(&self, f: &mut dyn FnMut(&ObservationId)) {
+            self.inner.for_each_broadcast_id(f)
+        }
+
+        fn for_each_addressed_id(&self, f: &mut dyn FnMut(&ObservationId)) {
+            self.inner.for_each_addressed_id(f)
+        }
+
+        fn release(&mut self, id: &ObservationId) {
+            self.inner.release(id)
+        }
+
+        fn is_released(&self, id: &ObservationId) -> bool {
+            self.inner.is_released(id)
+        }
+
+        fn for_each_topic(&self, prefix: &[u8], now: Tick, f: &mut dyn FnMut(&Observation)) {
+            self.inner.for_each_topic(prefix, now, f)
+        }
+
+        fn trim(&mut self, policy: &TrimPolicy, now: Tick) -> usize {
+            self.inner.trim(policy, now)
+        }
+    }
+
+    /// A store that rejected a receive (full, or backend error) must not ack,
+    /// whether the offer was addressed or a broadcast. Acking would release
+    /// the sender's custody for a message nobody holds (addressed) or fire a
+    /// false confidence event (broadcast) — custody lost for a message no one
+    /// keeps. Regression test for the full-store custody bug.
+    #[test]
+    fn store_full_receive_is_not_acked() {
+        let a: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        // A store that never keeps anything it is asked to insert.
+        let mut store = FullStore::new(0);
+        // Make peer `a` known and appearing to lack everything.
+        let bits = heapless::Vec::from_slice(&[0u8; consts::SUMMARY_BYTES]).unwrap();
+        let sum = Frame::Summary {
+            from: a,
+            salt: 0,
+            bits,
+        };
+        ex.on_event(Event::Frame(1, frame_bytes(&sum)), &mut store, 0);
+
+        // A broadcast from A, received into a store that rejects it.
+        let b = obs(a, 1, 0, None, b"t", b"bc");
+        let b_id = b.id();
+        ex.on_event(
+            Event::Frame(1, frame_bytes(&Frame::Obs { from: a, obs: b })),
+            &mut store,
+            0,
+        );
+
+        // An addressed offer from A to ME, received into the same store.
+        let x = observed_addressed(a, 2, ME, b"t", b"hi");
+        let x_id = x.id();
+        ex.on_event(
+            Event::Frame(1, frame_bytes(&Frame::Obs { from: a, obs: x })),
+            &mut store,
+            0,
+        );
+
+        // Nothing was kept, so nothing is acked: no pending ack queued and no
+        // Ack frame carries either id.
+        assert!(
+            ex.acks.entries.is_empty(),
+            "a store-full addressed receive must not be acked"
+        );
+        assert!(
+            ex.bcast_acks.entries.is_empty(),
+            "a store-full broadcast receive must not be acked"
+        );
+        for _ in 0..consts::MAX_FRAME {
+            let mut buf = [0u8; consts::MAX_FRAME];
+            if let Some((_, n)) = ex.next_frame(&store, consts::MAX_FRAME, 0, &mut buf) {
+                if let Ok(Frame::Ack { ids, .. }) = Frame::decode(&buf[..n]) {
+                    assert!(
+                        !ids.contains(&b_id) && !ids.contains(&x_id),
+                        "a store-full receive must not ack id {b_id:?} or {x_id:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            ex.acks.entries.is_empty(),
+            "the store-full acks never left the buffer"
         );
     }
 
