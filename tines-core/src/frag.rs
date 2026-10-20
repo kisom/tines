@@ -12,6 +12,9 @@ pub(crate) const FRAG_OVERHEAD: usize = 65;
 
 /// The most fragments one observation may be split into: the reassembler
 /// tracks received indices in a `u64` bitset.
+///
+/// WIRE. Frozen for wire v1 — changing it changes how a v1 peer reassembles a
+/// fragmented observation.
 pub(crate) const MAX_FRAGMENTS: usize = 64;
 
 /// Splits an encoded observation of `len` bytes for a link of `mtu` bytes,
