@@ -5,7 +5,8 @@ Status: approved by Kyle (2026-10-20). Kyle decided D1–D5 and Q1–Q3
 (2026-10-18) and the review decisions R1–R3 and the `observed_at`
 definition (2026-10-19); review fixes applied. v6 added §10 (core hardening
 from `THREAT_MODEL.md`) and the adversarial fuzz mode; Kyle reviewed and
-approved both (2026-10-20). Decisions F (`flush`) and G (age across downtime) added 2026-10-20.
+approved both (2026-10-20). Decisions F (`flush`) and G (age across downtime) added 2026-10-20;
+G amended the same day (quarantine on open, time from peers).
 Builds on: `2026-10-16-tines-design.md`, `2026-10-18-tines-addressed-delivery.md`,
 `2026-10-18-tines-fleet-deployment-design.md` (assumed fully implemented)
 
@@ -234,10 +235,11 @@ pub struct Dest { pub to: NodeId, pub lifetime_ms: u64 }
   - `trim` by `max_age_ms` keeps what it should drop.
 
   1.0 handles each gap:
-  - **Power-off time** is recovered by the store, from a wall clock, when it
-    opens (§9). The fleet assumes every robot has a clock it can trust
-    across a sleep, an RTC or GPS (decision G). It's cheap, and robots sleep
-    through charge cycles.
+  - **Power-off time** is recovered by the store from a wall clock, once
+    the robot has trusted time (§9). The fleet assumes robots have a clock
+    they can trust across a sleep, an RTC or GPS (decision G). It's cheap,
+    and robots sleep through charge cycles. A robot without trusted time
+    can take it from a peer's observation.
   - **Crash time** is bounded by how often the host flushes (§4; host work,
     `THREAT_MODEL.md` F18).
   - **In-flight time** is negligible on the links tines targets, and is
@@ -616,42 +618,79 @@ the new `Observation` encoding. There is no migration:
   that names the fix (delete the log). Silently misparsing an old log is
   not allowed.
 - **Ages across downtime (decision G).** The same format bump adds a
-  wall-clock reading to the clock marker `flush` writes: the trusted wall
-  time in milliseconds since the Unix epoch.
-  - **A host doesn't open the store until it has a trusted time source**
-    (Kyle, 2026-10-20), for example an RTC it trusts or a GPS fix. Until
-    then the robot runs no tines. That's acceptable because sharing is
-    opportunistic. `LogStore::open` therefore takes the trusted wall time
-    as a plain `u64` (ms since the Unix epoch), not an `Option`.
-  - **The marker's wall time is derived, not passed in.** `flush(now)`
-    keeps its `Tick`-only signature (decision F). `LogStore` records the
-    wall time and tick at `open`, and each clock marker carries
-    `wall_at_open + (now − tick_at_open)`. Because the store is never open
-    without trusted time, every marker this format writes has a wall time.
-  - **Downtime known:** the log has a marker with a wall time, and the wall
-    time at open is ≥ it.
-    `open` adds `now − marker` to every held observation's age,
-    saturating, on top of the tick fold it already does.
-  - **Downtime unknown:** the log has no clock marker (the previous run
-    never flushed), or the wall clock went backwards. `open` treats every held **addressed** observation as
-    expired: its age is set past `lifetime_ms`, so core never delivers or
-    forwards it, and `open` reports the count once. A custodian that can't
-    tell how long it slept must not deliver a directive that may have
-    expired. Losing a possibly valid one is the lesser harm, because
-    sharing is opportunistic and the originator can re-issue.
-  - **Broadcasts when downtime is unknown:** they're kept, but their age
-    isn't trusted. `open` raises every held broadcast's age to at least
-    `unknown_downtime_age_ms`, an open option the host configures.
-    - They lose `LatestWins` to any fresher fact and age out with the rest.
-    - They stay available as a last resort for topics nobody else has
-      reported.
-    - The floor must be below the host's trim `max_age_ms`; otherwise the
-      next trim drops them, and that's option 2 (drop) by another name.
+  wall-clock reading to the clock marker `flush` writes: trusted wall time
+  in milliseconds since the Unix epoch, when the store has one.
+  - **The store opens before trusted time; what it already held is
+    quarantined** (Kyle, 2026-10-20; this replaces the earlier "don't open
+    until trusted time" rule). A robot can then run tines, and learn the
+    time from a peer, before it trusts its own clock.
+    - `LogStore::open(path, now)` takes no wall time.
+    - Every observation already in the log is quarantined until the fold
+      runs. It's left out of summaries, custody offers and
+      `for_each_topic` (so beliefs don't see it). It isn't trimmed on its
+      untrusted age.
+    - For a quarantined addressed observation, `is_released` reports
+      `true`, so core neither forwards it nor acks a duplicate of it (it
+      won't take custody back of something it may be about to expire).
+      `contains` still reports every held id, so dedupe works.
+    - Observations inserted after open are normal: their ages are this
+      boot's ticks, and they need no fold.
+  - **`LogStore::set_wall_clock(wall_now: u64, now: Tick)`** runs the fold,
+    once, when the host first has trusted time. It's a `LogStore` method,
+    not a `Store` trait method: core never deals with wall time.
+    - **Downtime known:** the log's last clock marker has a wall time, and
+      `wall_now` ≥ it. Every quarantined observation's age gains the
+      downtime: the wall time elapsed since that marker, minus the ticks
+      already counted since this open. Saturating, on top of the tick fold
+      `open` already did.
+    - **Downtime unknown:** the last marker has no wall time, the log has
+      no marker, or the wall clock went backwards (marker ahead of
+      `wall_now`). Every quarantined **addressed** observation is expired:
+      its age is set past `lifetime_ms`, so core never delivers or forwards
+      it. A custodian that can't tell how long it slept must not deliver a
+      directive that may have expired. Losing a possibly valid one is the
+      lesser harm, because sharing is opportunistic and the originator can
+      re-issue.
+    - **Broadcasts when downtime is unknown:** kept, but their age isn't
+      trusted. Every quarantined broadcast's age is raised to at least
+      `unknown_downtime_age_ms`, a `LogStore` option the host configures.
+      They lose `LatestWins` to any fresher fact, age out with the rest,
+      and stay available as a last resort for topics nobody else has
+      reported. The floor must be below the host's trim `max_age_ms`;
+      otherwise the next trim drops them, which is "drop" by another name.
       The default is left to the builder (host hardening, F10, sets the
       trim defaults).
-  - Every `open` that runs a fold reports the downtime it applied, or that
-    it was unknown, once (stderr plus a counter, like the skipped-record
-    count).
+    - Then the quarantine lifts, and the fold reports once what it did
+      (downtime applied or unknown, plus how many addressed observations
+      expired), on stderr and as a counter, like the skipped-record count.
+  - **Clock markers.** After `set_wall_clock`, each `flush(now)` marker
+    carries `wall_at_set + (now − tick_at_set)`, so `Store::flush(now)`
+    stays `Tick`-only (decision F). A flush before trusted time writes a
+    marker with no wall time. If the robot then restarts, the next fold
+    finds no wall time and takes the unknown path, which is the safe one.
+  - **Where trusted time comes from.** In order:
+    1. the robot's own trusted source (an RTC it trusts, or a GPS fix);
+    2. otherwise, **another robot**, through any received observation that
+       carries `observed_at`. The estimate is `observed_at + age_ms`, plus
+       local ticks elapsed since that observation arrived. Because age is a
+       lower bound, this estimate is never later than the true time. The
+       host uses the observation with the smallest `age_ms` (the least
+       accumulated error), and only one inserted after this open: anything
+       older is quarantined.
+    3. otherwise, the robot's own fail-safe applies. That's outside tines.
+       The quarantine simply stays until trusted time arrives.
+  - **Peer time is unauthenticated until 1.1.** A peer can claim any
+    `observed_at`.
+    - A time too far *ahead* makes the downtime too long: addressed
+      messages expire early and facts look stale. That's the safe
+      direction.
+    - A time *behind* the marker is "clock went backwards", which takes the
+      unknown path. That's also safe.
+    - The cost is the robot's own `observed_at` stamps, which are wrong
+      until a trusted local source corrects them. `THREAT_MODEL.md` records
+      this.
+  - Hosts set `observed_at` on every observation they make once they have
+    trusted time, and leave it `None` before (R4).
 - Hosts wipe pre-1.0 logs on upgrade. That's acceptable because no robot
   runs tines yet, and none will be deployed with a pre-1.0 `tines-core`.
 - The header is what makes a later migration possible if one is ever
@@ -782,10 +821,15 @@ The review's other fixes are applied too:
     for robots that sleep through charge cycles.
   - Stores add power-off time on open, using a wall-clock reading in the
     flush marker.
-  - Hosts don't open the store until they have a trusted time source, so
-    `LogStore::open` takes a plain `u64` wall time. The marker's wall time
-    is derived from the wall time and tick at open, so `Store::flush(now)`
-    stays `Tick`-only.
+  - The store opens before trusted time, and holds what was already in
+    the log in quarantine until `LogStore::set_wall_clock(wall_now, now)`
+    runs the fold. Trusted time comes from the robot's own RTC or GPS, or
+    else from a peer's observation (`observed_at + age_ms`, smallest age
+    wins). The robot's own fail-safe covers the case where neither arrives.
+    The marker's wall time is derived from the wall time and tick at
+    `set_wall_clock`, so `Store::flush(now)` stays `Tick`-only. (Amended
+    twice on 2026-10-20; this supersedes "don't open the store until
+    trusted time".)
   - When downtime can't be known, held addressed messages are expired:
     possibly delivering an expired directive is worse than possibly
     dropping a valid one, since sharing is opportunistic.
