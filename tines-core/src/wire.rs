@@ -50,19 +50,33 @@ impl Frame {
     }
 
     /// Serializes this frame into `out` via postcard, returning the number of
-    /// bytes written. A buffer too small to hold the frame yields
-    /// `WireError::TooLarge`.
+    /// bytes written. The leading [`consts::WIRE_VERSION`] byte is prepended, so
+    /// the total is `1 + postcard_len`. A buffer too small to hold the frame
+    /// (including a zero-length buffer) yields `WireError::TooLarge`.
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, WireError> {
-        match postcard::to_slice(self, out) {
-            Ok(slice) => Ok(slice.len()),
+        // A zero-length `out` must not panic on the `&out[1..]` slice below.
+        if out.is_empty() {
+            return Err(WireError::TooLarge);
+        }
+        out[0] = consts::WIRE_VERSION;
+        match postcard::to_slice(self, &mut out[1..]) {
+            Ok(slice) => Ok(1 + slice.len()),
             Err(_) => Err(WireError::TooLarge),
         }
     }
 
-    /// Deserializes a frame from `bytes`. Any error (including truncation or
-    /// garbage) becomes `WireError::Malformed` rather than a panic.
+    /// Deserializes a frame from `bytes`. Rejects an empty frame as
+    /// `WireError::Malformed` and a wrong-version leading byte as
+    /// `WireError::VersionMismatch`; any other error (truncation, garbage)
+    /// becomes `Malformed` rather than a panic.
     pub fn decode(bytes: &[u8]) -> Result<Frame, WireError> {
-        match postcard::from_bytes::<Frame>(bytes) {
+        if bytes.is_empty() {
+            return Err(WireError::Malformed);
+        }
+        if bytes[0] != consts::WIRE_VERSION {
+            return Err(WireError::VersionMismatch { version: bytes[0] });
+        }
+        match postcard::from_bytes::<Frame>(&bytes[1..]) {
             Ok(frame) => Ok(frame),
             Err(_) => Err(WireError::Malformed),
         }
@@ -71,25 +85,26 @@ impl Frame {
 
 /// Peek the [`NodeId`] a wire frame was sent by, without fully decoding it.
 ///
-/// A [`Frame`] envelope is an externally-tagged postcard enum: one tag byte at
-/// index `0`, then its fields in declaration order. `from` is the first field,
-/// so it occupies the 16 bytes at `bytes[1..17]`. This reads those 16 bytes and
-/// returns `None` for anything shorter than a full envelope (so a truncated or
-/// non-frame payload reports no sender rather than panicking).
-///
-/// The leading byte is skipped on purpose: it is the externally-tagged variant
-/// tag today and the reserved version-byte slot in 1.0, so reading `from` from
-/// a fixed offset keeps this accessor correct when 1.0 prepends a version byte
-/// ahead of the envelope.
+/// A [`Frame`] envelope is a `WIRE_VERSION` byte, then an externally-tagged
+/// postcard enum: `bytes[0]` is the version, `bytes[1]` the variant tag, and
+/// `from` (the first field) occupies the 16 bytes at `bytes[2..18]`. This skips
+/// the two leading bytes, reads those 16 bytes, and returns `None` for anything
+/// shorter than a full envelope or whose leading byte is not
+/// [`consts::WIRE_VERSION`] (so a truncated, wrong-version, or non-frame payload
+/// reports no sender rather than panicking).
 ///
 /// `tines-bt` uses this to enforce that a frame's declared sender matches the
 /// NodeId advertised by its transport connection (the from-check), without
 /// importing the private `Frame` layout.
 pub fn frame_sender(bytes: &[u8]) -> Option<NodeId> {
-    // The envelope is one tag byte then the `from` field; `NodeId` is 16 bytes.
-    const ENVELOPE_OVERHEAD: usize = 1;
+    // Two leading bytes: `WIRE_VERSION` then the postcard variant tag, then the
+    // 16-byte `from` field; `NodeId` is 16 bytes.
+    const ENVELOPE_OVERHEAD: usize = 2;
     const NODE_ID_BYTES: usize = core::mem::size_of::<NodeId>();
     if bytes.len() < ENVELOPE_OVERHEAD + NODE_ID_BYTES {
+        return None;
+    }
+    if bytes[0] != consts::WIRE_VERSION {
         return None;
     }
     let mut from = [0u8; NODE_ID_BYTES];
@@ -104,6 +119,8 @@ pub enum WireError {
     TooLarge,
     /// The input bytes were malformed, truncated, or not a valid `Frame`.
     Malformed,
+    /// The frame's leading `WIRE_VERSION` byte did not match `consts::WIRE_VERSION`.
+    VersionMismatch { version: u8 },
 }
 
 #[cfg(test)]
@@ -199,10 +216,71 @@ mod tests {
 
     #[test]
     fn summary_golden_vector() {
-        // Pinned wire bytes for the exact Summary frame below. postcard tags are
-        // positional, so any future reorder of the existing Frame variants changes
-        // what these bytes decode to and fails this assertion.
-        const GOLDEN: [u8; 536] = [
+        // Pinned wire bytes for the exact Summary frame below. A `WIRE_VERSION`
+        // byte leads the frame (byte 0); postcard tags are positional, so any
+        // future reorder of the existing Frame variants changes what these
+        // bytes decode to and fails this assertion.
+        const GOLDEN: [u8; 537] = [
+            4u8, 0u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8,
+            3u8, 239u8, 253u8, 182u8, 245u8, 13u8, 128u8, 4u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8,
+        ];
+        let expected = Frame::Summary {
+            from: [3; 16],
+            salt: 0xdeadbeef,
+            bits: Vec::from_slice(&[0xAAu8; consts::SUMMARY_BYTES]).unwrap(),
+        };
+        assert_eq!(Frame::decode(&GOLDEN).unwrap(), expected);
+    }
+
+    #[test]
+    fn rejects_0x_frame() {
+        // The pre-change (0.x) Summary golden bytes — captured before the
+        // `WIRE_VERSION` byte was added — decode today as a version mismatch:
+        // their leading byte is the postcard variant tag (0), not WIRE_VERSION.
+        const ZERO_X: [u8; 536] = [
             0u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8,
             239u8, 253u8, 182u8, 245u8, 13u8, 128u8, 4u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
             170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
@@ -249,20 +327,80 @@ mod tests {
             170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
             170u8, 170u8,
         ];
-        let expected = Frame::Summary {
+        assert_eq!(
+            Frame::decode(&ZERO_X).err(),
+            Some(WireError::VersionMismatch { version: 0 })
+        );
+    }
+
+    #[test]
+    fn encode_prepends_version_byte() {
+        // A Summary serializes with `WIRE_VERSION` as byte 0 and still
+        // round-trips through `Frame::decode` read across the *whole* buffer
+        // (version byte included — never `&buf[1..]`, which lacks it).
+        let f = Frame::Summary {
             from: [3; 16],
             salt: 0xdeadbeef,
             bits: Vec::from_slice(&[0xAAu8; consts::SUMMARY_BYTES]).unwrap(),
         };
-        assert_eq!(Frame::decode(&GOLDEN).unwrap(), expected);
+        let mut buf = [0u8; consts::MAX_FRAME];
+        let n = f.encode(&mut buf).unwrap();
+        assert_eq!(buf[0], consts::WIRE_VERSION);
+        assert_eq!(Frame::decode(&buf[..n]).unwrap(), f);
+    }
+
+    #[test]
+    fn decode_wrong_version_is_mismatch() {
+        // A frame whose leading byte is `WIRE_VERSION + 1` is a version
+        // mismatch rather than `Malformed`.
+        let f = obs_frame();
+        let mut buf = [0u8; consts::MAX_FRAME];
+        let n = f.encode(&mut buf).unwrap();
+        buf[0] = consts::WIRE_VERSION + 1;
+        assert_eq!(
+            Frame::decode(&buf[..n]).err(),
+            Some(WireError::VersionMismatch {
+                version: consts::WIRE_VERSION + 1
+            })
+        );
+    }
+
+    #[test]
+    fn decode_empty_is_malformed() {
+        // An empty frame is `Malformed`, never a spurious
+        // `VersionMismatch { version: 0 }` and never a panic.
+        assert_eq!(Frame::decode(&[]).err(), Some(WireError::Malformed));
+    }
+
+    #[test]
+    fn frame_sender_skips_version_and_tag() {
+        // `[WIRE_VERSION, 0(tag), from..]` yields `Some(from)`: the two leading
+        // bytes (version + variant tag) are skipped.
+        let from = [9u8; 16];
+        let mut b = std::vec![0u8; 2 + 16];
+        b[0] = consts::WIRE_VERSION;
+        b[1] = 0; // variant tag
+        b[2..2 + 16].copy_from_slice(&from);
+        assert_eq!(frame_sender(&b), Some(from));
+    }
+
+    #[test]
+    fn frame_sender_wrong_version_is_none() {
+        // `[WIRE_VERSION + 1, 0, from..]` is not our version, so no sender.
+        let from = [9u8; 16];
+        let mut b = std::vec![0u8; 2 + 16];
+        b[0] = consts::WIRE_VERSION + 1;
+        b[1] = 0; // variant tag
+        b[2..2 + 16].copy_from_slice(&from);
+        assert_eq!(frame_sender(&b), None);
     }
 
     #[test]
     fn frame_sender_peeks_from_field() {
-        // The golden Summary encodes `from: [3;16]` starting at byte 1.
-        const GOLDEN: [u8; 200] = [
-            0u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8,
-            239u8, 253u8, 182u8, 245u8, 13u8, 128u8, 4u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+        // Version byte 0, variant tag 1, then `from: [3;16]` at bytes 2..18.
+        const GOLDEN: [u8; 201] = [
+            4u8, 0u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8,
+            3u8, 239u8, 253u8, 182u8, 245u8, 13u8, 128u8, 4u8, 170u8, 170u8, 170u8, 170u8, 170u8,
             170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
             170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
             170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
@@ -277,7 +415,7 @@ mod tests {
             170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
             170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
             170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
-            170u8, 170u8,
+            170u8, 170u8, 170u8,
         ];
         assert_eq!(frame_sender(&GOLDEN), Some([3u8; 16]));
     }
@@ -289,8 +427,9 @@ mod tests {
         // recorded at byte 1.
         let bytes = {
             let mut b = [0u8; 32];
-            b[0] = 0xFF; // tag/version slot
-            b[1..17].copy_from_slice(&[9u8; 16]); // from
+            b[0] = consts::WIRE_VERSION; // version slot (skipped by frame_sender)
+            b[1] = 0xFF; // variant tag (skipped by frame_sender)
+            b[2..18].copy_from_slice(&[9u8; 16]); // from
             b
         };
         assert_eq!(frame_sender(&bytes), Some([9u8; 16]));
@@ -299,16 +438,30 @@ mod tests {
     #[test]
     fn frame_sender_truncated_returns_none() {
         assert_eq!(frame_sender(&[0u8; 0]), None);
-        assert_eq!(frame_sender(&[0u8; 16]), None); // tag + from missing
-        assert_eq!(frame_sender(&[0u8; 17]), Some([0u8; 16])); // exactly tag + from
+        assert_eq!(frame_sender(&[0u8; 16]), None); // version + tag + from missing
+                                                    // A full envelope (version + tag + `from`) with a matching version
+                                                    // yields the peeked sender.
+        let mut full = std::vec![0u8; 2 + 16];
+        full[0] = consts::WIRE_VERSION;
+        assert_eq!(frame_sender(&full), Some([0u8; 16]));
     }
 
     #[test]
     fn decode_garbage_is_error_not_panic() {
-        for len in [0usize, 1, 7, 64, 1500] {
+        // A leading byte that is not `WIRE_VERSION` fails on the version gate
+        // (`VersionMismatch`) before postcard ever runs...
+        for len in [1usize, 7, 64, 1500] {
             let bytes = std::vec![0xFFu8; len];
-            assert_eq!(Frame::decode(&bytes).err(), Some(WireError::Malformed));
+            assert_eq!(
+                Frame::decode(&bytes).err(),
+                Some(WireError::VersionMismatch { version: 0xFF })
+            );
         }
+        // ...while same-length bytes that pass the gate but are not a valid
+        // frame decode as `Malformed` rather than panicking.
+        let mut garbage = std::vec![consts::WIRE_VERSION];
+        garbage.extend(std::vec![0xFFu8; 16]);
+        assert_eq!(Frame::decode(&garbage).err(), Some(WireError::Malformed));
     }
 
     #[test]

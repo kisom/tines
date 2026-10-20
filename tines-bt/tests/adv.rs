@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 
 use tines_bt::{adv, BtTransport, Radio, RadioError, RadioEvent};
+use tines_core::consts::WIRE_VERSION;
 use tines_core::observation::NodeId;
 use tines_core::transport::{Event, Transport};
 
@@ -73,12 +74,14 @@ fn advertising_payload_roundtrips_node_id() {
     assert_eq!(adv::decode_node_id(&p), Some(node));
 }
 
-/// A framed envelope: one tag byte, then the 16-byte `from`. This is the layout
-/// `frame_sender` peeks — the transport delivers this whole envelope to core
-/// (which decodes it), so the `from` must be stamped with the sender's id.
+/// A framed envelope: a `WIRE_VERSION` byte, a variant tag, then the 16-byte
+/// `from`. This is the layout `frame_sender` peeks — the transport delivers this
+/// whole envelope to core (which decodes it), so the `from` must be stamped with
+/// the sender's id.
 fn frame(from: NodeId, payload: &[u8]) -> Vec<u8> {
-    let mut b = Vec::with_capacity(1 + 16 + payload.len());
-    b.push(0u8); // version/tag byte
+    let mut b = Vec::with_capacity(2 + 16 + payload.len());
+    b.push(WIRE_VERSION); // wire version byte
+    b.push(0u8); // postcard externally-tagged variant tag
     b.extend_from_slice(&from);
     b.extend_from_slice(payload);
     b

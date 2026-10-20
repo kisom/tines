@@ -18,9 +18,9 @@ use crate::{
 use heapless::Vec;
 
 /// Worst-case bytes a [`Frame::Summary`] adds around its bloom bits: the
-/// variant tag (1), `from` (16), `salt` as a varint (up to 5), and the bits
-/// length as a varint (up to 2).
-const SUMMARY_OVERHEAD: usize = 24;
+/// `WIRE_VERSION` byte (1), the variant tag (1), `from` (16), `salt` as a
+/// varint (up to 5), and the bits length as a varint (up to 2).
+const SUMMARY_OVERHEAD: usize = 25;
 
 /// A fragmented observation part-way through transmission to one peer.
 ///

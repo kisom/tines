@@ -5,7 +5,7 @@ use crate::{Frame, NodeId, Observation, ObservationId, Tick, WireError};
 use heapless::Vec;
 
 /// Header allowance per fragment (bytes), pinned.
-pub const FRAG_OVERHEAD: usize = 64;
+pub const FRAG_OVERHEAD: usize = 65;
 
 /// The most fragments one observation may be split into: the reassembler
 /// tracks received indices in a `u64` bitset.

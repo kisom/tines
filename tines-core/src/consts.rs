@@ -3,6 +3,15 @@
 //! Every value here is a compile-time `const` so it can drive generic
 //! parameters (e.g. `heapless::Vec` capacities) and be optimized away.
 
+/// Wire envelope version byte prepended to every serialized `Frame`.
+///
+/// The first byte of every frame on the wire; [`crate::wire::Frame::decode`]
+/// rejects any frame whose leading byte differs from this
+/// (`WireError::VersionMismatch`), and [`crate::wire::frame_sender`] skips it.
+/// `4` is the first value in the `4..=0x7F` range that fits a single-byte
+/// postcard enum tag and sits above the 0.x tag values (`0..=3`).
+pub const WIRE_VERSION: u8 = 4;
+
 /// Maximum topic length in bytes.
 pub const MAX_TOPIC: usize = 64;
 

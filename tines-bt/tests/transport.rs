@@ -9,6 +9,7 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use tines_bt::{adv, resolve_bound, BtTransport, Radio, RadioError, RadioEvent};
+use tines_core::consts::WIRE_VERSION;
 use tines_core::observation::NodeId;
 use tines_core::transport::{Event, Transport};
 
@@ -58,11 +59,12 @@ impl Drop for MockRadio {
     }
 }
 
-/// Build a minimal frame: one leading tag byte, then the 16-byte `from`.
-/// `frame_sender` reads `from` from bytes 1..17, so this matches the wire.
+/// Build a minimal frame: a `WIRE_VERSION` byte, then the 16-byte `from`.
+/// `frame_sender` reads `from` from bytes 2..18, so this matches the wire.
 fn frame(from: NodeId) -> Vec<u8> {
-    let mut b = vec![0u8; 1 + 16];
-    b[1..1 + 16].copy_from_slice(&from);
+    let mut b = vec![0u8; 2 + 16];
+    b[2..2 + 16].copy_from_slice(&from);
+    b[0] = WIRE_VERSION;
     b
 }
 
@@ -164,7 +166,7 @@ fn frame_boundaries_preserved_at_transport() {
     let peer: NodeId = [2u8; 16];
     let frame_a = frame(peer);
     let mut frame_b = frame(peer);
-    frame_b[0] = 0xFF; // differ from frame_a via the tag byte, so `from` stays == peer
+    frame_b[1] = 0xFF; // differ via the variant tag (skipped by frame_sender), so `from` stays == peer
     let a_expected = frame_a.clone();
     let b_expected = frame_b.clone();
 
