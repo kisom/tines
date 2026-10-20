@@ -27,6 +27,14 @@ struct Config {
     log_path: String,
     /// Unix-domain socket path the IPC listens on.
     socket_path: String,
+    /// Exchange poll interval in milliseconds. The real default belongs to the
+    /// builder; 20 ms keeps the link responsive without burning idle cycles.
+    #[serde(default = "default_poll_interval_ms")]
+    poll_interval_ms: u64,
+}
+
+fn default_poll_interval_ms() -> u64 {
+    20
 }
 
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -44,14 +52,24 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .map_err(|e| format!("failed to open log store: {e:?}"))?;
     let radio = BluerRadio::new(me, peer);
     let transport = BtTransport::new(me, peer, radio);
+    // `serve` runs the exchange inline (a poll loop fed by the socket read
+    // timeouts) on this same thread, so observations and beliefs flow over the
+    // transport, not just over IPC. The node isn't `Send` (the BLE transport
+    // carries a `dyn Radio` with no `Send` bound), so it never crosses a thread.
     let node = Node::new(me, store.first_seq(), store, transport);
 
     println!(
-        "tines: listening on {} (node {})",
+        "tines: listening on {} (node {}, exchange poll {} ms)",
         config.socket_path,
-        node_hex(me)
+        node_hex(me),
+        config.poll_interval_ms,
     );
-    serve(node, Path::new(&config.socket_path), clock)?;
+    serve(
+        node,
+        Path::new(&config.socket_path),
+        clock,
+        config.poll_interval_ms,
+    )?;
     Ok(())
 }
 

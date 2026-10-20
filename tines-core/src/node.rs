@@ -213,6 +213,16 @@ impl<S: Store, T: Transport> Node<S, T> {
         &self.store
     }
 
+    /// Mutable access to the backing store.
+    ///
+    /// Lets a host call backend-specific methods that aren't on the [`Store`]
+    /// trait — e.g. `tines_store::LogStore::flush`, the durability boundary a
+    /// host reaches on its flush schedule. [`Self::trim`] takes `&mut self`;
+    /// this exposes the concrete backend the same way.
+    pub fn store_mut(&mut self) -> &mut S {
+        &mut self.store
+    }
+
     /// Access the transport (e.g. to `connect`/`disconnect` a peer in tests).
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport

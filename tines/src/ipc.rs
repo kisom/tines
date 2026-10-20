@@ -33,16 +33,22 @@
 //! clock's `now` (0 at startup), so the service and the store agree on "now".
 
 use std::fmt::Write as _;
-use std::io::{Read, Write};
-use std::os::unix::net::UnixListener;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::io::{self, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
+use std::time::Duration;
 
-use tines_core::{Node, Store, Transport};
+use tines_core::{Node, Store, Transport, TrimPolicy};
+use tines_store::LogStore;
 
 use crate::HostClock;
 
 const MAX_FRAME: usize = 1 << 20; // 1 MiB cap on a single JSON frame
+
+/// Cap on the number of `poll` rounds the exchange runs per iteration. Without
+/// it, a busy peer that keeps the exchange full could starve the IPC listener
+/// of its accept loop.
+const POLL_CAP: u64 = 64;
 
 /// A confidence event handed out by the IPC `events` request.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -184,70 +190,148 @@ where
     }
 }
 
-/// Serve IPC on `socket_path` until the listener dies or a response write
-/// fails. Blocks; each accepted connection is served request-by-request.
-///
-/// `now` for each request comes from `clock`, the host's single monotonic
-/// millisecond [`HostClock`] (an `Instant` at process start), so the tick the
-/// exchange advances on is in real milliseconds. Open the store with the same
-/// clock's `now` (0 at startup) so the service and store agree on "now".
-///
-/// `Node<S, T>` may be any concrete store/transport, so the real binary passes
-/// `Node<LogStore, BtTransport>` and tests pass a mock.
-pub fn serve<S, T>(
-    node: Node<S, T>,
-    socket_path: impl AsRef<Path>,
-    clock: HostClock,
-) -> std::io::Result<()>
+// Drive the exchange until no new observations arrive or the per-iteration cap
+// (`POLL_CAP`) is reached, then — on schedule — trim and flush.
+//
+// The node isn't `Send` (the real `BtTransport` carries a `dyn Radio` with no
+// `Send` bound), so this can't run on its own thread; it runs inline in
+// [`serve`], fed by the socket read timeouts.
+fn poll_exchange<T>(node: &mut Node<LogStore, T>, clock: &HostClock, rounds: &mut u64)
 where
-    S: Store + 'static,
     T: Transport + 'static,
 {
-    let node = Arc::new(Mutex::new(node));
-    let path: PathBuf = socket_path.as_ref().to_path_buf();
+    while node.poll(clock.now()) > 0 && *rounds < POLL_CAP {
+        *rounds += 1;
+    }
 
+    // On a schedule: trim stale observations and flush the store. Flush is
+    // `LogStore::flush` (not on the `Store` trait), so it's called on the
+    // concrete store through `Node::store_mut` — tines-core keeps no flush hook.
+    if *rounds >= POLL_CAP {
+        *rounds = 0;
+        node.trim(&TrimPolicy::default(), clock.now());
+        match node.store_mut().flush() {
+            Ok(()) => {}
+            Err(e) => eprintln!("tines: store flush failed: {e:?}"),
+        }
+    }
+}
+
+/// Serve this process's IPC socket and run its exchange.
+///
+/// `serve` answers IPC and drives the exchange inline on a poll loop fed by the
+/// socket read timeouts (see `poll_exchange`). Because the node isn't `Send`
+/// (the real `BtTransport` carries a `dyn Radio` with no `Send` bound), the
+/// exchange can't move to a spawned thread — it runs inline here, between
+/// connections and while a connection is idle.
+///
+/// `serve` is generic over the transport (so tests can drive it over an
+/// in-memory link) but concrete on the on-disk [`LogStore`], whose `flush` is
+/// the trim/flush hook. The real binary passes `Node<LogStore, BtTransport>`
+/// and the tests pass `Node<LogStore, mock>`.
+///
+/// `poll_interval_ms` is the read-timeout cadence that feeds the poll loop; the
+/// default (20 ms) keeps the exchange responsive without busy-polling.
+pub fn serve<T>(
+    mut node: Node<LogStore, T>,
+    socket_path: impl AsRef<Path>,
+    clock: HostClock,
+    poll_interval_ms: u64,
+) -> std::io::Result<()>
+where
+    T: Transport + 'static,
+{
+    let socket_path = socket_path.as_ref().to_path_buf();
     // Clear a stale socket file left by a previous run so bind() can't fail.
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path)?;
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path)?;
 
-    for stream in listener.incoming() {
-        let mut stream = stream?;
-        // Serve this connection request-by-request until the peer cleanly
-        // disconnects, then move on to the next connection.
-        loop {
-            match read_request(&mut stream) {
-                Ok(req) => {
-                    let now = clock.now();
-                    let resp = {
-                        // Recover from a poisoned lock so one panicking
-                        // handler can't take down the daemon.
-                        let mut guard =
-                            node.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                        handle(&mut guard, req, now)
-                    };
-                    if write_response(&mut stream, &resp).is_err() {
-                        // A client that vanished mid-connection shouldn't
-                        // take down the whole service; just drop this socket.
-                        break;
-                    }
+    // `accept` blocks, so run it in a dedicated thread that just forwards
+    // accepted streams over a channel. That lets the main loop yield to the
+    // exchange poll loop (via `recv_timeout`) instead of blocking forever. The
+    // accept thread never touches the node, so the transport need not be
+    // `Send` here — only the main loop borrows it.
+    let (tx, rx) = std::sync::mpsc::channel::<UnixStream>();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            if stream
+                .and_then(|s| {
+                    tx.send(s)
+                        .map_err(|_| std::io::Error::other("receiver dropped"))
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let mut rounds = 0u64;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(poll_interval_ms.max(1))) {
+            Ok(mut stream) => {
+                // A read timeout on the connection lets an idle client yield to
+                // the poll loop instead of stalling the exchange forever.
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(poll_interval_ms.max(1))))
+                    .expect("connection read timeout");
+                serve_stream(&mut node, &mut stream, &clock, &mut rounds)?;
+            }
+            // Timeout: run the exchange poll loop instead of blocking.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                poll_exchange(&mut node, &clock, &mut rounds);
+            }
+            // The accept thread is gone; stop serving.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Serve a single accepted connection until the peer disconnects, driving the
+/// exchange on every idle read.
+fn serve_stream<T>(
+    node: &mut Node<LogStore, T>,
+    stream: &mut UnixStream,
+    clock: &HostClock,
+    rounds: &mut u64,
+) -> io::Result<()>
+where
+    T: Transport + 'static,
+{
+    loop {
+        match read_request(stream) {
+            Ok(request) => {
+                let response = handle(node, request, clock.now());
+                if write_response(stream, &response).is_err() {
+                    // A client that vanished mid-connection shouldn't take
+                    // down the whole service; just drop this socket.
+                    break;
                 }
-                // A clean disconnect (peer closed the socket) ends the loop.
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                // A malformed frame isn't a disconnect: tell the client and
-                // keep serving this connection rather than dropping it. The
-                // frame can't be identified, so the error is generic.
-                Err(_) => {
-                    if write_response(&mut stream, &error("malformed request")).is_err() {
-                        break;
-                    }
+                // Drive the exchange after every request so a busy client that
+                // connects back-to-back can't starve it (the WouldBlock path
+                // below only fires once the client goes idle).
+                poll_exchange(node, clock, rounds);
+            }
+            // Peer closed the connection cleanly.
+            Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            // Idle read: drive the exchange rather than blocking forever.
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                poll_exchange(node, clock, rounds);
+            }
+            // A malformed frame isn't a disconnect: tell the client and keep
+            // serving this connection. The frame can't be identified, so the
+            // error is generic.
+            Err(_) => {
+                if write_response(stream, &error("malformed request")).is_err() {
+                    break;
                 }
             }
         }
     }
     Ok(())
 }
-
-/// Read one length-prefixed JSON frame from a stream.
 fn read_request<S: Read>(stream: &mut S) -> std::io::Result<Request> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
@@ -320,23 +404,237 @@ fn hex_val(c: u8) -> Result<u8, String> {
 }
 
 #[cfg(test)]
-mod tests {
+mod f2_tests {
+    use super::*;
+    use std::collections::{HashMap, VecDeque};
+    use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
+    use std::process;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
     use std::time::Duration;
 
-    // Regression for F17: the tines `Tick` is milliseconds. A wall-clock
-    // *seconds* clock (the old `now_ms`) advances by at most ~1 over a
-    // short interval, so an observation's `lifetime_ms` would expire ~1000×
-    // too slowly. This asserts the service clock advances in milliseconds.
+    use tines_core::{consts, Event, FrameBuf, Node, NodeId, SendError, Transport};
+    use tines_store::LogStore;
+
+    fn topic() -> Vec<u8> {
+        b"tines/f2".to_vec()
+    }
+
+    fn payload() -> Vec<u8> {
+        b"hello".to_vec()
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tines-f2-{}-{}", tag, process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn connect(path: &Path) -> UnixStream {
+        for _ in 0..500 {
+            if let Ok(s) = UnixStream::connect(path) {
+                return s;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("failed to connect to {}", path.display());
+    }
+
+    fn rpc<S: Read + Write>(stream: &mut S, req: &Request) {
+        let body = serde_json::to_vec(req).expect("serialize request");
+        let len = (body.len() as u32).to_le_bytes();
+        stream.write_all(&len).unwrap();
+        stream.write_all(&body).unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn read_response<S: Read>(stream: &mut S) -> Response {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).unwrap();
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).unwrap();
+        serde_json::from_slice(&buf).expect("valid response")
+    }
+
+    /// A minimal shared in-memory transport for the F2 propagation test: two
+    /// [`Node`]s bound to the same world share mailbox pairs, so a frame sent by
+    /// one is delivered to the other's [`Transport::poll`] — with no real BLE
+    /// radio. This is the only thing the spec means by "an in-memory transport"
+    /// when none exists in `tines`.
+    struct SharedInMemory {
+        me: NodeId,
+        their: NodeId,
+        world: Arc<Mutex<SharedInMemoryWorld>>,
+        /// Set to `true` once this endpoint's first `poll` has reported contact,
+        /// so the `Contact` event fires exactly once, per endpoint.
+        contacted: bool,
+    }
+
+    struct SharedInMemoryWorld {
+        /// Per-node mailboxes: `send` to `to` lands in that node's inbox and
+        /// `poll` drains the local node's inbox. A single shared mailbox would
+        /// let either endpoint consume a frame destined for the other.
+        inboxes: HashMap<NodeId, VecDeque<Event<NodeId>>>,
+    }
+
+    impl SharedInMemoryWorld {
+        fn new() -> Self {
+            Self {
+                inboxes: HashMap::new(),
+            }
+        }
+    }
+
+    impl Transport for SharedInMemory {
+        type Addr = NodeId;
+
+        fn poll(&mut self) -> Option<Event<NodeId>> {
+            if !self.contacted {
+                self.contacted = true;
+                return Some(Event::Contact(self.their));
+            }
+            self.world
+                .lock()
+                .unwrap()
+                .inboxes
+                .get_mut(&self.me)?
+                .pop_front()
+        }
+
+        fn send(&mut self, to: &NodeId, frame: &[u8]) -> Result<(), SendError> {
+            // Deliver only to our peer; a frame to an unknown Addr is dropped.
+            if *to != self.their {
+                return Ok(());
+            }
+            let payload = FrameBuf::from_slice(frame).map_err(|_| SendError::TooLarge)?;
+            self.world
+                .lock()
+                .unwrap()
+                .inboxes
+                .entry(*to)
+                .or_default()
+                .push_back(Event::Frame(self.me, payload));
+            Ok(())
+        }
+
+        fn mtu(&self) -> usize {
+            consts::MAX_FRAME
+        }
+    }
+
+    /// Build two [`Node`]s over a shared [`SharedInMemory`] world, each with its
+    /// own store, bound to the given ids.
+    fn build_pair(
+        dir: &Path,
+    ) -> (
+        Node<LogStore, SharedInMemory>,
+        Node<LogStore, SharedInMemory>,
+    ) {
+        let world = Arc::new(Mutex::new(SharedInMemoryWorld::new()));
+        let (a_id, b_id) = ([1; 16], [2; 16]);
+
+        let a_store = LogStore::open(&dir.join("a.store.log"), 0).expect("a store open");
+        let b_store = LogStore::open(&dir.join("b.store.log"), 0).expect("b store open");
+
+        let ta = SharedInMemory {
+            me: a_id,
+            their: b_id,
+            world: world.clone(),
+            contacted: false,
+        };
+        let tb = SharedInMemory {
+            me: b_id,
+            their: a_id,
+            world,
+            contacted: false,
+        };
+
+        (
+            Node::new(a_id, a_store.first_seq(), a_store, ta),
+            Node::new(b_id, b_store.first_seq(), b_store, tb),
+        )
+    }
+
     #[test]
-    fn tick_advances_in_milliseconds() {
-        let clock = crate::HostClock::start();
-        let a = clock.now();
-        std::thread::sleep(Duration::from_millis(150));
-        let b = clock.now();
-        let delta = b.saturating_sub(a);
-        assert!(
-            delta >= 120,
-            "tines tick advances in milliseconds: expected >=120 ms over a 150 ms sleep, got {delta} ms",
+    fn f2_direct_propagation() {
+        let dir = unique_dir("probe");
+        let (mut node_a, mut node_b) = build_pair(&dir);
+        // Observe FIRST so the broadcast is already in A's store when the
+        // summary exchange rebuilds the send queue (mirrors pair.rs).
+        let observed = node_a.observe(&topic(), &payload(), None, 0).unwrap();
+        let mut t = 0u64;
+        let mut ok = false;
+        for _ in 0..1000 {
+            let _ = node_a.poll(t);
+            let _ = node_b.poll(t);
+            t += 10;
+            if node_b.store().contains(&observed) {
+                ok = true;
+                break;
+            }
+        }
+        assert!(ok, "direct propagation failed after 1000 rounds");
+    }
+
+    /// F2 regression: two service instances over an in-memory transport — an
+    /// observation made through one instance's IPC becomes a belief readable
+    /// through the other's. Both instances drive their exchange inline in
+    /// [`serve`]'s poll loop (the node isn't `Send`, so there's no separate
+    /// exchange thread); the broadcast reaches the other instance over the
+    /// shared transport and is stored as a belief.
+    #[test]
+    fn f2_propagation_between_instances() {
+        let dir = unique_dir("propagate");
+        let (node_a, node_b) = build_pair(&dir);
+
+        let socket_a = dir.join("a.sock");
+        let socket_b = dir.join("b.sock");
+        let (clock_a, clock_b) = (HostClock::start(), HostClock::start());
+
+        let socket_a_thread = socket_a.clone();
+        let _a = thread::spawn(move || serve(node_a, socket_a_thread, clock_a, 20).unwrap());
+        let socket_b_thread = socket_b.clone();
+        let _b = thread::spawn(move || serve(node_b, socket_b_thread, clock_b, 20).unwrap());
+
+        // A observes on its socket.
+        let mut stream_a = connect(&socket_a);
+        rpc(
+            &mut stream_a,
+            &Request::Observe {
+                topic: hex_encode(&topic()),
+                payload: hex_encode(&payload()),
+            },
         );
+        let obs = match read_response(&mut stream_a) {
+            Response::Observe { id } => id,
+            other => panic!("expected Observe, got {other:?}"),
+        };
+
+        // B queries the belief; retry until its inline exchange has polled A's
+        // broadcast off the shared transport and stored it.
+        for _ in 0..1000 {
+            let maybe = {
+                let mut stream_b = connect(&socket_b);
+                rpc(
+                    &mut stream_b,
+                    &Request::Belief {
+                        topic: hex_encode(&topic()),
+                    },
+                );
+                read_response(&mut stream_b)
+            };
+            if let Response::Belief { obs: Some(b) } = maybe {
+                assert_eq!(b.id, obs);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("observation through A never became a belief through B");
     }
 }

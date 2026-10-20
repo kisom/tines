@@ -222,7 +222,7 @@ fn observe_and_belief_over_socket() {
     let socket = dir.join("ipc.sock");
     let node = build_node([9; 16], &dir);
     let serve_path = socket.clone();
-    let _handle = thread::spawn(move || serve(node, serve_path, HostClock::start()).unwrap());
+    let _handle = thread::spawn(move || serve(node, serve_path, HostClock::start(), 20).unwrap());
 
     let mut stream = connect(&socket);
 
@@ -270,7 +270,7 @@ fn events_over_socket() {
     node.poll(0); // ack processed -> confidence event fires
 
     let serve_path = socket.clone();
-    let _handle = thread::spawn(move || serve(node, serve_path, HostClock::start()).unwrap());
+    let _handle = thread::spawn(move || serve(node, serve_path, HostClock::start(), 20).unwrap());
     let mut stream = connect(&socket);
 
     rpc(&mut stream, &Request::Events);
@@ -324,7 +324,7 @@ fn malformed_frame_gets_error_and_connection_survives() {
     let socket = dir.join("ipc.sock");
     let node = build_node([3; 16], &dir);
     let serve_path = socket.clone();
-    let _handle = thread::spawn(move || serve(node, serve_path, HostClock::start()).unwrap());
+    let _handle = thread::spawn(move || serve(node, serve_path, HostClock::start(), 20).unwrap());
     let mut stream = connect(&socket);
 
     // A length-prefixed frame whose body is not valid JSON.
