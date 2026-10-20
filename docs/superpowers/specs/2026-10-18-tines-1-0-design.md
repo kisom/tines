@@ -616,16 +616,24 @@ the new `Observation` encoding. There is no migration:
   that names the fix (delete the log). Silently misparsing an old log is
   not allowed.
 - **Ages across downtime (decision G).** The same format bump adds a
-  wall-clock reading to the clock marker `flush` writes: the host's trusted
-  wall time in milliseconds since the Unix epoch, or none.
-  - `LogStore::open` takes the host's current trusted wall time,
-    `Option<u64>`. The host passes `None` if its clock isn't trusted, for
-    example a dead RTC battery with no GPS fix yet.
-  - **Downtime known:** both readings are present and now ≥ the marker.
+  wall-clock reading to the clock marker `flush` writes: the trusted wall
+  time in milliseconds since the Unix epoch.
+  - **A host doesn't open the store until it has a trusted time source**
+    (Kyle, 2026-10-20), for example an RTC it trusts or a GPS fix. Until
+    then the robot runs no tines. That's acceptable because sharing is
+    opportunistic. `LogStore::open` therefore takes the trusted wall time
+    as a plain `u64` (ms since the Unix epoch), not an `Option`.
+  - **The marker's wall time is derived, not passed in.** `flush(now)`
+    keeps its `Tick`-only signature (decision F). `LogStore` records the
+    wall time and tick at `open`, and each clock marker carries
+    `wall_at_open + (now − tick_at_open)`. Because the store is never open
+    without trusted time, every marker this format writes has a wall time.
+  - **Downtime known:** the log has a marker with a wall time, and the wall
+    time at open is ≥ it.
     `open` adds `now − marker` to every held observation's age,
     saturating, on top of the tick fold it already does.
-  - **Downtime unknown:** either reading is missing, or the clock went
-    backwards. `open` treats every held **addressed** observation as
+  - **Downtime unknown:** the log has no clock marker (the previous run
+    never flushed), or the wall clock went backwards. `open` treats every held **addressed** observation as
     expired: its age is set past `lifetime_ms`, so core never delivers or
     forwards it, and `open` reports the count once. A custodian that can't
     tell how long it slept must not deliver a directive that may have
@@ -774,6 +782,10 @@ The review's other fixes are applied too:
     for robots that sleep through charge cycles.
   - Stores add power-off time on open, using a wall-clock reading in the
     flush marker.
+  - Hosts don't open the store until they have a trusted time source, so
+    `LogStore::open` takes a plain `u64` wall time. The marker's wall time
+    is derived from the wall time and tick at open, so `Store::flush(now)`
+    stays `Tick`-only.
   - When downtime can't be known, held addressed messages are expired:
     possibly delivering an expired directive is worse than possibly
     dropping a valid one, since sharing is opportunistic.
