@@ -294,9 +294,13 @@ example, because its store is full), and never acks an addressed duplicate
 it has already released, since that would hand custody back to a robot that
 no longer carries the message.
 
-Broadcast confirmations surface as `ConfidenceEvent { peer, id }` from
-`Node::drain_events`. The event queue is bounded (64): events are telemetry,
-and losing one never loses data.
+Broadcast confirmations surface as `NodeEvent<A>::Delivered { peer, id }` from
+`Node::drain_events`. Frames the peer could not use are counted under a
+`DropReason` (`VersionMismatch` or `Malformed`) and surface as
+`NodeEvent::Dropped { reason, count }` (see the `drop` reporting in the `tines`
+service and the ROS2 node). The event queue is bounded (64) plus a small
+counted-drop table, so drops are always reported even under a chatty peer —
+events are telemetry, and losing one never loses data.
 
 ## Usage
 
@@ -333,9 +337,17 @@ let stored = node.poll(500);
 // (e.g. the youngest observation wins).
 let belief = node.belief(b"door", &LatestWins, 500);
 
-// Which peers have confirmed holding which of your broadcasts.
+// Which peers have confirmed holding which of your broadcasts, and which
+// frames the peer dropped and counted.
 for event in node.drain_events() {
-    println!("peer {:?} has {:?}", event.peer, event.id);
+    match event {
+        tines_core::NodeEvent::Delivered { peer, id } => {
+            println!("peer {peer:?} has {id:?}");
+        }
+        tines_core::NodeEvent::Dropped { addr, reason, count } => {
+            println!("dropped {count} frame(s) from {addr:?}: {reason:?}");
+        }
+    }
 }
 
 // Keep the store bounded.
@@ -521,7 +533,7 @@ A robot runs either the service or the ROS2 node, not both: each owns its
   - It's configured by a JSON file: `node_id`, `peer`, `log_path`,
     `socket_path` and `poll_interval_ms`.
 - **`tines-ros2`**: a ROS2 node.
-  - It publishes each tines topic under `/tines/` and confidence events on
+  - It publishes each tines topic under `/tines/` and confirmed deliveries on
     `/tines/receipts`.
   - It turns messages on those topics into observations.
   - rclrs is behind the `ros2` feature, so the crate builds without a ROS2
@@ -569,7 +581,7 @@ Fixed limits, all compile-time constants in `tines-core/src/consts.rs`:
 | `SEND_QUEUE_CAP`        | 256    | ids queued per peer                      |
 | `MAX_FRAME`             | 1500   | largest frame (and MTU) supported        |
 | `ACK_IDS_CAP`           | 90     | ids in one `Ack` frame                   |
-| `EVENT_QUEUE_CAP`       | 64     | confidence events awaiting `drain_events`|
+| `EVENT_QUEUE_CAP`       | 64     | confirmed deliveries awaiting `drain_events` |
 | `BCAST_SENT_CAP`        | 256    | broadcast sends remembered per peer, to validate acks |
 | `ACK_BUFFER_CAP`        | 256    | received ids waiting to be acked, per kind |
 

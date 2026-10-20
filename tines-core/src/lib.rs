@@ -8,7 +8,6 @@ pub mod belief;
 pub mod bloom;
 pub mod consts;
 pub mod exchange;
-pub use exchange::ConfidenceEvent;
 pub mod frag;
 #[cfg(feature = "alloc")]
 pub mod mem_store;
@@ -20,7 +19,7 @@ pub mod wire;
 
 pub use belief::{BeliefPolicy, LatestWins, SelfFirst};
 pub use bloom::Bloom;
-pub use exchange::{Exchange, Peer};
+pub use exchange::{DropReason, Exchange, NodeEvent, Peer};
 pub use frag::{fragment, Reassembler};
 pub use node::{Node, ObserveError};
 pub use observation::{NodeId, Observation, ObservationId, Payload, Tick, Topic};

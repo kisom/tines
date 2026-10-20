@@ -39,7 +39,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::time::Duration;
 
-use tines_core::{Node, Store, Transport, TrimPolicy};
+use tines_core::{Node, NodeEvent, Store, Transport, TrimPolicy};
 use tines_store::LogStore;
 
 use crate::HostClock;
@@ -51,7 +51,7 @@ const MAX_FRAME: usize = 1 << 20; // 1 MiB cap on a single JSON frame
 /// of its accept loop.
 const POLL_CAP: u64 = 64;
 
-/// A confidence event handed out by the IPC `events` request.
+/// A confirmed delivery handed out by the IPC `events` request.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct EventOut {
     /// Hex of the `ObservationId` this confidence concerns.
@@ -87,7 +87,7 @@ pub enum Request {
         /// Hex of the topic bytes to query.
         topic: String,
     },
-    /// Drain outstanding confidence events.
+    /// Drain outstanding confirmed deliveries and drop counters.
     Events,
     /// Report the node's identity and log depth.
     Status,
@@ -107,9 +107,9 @@ pub enum Response {
         /// The stored belief, or `None` if the topic is unknown.
         obs: Option<BeliefOut>,
     },
-    /// Confidence events drained from the exchange.
+    /// Confirmed deliveries drained from the exchange.
     Events {
-        /// The drained confidence events.
+        /// The drained confirmed deliveries.
         events: Vec<EventOut>,
     },
     /// The node's `id`, next tines `next_seq`, and observations `stored`.
@@ -176,9 +176,24 @@ where
             let events = node
                 .drain_events()
                 .into_iter()
-                .map(|ev| EventOut {
-                    id: encode_hex(&ev.id),
-                    peer: encode_hex(&ev.peer),
+                .filter_map(|ev| match ev {
+                    NodeEvent::Delivered { peer, id } => Some(EventOut {
+                        id: encode_hex(&id),
+                        peer: encode_hex(&peer),
+                    }),
+                    // Dropped frames are surfaced to the operator via stderr
+                    // (they are the whole point of D3), not the `events`
+                    // response, so they filter out here.
+                    NodeEvent::Dropped {
+                        addr,
+                        reason,
+                        count,
+                    } => {
+                        eprintln!("tines: drop: {reason:?} (count={count}, addr={addr:?})");
+                        None
+                    }
+                    // `NodeEvent` is non-exhaustive: ignore any future variant.
+                    _ => None,
                 })
                 .collect();
             Response::Events { events }

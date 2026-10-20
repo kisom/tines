@@ -7,7 +7,7 @@ use common::PairTransport;
 use std::collections::BTreeSet;
 use tines_core::observation::Payload;
 use tines_core::transport::{Event, FrameBuf, SendError, Transport};
-use tines_core::{consts, LatestWins, MemStore, Node, ObserveError, Store};
+use tines_core::{consts, LatestWins, MemStore, Node, NodeEvent, ObserveError, Store};
 
 #[test]
 fn pair_transport_connect_then_frame() {
@@ -384,10 +384,13 @@ fn confidence_event_surfaces_on_node() {
         "b must receive a's broadcast before an Ack fires"
     );
 
-    // a's node surfaces the confidence event: peer == b, id == the broadcast.
+    // a's node surfaces the confirmed delivery: peer == b, id == the broadcast.
     let events = na.drain_events();
     assert!(
-        events.iter().any(|ev| ev.peer == nb.id() && ev.id == id),
-        "a's node must surface the confidence event for b's Ack"
+        events.iter().any(|ev| matches!(
+            ev,
+            NodeEvent::Delivered { peer, id: observed_id } if *peer == nb.id() && *observed_id == id
+        )),
+        "a's node must surface the confirmed delivery for b's Ack"
     );
 }

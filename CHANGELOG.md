@@ -19,7 +19,19 @@ still 0.3.0.
   - An ack for an addressed observation moves custody: the sender releases
     its copy (`Store::release`) and never offers it again.
   - An ack for a broadcast is confidence only. It surfaces as a
-    `ConfidenceEvent { peer, id }` from the new `Node::drain_events`.
+    `NodeEvent<A>::Delivered { peer, id }` from the new `Node::drain_events`.
+  - Broadcast confirmations and counted drops both come through
+    `Node::drain_events`; a confirmed broadcast arrives as
+    `NodeEvent::Delivered`, and a frame the peer dropped arrives as
+    `NodeEvent::Dropped { reason, count }` (§3).
+- **Counted drop reporting** (tines-core). A frame the peer could not use is no
+  dropped silently: the exchange counts it under a `DropReason` (`VersionMismatch`
+  or `Malformed`) keyed by the peer's transport address and reports the count
+  through `Node::drain_events` as `NodeEvent::Dropped`. Counters are held in a
+  bounded table (`consts::DROP_TABLE_CAP`) with a single overflow slot for the
+  case where the table is full, so an adversarial peer can't spin forever — it
+  just reports `addr: None`. Expired addressed observations dropped by policy are
+  *not* counted.
 - New constants: `ACK_IDS_CAP`, `EVENT_QUEUE_CAP`, `BCAST_SENT_CAP`,
   `ACK_BUFFER_CAP`.
 - `wire::frame_sender(bytes) -> Option<NodeId>`: a frame's claimed sender,

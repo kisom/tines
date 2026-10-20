@@ -16,7 +16,7 @@ use heapless::Vec as HeaplessVec;
 use std::fmt::Write as _;
 use tines::{handle, serve, HostClock, Request, Response};
 use tines_core::{
-    consts, Event, Frame, FrameBuf, Node, NodeId, ObservationId, SendError, Transport,
+    consts, Event, Frame, FrameBuf, Node, NodeEvent, NodeId, ObservationId, SendError, Transport,
 };
 use tines_store::LogStore;
 
@@ -67,7 +67,7 @@ impl Transport for MockTransport {
             Ok(Frame::Summary { salt, .. }) => {
                 // Echo back an empty, full-size Summary so the exchange learns
                 // the peer holds nothing and broadcasts its diff (which we then
-                // ack, firing a ConfidenceEvent).
+                // ack, firing a NodeEvent::Delivered).
                 let raw: [u8; consts::SUMMARY_BYTES] = [0u8; consts::SUMMARY_BYTES];
                 let bits: HeaplessVec<u8, { consts::SUMMARY_BYTES }> =
                     HeaplessVec::from_slice(&raw).expect("512 fits SUMMARY_BYTES");
@@ -276,7 +276,7 @@ fn events_over_socket() {
     rpc(&mut stream, &Request::Events);
     match read_response(&mut stream) {
         Response::Events { events } => {
-            assert_eq!(events.len(), 1, "expected one confidence event");
+            assert_eq!(events.len(), 1, "expected one confirmed delivery");
             assert_eq!(events[0].id, hex_encode(&x), "event id matches observed id");
             assert_eq!(events[0].peer, hex_encode(&peer), "event came from peer");
         }
@@ -303,7 +303,7 @@ fn handle_bad_hex_is_error() {
 }
 
 #[test]
-fn confidence_event_direct_probe() {
+fn confirmed_delivery_direct_probe() {
     let dir = unique_dir("ev");
     let mut node = build_node([7; 16], &dir);
     let x = node.observe(&topic(), &payload(), None, 0).unwrap();
@@ -311,9 +311,14 @@ fn confidence_event_direct_probe() {
     node.poll(0);
     node.poll(0);
     let evs = node.drain_events();
-    assert_eq!(evs.len(), 1, "one confidence event after observe+ack");
-    assert_eq!(evs[0].id, x);
-    assert_eq!(evs[0].peer, [7; 16]);
+    assert_eq!(evs.len(), 1, "one confirmed delivery after observe+ack");
+    match &evs[0] {
+        NodeEvent::Delivered { peer, id } => {
+            assert_eq!(*id, x);
+            assert_eq!(*peer, [7; 16]);
+        }
+        other => panic!("expected a Delivered event, got {other:?}"),
+    }
 }
 
 /// A malformed JSON frame must yield an `Error` response and leave the

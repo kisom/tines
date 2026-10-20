@@ -7,7 +7,7 @@
 //! * **tines → ROS2**: each distinct live tines topic is published to its
 //!   hex-escaped ROS2 topic (see [`crate::topics::topic_name`]) carrying the
 //!   raw observation payload as a `UInt8MultiArray` (`data: Vec<u8>`), and every
-//!   [`tines_core::ConfidenceEvent`] the exchange emits is published to
+//!   [`tines_core::NodeEvent`] the exchange emits is published to
 //!   [`RECEIPTS_TOPIC`] as a 32-byte `UInt8MultiArray` (`peer[..16] ++
 //!   id[..16]`).
 //! * **ROS2 → tines**: inbound messages on a topic are observed back into the
@@ -45,7 +45,9 @@ use rclrs::{Context, CreateBasicExecutor, Node as RclNode, Publisher, RclrsError
 use ros_env::std_msgs::msg::{MultiArrayLayout, UInt8MultiArray};
 
 use tines_bt::{BtTransport, Radio};
-use tines_core::{Node as TinesNodeCore, NodeId, Observation, ObservationId, Store, Tick};
+use tines_core::{
+    Node as TinesNodeCore, NodeEvent, NodeId, Observation, ObservationId, Store, Tick,
+};
 use tines_store::LogStore;
 
 use crate::topics::topic_name;
@@ -54,7 +56,7 @@ use crate::topics::topic_name;
 /// rclrs dispatch thread to the node's single owner task.
 type InboundMsg = (Vec<u8>, Vec<u8>);
 
-/// ROS2 topic carrying confidence events, the literal `/tines/receipts`
+/// ROS2 topic carrying confirmed deliveries, the literal `/tines/receipts`
 /// (hex-escaping is a no-op here since the bytes are already valid ROS2 name
 /// characters). This is a `&str` because ROS2 publisher/subscription creation
 /// takes a `&str` topic name, unlike the arbitrary-byte [`crate::RECEIPTS_TOPIC`].
@@ -106,7 +108,7 @@ pub struct TinesNode {
     tines: TinesNodeCore<LogStore, BtTransport>,
     /// ROS2 topics currently managed (ROS2 topic name → bookkeeping).
     managed: HashMap<String, ManagedTopic>,
-    /// Receipt publisher for confidence events.
+    /// Receipt publisher for confirmed deliveries.
     receipt_pub: Publisher<UInt8MultiArray>,
     /// Channel from subscription callbacks back to this node.
     inbound_rx: std::sync::mpsc::Receiver<InboundMsg>,
@@ -174,7 +176,8 @@ impl TinesNode {
     }
 
     /// One bridge tick: consume inbound ROS2 observations, drive the tines
-    /// exchange, publish live topics, and publish any confidence events.
+    /// exchange, publish live topics, and publish confirmed deliveries (logging
+    /// any counted drop to stderr).
     ///
     /// `now` is a monotonic millisecond [`Tick`]: milliseconds since the host
     /// process started (a single `Instant`-based clock, `0` at startup), never
@@ -325,24 +328,40 @@ impl TinesNode {
         best
     }
 
-    /// Publish every pending confidence event to [`RECEIPTS_TOPIC`].
+    /// Publish every confirmed delivery to [`RECEIPTS_TOPIC`]; log any counted
+    /// drop to stderr (counted drops are the point of D3 — the operator must
+    /// see them — so they are never published to the receipts topic).
     ///
     /// Each receipt is a 32-byte `UInt8MultiArray` = `peer[..16] ++ id[..16]`,
     /// the raw node ids (no hex encoding).
     fn publish_receipts(&mut self) {
         let events = self.tines.drain_events();
-        for ev in events.iter() {
-            let mut data = [0u8; 32];
-            data[..16].copy_from_slice(&ev.peer);
-            data[16..32].copy_from_slice(&ev.id);
-            let msg = UInt8MultiArray {
-                data: data.to_vec(),
-                layout: MultiArrayLayout {
-                    dim: vec![],
-                    data_offset: 0,
-                },
-            };
-            let _ = self.receipt_pub.publish(&msg);
+        for ev in events {
+            match ev {
+                NodeEvent::Delivered { peer, id } => {
+                    let mut data = [0u8; 32];
+                    data[..16].copy_from_slice(&peer);
+                    data[16..32].copy_from_slice(&id);
+                    let msg = UInt8MultiArray {
+                        data: data.to_vec(),
+                        layout: MultiArrayLayout {
+                            dim: vec![],
+                            data_offset: 0,
+                        },
+                    };
+                    let _ = self.receipt_pub.publish(&msg);
+                }
+                // Counted drops are surfaced to the operator via stderr.
+                NodeEvent::Dropped {
+                    addr,
+                    reason,
+                    count,
+                } => {
+                    eprintln!("tines: drop: {reason:?} (count={count}, addr={addr:?})");
+                }
+                // `NodeEvent` is non-exhaustive: ignore any future variant.
+                _ => {}
+            }
         }
     }
 }

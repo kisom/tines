@@ -9,8 +9,8 @@
 //!   dependency. This is what builds and is tested without a ROS2 toolchain.
 //!
 //! * **rclrs-backed** (feature `ros2`): `TinesNode`, a self-contained ROS2 node
-//!   that publishes each tines topic as a ROS2 topic and
-//!   [`crate::RECEIPTS_TOPIC`] for [`tines_core::ConfidenceEvent`]s, and
+//!   that publishes each tines topic as a ROS2 topic and publishes confirmed
+//!   deliveries to [`crate::RECEIPTS_TOPIC`] for [`tines_core::NodeEvent`]s, and
 //!   subscribes for new observations. Compiled only behind
 //!   `#[cfg(feature = "ros2")]` so the default build never needs rclrs.
 //!
@@ -20,7 +20,7 @@
 
 pub mod topics;
 
-/// ROS2 topic carrying serialized [`tines_core::ConfidenceEvent`]s (one per
+/// ROS2 topic carrying confirmed [`tines_core::NodeEvent`]s (one per
 /// broadcast a peer confirmed holding). Always the hex-escaped literal below.
 pub const RECEIPTS_TOPIC: &[u8] = b"/tines/receipts";
 

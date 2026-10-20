@@ -42,9 +42,14 @@ pub const MAX_FRAME: usize = 1500;
 /// Maximum number of content-IDs an `Ack` receipt may carry.
 pub const ACK_IDS_CAP: usize = 90;
 
-/// Cap on the `Exchange` `events` queue of `ConfidenceEvent`s (one per
-/// broadcast id a peer has confirmed).
+/// Cap on the `Exchange` `events` queue of `NodeEvent`s (one per broadcast id
+/// a peer has confirmed).
 pub const EVENT_QUEUE_CAP: usize = 64;
+
+/// Cap on the `Exchange` counted-drop table of distinct `(addr, DropReason)`
+/// pairs. Once full, further counted drops fold into a single overflow counter
+/// (reported with no address); see [`crate::exchange::NodeEvent::Dropped`].
+pub const DROP_TABLE_CAP: usize = 32;
 
 /// Cap on the `Exchange` per-peer `bcast_sent` table of broadcast ids
 /// dispatched to a peer.

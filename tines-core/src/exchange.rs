@@ -14,6 +14,7 @@
 use crate::consts;
 use crate::{
     Bloom, Event, Frame, NodeId, Observation, ObservationId, Reassembler, SendError, Store, Tick,
+    WireError,
 };
 use heapless::Vec;
 
@@ -44,15 +45,122 @@ pub struct InFlight {
     pub len: usize,
 }
 
-/// Emitted for a broadcast observation a peer has confirmed holding via an
-/// `Ack` receipt: [`ConfidenceEvent::peer`] is who received it and `id` is
-/// the broadcast's content-ID. Produced through `Exchange::drain_events`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConfidenceEvent {
-    /// The node id of the peer that acknowledged receiving the observation.
-    pub peer: NodeId,
-    /// The content-ID of the broadcast observation that was acknowledged.
-    pub id: ObservationId,
+/// Why the [`Exchange`] dropped an inbound frame it could not use; reported
+/// via [`NodeEvent::Dropped`]. A peer's [`Exchange`] rejects expired addressed
+/// observations by policy — those are *not* counted as drops.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DropReason {
+    /// The frame's leading `WIRE_VERSION` byte did not match
+    /// [`consts::WIRE_VERSION`].
+    VersionMismatch {
+        /// The version byte read off the wire.
+        version: u8,
+    },
+    /// The frame was not a valid [`Frame`] (truncated, garbage, or empty).
+    Malformed,
+}
+
+/// Emitted by [`crate::Node::drain_events`] for either a broadcast a peer
+/// confirmed holding (a *confirmed delivery*) or an inbound frame the peer
+/// dropped and counted.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NodeEvent<A> {
+    /// A broadcast observation the peer at `peer` confirmed holding (via an
+    /// `Ack` receipt); `id` is the broadcast's content-ID.
+    Delivered {
+        /// The node id of the peer that acknowledged receiving the observation.
+        peer: NodeId,
+        /// The content-ID of the broadcast observation that was acknowledged.
+        id: ObservationId,
+    },
+    /// The peer at `addr` sent a frame we dropped and counted under `reason`.
+    /// `count` is how many frames were counted for this `(addr, reason)` pair
+    /// since the last drain (always `>= 1`); `addr` is `None` when the
+    /// drop-counter table is full and the count lives in the single overflow
+    /// slot instead.
+    Dropped {
+        /// The wire address of the peer that sent the dropped frame. `None`
+        /// only for the overflow slot, which has no address to name.
+        addr: Option<A>,
+        /// Why the frame was dropped.
+        reason: DropReason,
+        /// The number of frames folded into this counter since the last drain.
+        count: u32,
+    },
+}
+
+/// The [`Exchange`]'s counted-drop table: up to [`consts::DROP_TABLE_CAP`]
+/// distinct `(addr, DropReason)` pairs, each with a saturating count, plus a
+/// single overflow counter. Counters are drained — and reset — through
+/// [`Exchange::drain_events`].
+#[derive(Clone, Debug)]
+pub(crate) struct DropTable<A> {
+    /// `(addr, reason, count)`, in insertion order; `count` saturates at `u32`.
+    entries: Vec<(A, DropReason, u32), { consts::DROP_TABLE_CAP }>,
+    /// A single slot for drops that arrive once the table is full: no address,
+    /// just the reason and a combined count. Reported with `addr: None`.
+    overflow: Option<(DropReason, u32)>,
+}
+
+impl<A: Clone + PartialEq> DropTable<A> {
+    /// Creates an empty drop-counter table.
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            overflow: None,
+        }
+    }
+
+    /// Records one drop for `(addr, reason)`: bumps the matching entry's count
+    /// if present, otherwise adds a new entry, or folds into the single overflow
+    /// counter once the table is full.
+    fn record(&mut self, addr: A, reason: DropReason) {
+        for entry in self.entries.iter_mut() {
+            if entry.0 == addr && entry.1 == reason {
+                entry.2 = entry.2.saturating_add(1);
+                return;
+            }
+        }
+        if self.entries.is_full() {
+            match self.overflow {
+                Some((_, ref mut count)) => *count = count.saturating_add(1),
+                None => self.overflow = Some((reason, 1)),
+            }
+        } else {
+            let _ = self.entries.push((addr, reason, 1));
+        }
+    }
+
+    /// Emits one [`NodeEvent::Dropped`] per non-zero entry (resetting its count,
+    /// keeping the key) followed by the overflow counter, if any.
+    fn drain(&mut self) -> Vec<NodeEvent<A>, { consts::DROP_TABLE_CAP + 1 }> {
+        let mut out: Vec<NodeEvent<A>, { consts::DROP_TABLE_CAP + 1 }> = Vec::new();
+        let mut i = 0;
+        while let Some(entry) = self.entries.get_mut(i) {
+            let (addr, reason, count) = (entry.0.clone(), entry.1, entry.2);
+            if count > 0 {
+                let _ = out.push(NodeEvent::Dropped {
+                    addr: Some(addr),
+                    reason,
+                    count,
+                });
+                entry.2 = 0;
+            }
+            i += 1;
+        }
+        if let Some((reason, count)) = self.overflow.take() {
+            if count > 0 {
+                let _ = out.push(NodeEvent::Dropped {
+                    addr: None,
+                    reason,
+                    count,
+                });
+            }
+        }
+        out
+    }
 }
 
 /// A single peer the [`Exchange`] is tracking.
@@ -178,9 +286,13 @@ pub struct Exchange<A> {
     /// broadcast emit path. Used to validate inbound `Ack` receipts against
     /// broadcasts we actually sent; overflow drops the oldest record.
     bcast_sent: Vec<(ObservationId, A), { consts::BCAST_SENT_CAP }>,
-    /// One [`ConfidenceEvent`] per broadcast id a peer has confirmed, pushed
-    /// drop-oldest when full. Drain through [`Exchange::drain_events`].
-    events: Vec<ConfidenceEvent, { consts::EVENT_QUEUE_CAP }>,
+    /// One [`NodeEvent::Delivered`] per broadcast id a peer has confirmed,
+    /// pushed drop-oldest when full. Drain through [`Exchange::drain_events`].
+    events: Vec<NodeEvent<A>, { consts::EVENT_QUEUE_CAP }>,
+    /// Counted drops: distinct `(addr, DropReason)` pairs, each with a
+    /// saturating count, plus a single overflow counter; reported through
+    /// [`Exchange::drain_events`] and reset on drain.
+    drops: DropTable<A>,
     /// Pending addressed acks: ids awaiting an `Ack` for a peer that sent an
     /// addressed observation.
     acks: AckBuffer<A>,
@@ -207,6 +319,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
             bounce: Vec::new(),
             bcast_sent: Vec::new(),
             events: Vec::new(),
+            drops: DropTable::new(),
             undo: None,
             ack_undo: None,
             acks: AckBuffer::new(),
@@ -655,18 +768,33 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         &self.peers
     }
 
-    /// [`Exchange`]s emit [`ConfidenceEvent`]s through [`Exchange::drain_events`];
-    /// `tines` surfaces them to its transport, so the drain method is unused
-    /// inside `tines-core` itself.
+    /// [`Exchange`]s emit [`NodeEvent`]s — confirmed deliveries plus counted
+    /// drops — through `Exchange::drain_events`; `tines` surfaces them to its
+    /// transport, so the drain method is unused inside `tines-core` itself.
+    ///
+    /// Returns confirmed deliveries first, oldest first, then one
+    /// [`NodeEvent::Dropped`] per non-zero counter (resetting each counter).
+    /// Sized to hold the entire delivery queue plus the whole drop table and
+    /// its overflow slot, so a full delivery queue never evicts a counted drop.
     #[allow(dead_code)]
-    pub(crate) fn drain_events(&mut self) -> Vec<ConfidenceEvent, { consts::EVENT_QUEUE_CAP }> {
-        let mut drained: Vec<ConfidenceEvent, { consts::EVENT_QUEUE_CAP }> = Vec::new();
+    pub(crate) fn drain_events(
+        &mut self,
+    ) -> Vec<NodeEvent<A>, { consts::EVENT_QUEUE_CAP + consts::DROP_TABLE_CAP + 1 }> {
+        let mut drained: Vec<
+            NodeEvent<A>,
+            { consts::EVENT_QUEUE_CAP + consts::DROP_TABLE_CAP + 1 },
+        > = Vec::new();
+        // Confirmed deliveries, oldest first.
         while !self.events.is_empty() {
             if drained.is_full() {
                 break;
             }
             let ev = self.events.remove(0);
             let _ = drained.push(ev);
+        }
+        // Then one counted drop per non-zero counter, resetting each.
+        for dropped in self.drops.drain() {
+            let _ = drained.push(dropped);
         }
         drained
     }
@@ -716,7 +844,18 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
     ) -> Option<Observation> {
         let frame = match Frame::decode(bytes) {
             Ok(frame) => frame,
-            Err(_) => return None,
+            Err(WireError::VersionMismatch { version }) => {
+                // A wrong-version frame is a counted drop, not a silent drop.
+                self.drops
+                    .record(addr, DropReason::VersionMismatch { version });
+                return None;
+            }
+            // Any other decode failure (malformed, truncated, or the encode-only
+            // TooLarge which decode never yields) is a counted malformed drop.
+            Err(_) => {
+                self.drops.record(addr, DropReason::Malformed);
+                return None;
+            }
         };
         let idx = self.peer_index(&addr)?;
         let peer = &mut self.peers[idx];
@@ -750,8 +889,8 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
     /// For each id in the receipt: an id the local node `Sent` to `addr` (per
     /// the bounce table) is released from custody so it is never forwarded
     /// again; an id the node dispatched as a broadcast to `addr` (per
-    /// `bcast_sent`) fires a [`ConfidenceEvent`]. A receipt for an id the node
-    /// never dispatched to `addr` is silently ignored. No path panics on
+    /// `bcast_sent`) fires a [`NodeEvent::Delivered`]. A receipt for an id the
+    /// node never dispatched to `addr` is silently ignored. No path panics on
     /// malformed input — an oversized id list just drops the overflow.
     fn on_ack<S: Store>(
         &mut self,
@@ -774,7 +913,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                 }
             } else if bcast_sent_contains(&self.bcast_sent, *id, &addr) {
                 // Broadcast: the peer confirms it holds our broadcast.
-                let _ = self.events.push(ConfidenceEvent {
+                let _ = self.events.push(NodeEvent::Delivered {
                     peer: from,
                     id: *id,
                 });
@@ -2712,7 +2851,7 @@ mod tests {
     }
 
     /// An Ack for a broadcast we dispatched to the peer fires exactly one
-    /// ConfidenceEvent naming the peer and the broadcast id.
+    /// `NodeEvent::Delivered` naming the peer and the broadcast id.
     #[test]
     fn ack_broadcast_fires_confidence_event() {
         let peer: NodeId = [2; 16];
@@ -2734,8 +2873,16 @@ mod tests {
             1,
             "one broadcast ack fires one confidence event"
         );
-        assert_eq!(events[0].peer, peer);
-        assert_eq!(events[0].id, b_id);
+        match events[0] {
+            NodeEvent::Delivered {
+                peer: ev_peer,
+                id: ev_id,
+            } => {
+                assert_eq!(ev_peer, peer);
+                assert_eq!(ev_id, b_id);
+            }
+            other => panic!("expected a Delivered event, got {other:?}"),
+        }
     }
 
     /// A broadcast Ack does not release custody: there is no local addressed
@@ -2847,8 +2994,8 @@ mod tests {
     }
 
     /// A broadcast Ack from a peer that never held the broadcast fires no
-    /// ConfidenceEvent: the receipt names a broadcast we did not dispatch to
-    /// that peer.
+    /// `NodeEvent::Delivered`: the receipt names a broadcast we did not dispatch
+    /// to that peer.
     #[test]
     fn ack_broadcast_forged_id_no_confidence() {
         let peer: NodeId = [2; 16];
@@ -2904,8 +3051,18 @@ mod tests {
             2,
             "each broadcast ack fires a confidence event"
         );
-        assert_eq!(events[0].id, a_id, "events come back oldest-first");
-        assert_eq!(events[1].id, b_id);
+        match events[0] {
+            NodeEvent::Delivered { id, .. } => {
+                assert_eq!(id, a_id, "events come back oldest-first");
+            }
+            other => panic!("expected a Delivered event, got {other:?}"),
+        }
+        match events[1] {
+            NodeEvent::Delivered { id, .. } => {
+                assert_eq!(id, b_id);
+            }
+            other => panic!("expected a Delivered event, got {other:?}"),
+        }
     }
 
     /// drain_events empties the queue: a second drain yields nothing.
@@ -2925,12 +3082,205 @@ mod tests {
 
         let first = ex.drain_events();
         assert_eq!(first.len(), 1, "the queued confidence event is drained");
-        assert_eq!(first[0].id, b_id);
+        match first[0] {
+            NodeEvent::Delivered { id, .. } => {
+                assert_eq!(id, b_id);
+            }
+            other => panic!("expected a Delivered event, got {other:?}"),
+        }
 
         let second = ex.drain_events();
         assert!(
             second.is_empty(),
             "drain_events empties the queue; a second drain yields nothing"
+        );
+    }
+
+    /// A frame whose leading byte isn't WIRE_VERSION is a counted
+    /// version-mismatch drop, reported with the sender, the version byte, and a
+    /// count of one.
+    #[test]
+    fn version_mismatch_is_counted() {
+        let mut store = MemStore::new();
+        let mut ex = Exchange::<u8>::new(ME);
+        // The first byte is 0, which isn't WIRE_VERSION: a version mismatch.
+        let bytes = heapless::Vec::<u8, { consts::MAX_FRAME }>::from_slice(&[0u8; 10]).unwrap();
+        assert_eq!(ex.on_event(Event::Frame(1, bytes), &mut store, 0), None);
+
+        let drained = ex.drain_events();
+        assert_eq!(drained.len(), 1, "exactly one counted drop");
+        match drained.into_iter().next().unwrap() {
+            NodeEvent::Dropped {
+                addr,
+                reason,
+                count,
+            } => {
+                assert_eq!(addr, Some(1u8));
+                assert_eq!(reason, DropReason::VersionMismatch { version: 0 });
+                assert_eq!(count, 1);
+            }
+            other => panic!("expected a counted Dropped, got {other:?}"),
+        }
+    }
+
+    /// A frame that passes the version gate (byte 0 is WIRE_VERSION) but whose
+    /// body isn't a valid postcard [`Frame`] is a counted malformed drop.
+    #[test]
+    fn malformed_is_counted() {
+        let mut store = MemStore::new();
+        let mut ex = Exchange::<u8>::new(ME);
+        let mut bytes = heapless::Vec::<u8, { consts::MAX_FRAME }>::new();
+        bytes.push(consts::WIRE_VERSION).unwrap();
+        bytes.push(0xFF).unwrap();
+        bytes.push(0xFF).unwrap();
+        assert_eq!(ex.on_event(Event::Frame(1, bytes), &mut store, 0), None);
+
+        let drained = ex.drain_events();
+        assert_eq!(drained.len(), 1, "exactly one counted drop");
+        match drained.into_iter().next().unwrap() {
+            NodeEvent::Dropped {
+                addr,
+                reason,
+                count,
+            } => {
+                assert_eq!(addr, Some(1u8));
+                assert_eq!(reason, DropReason::Malformed);
+                assert_eq!(count, 1);
+            }
+            other => panic!("expected a counted Dropped, got {other:?}"),
+        }
+    }
+
+    /// A repeat of the same (addr, reason) folds into one counter whose count
+    /// is two: the two frames are one drop, counted once with count 2.
+    #[test]
+    fn same_drop_increments_count() {
+        let mut store = MemStore::new();
+        let mut ex = Exchange::<u8>::new(ME);
+        let bytes = heapless::Vec::<u8, { consts::MAX_FRAME }>::from_slice(&[0u8; 10]).unwrap();
+        assert_eq!(
+            ex.on_event(Event::Frame(1, bytes.clone()), &mut store, 0),
+            None
+        );
+        assert_eq!(ex.on_event(Event::Frame(1, bytes), &mut store, 0), None);
+
+        let drained = ex.drain_events();
+        assert_eq!(drained.len(), 1, "a repeat is folded into one counter");
+        match drained.into_iter().next().unwrap() {
+            NodeEvent::Dropped {
+                addr,
+                reason,
+                count,
+            } => {
+                assert_eq!(addr, Some(1u8));
+                assert_eq!(reason, DropReason::VersionMismatch { version: 0 });
+                assert_eq!(count, 2, "both frames counted against one peer+reason");
+            }
+            other => panic!("expected a single counted Dropped with count 2, got {other:?}"),
+        }
+    }
+
+    /// An addressed observation that arrives already past its lifetime_ms is
+    /// rejected by policy; that rejection is NOT a counted drop (unlike a
+    /// decode error).
+    #[test]
+    fn expired_addressed_is_not_a_drop() {
+        let mut store = MemStore::new();
+        let mut ex = Exchange::<u8>::new(ME);
+        // Addressed to us, lifetime 100ms, but age 200ms -> expired.
+        let mut o = obs([2; 16], 7, 200, None, b"t", b"hi");
+        o.to = Some(ME);
+        o.lifetime_ms = Some(100);
+        let frame = Frame::Obs {
+            from: [2; 16],
+            obs: o,
+        };
+        assert_eq!(
+            ex.on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0),
+            None,
+            "an expired addressed obs must not be delivered"
+        );
+        // A policy rejection is not a counted drop.
+        assert!(
+            ex.drain_events().is_empty(),
+            "an expired addressed obs is rejected by policy, not counted as a drop"
+        );
+    }
+
+    /// A full delivery queue and a counted drop survive together: drops are
+    /// appended after the deliveries and none are evicted (the drop-oldest
+    /// eviction of the delivery queue is not in play here, and the drop-table
+    /// and delivery queue never evict each other).
+    #[test]
+    fn drops_do_not_evict_delivered() {
+        let mut store = MemStore::new();
+        let mut ex = Exchange::<u8>::new(ME);
+        // Fill the delivery queue to the brim with confirmed broadcasts.
+        for _ in 0..consts::EVENT_QUEUE_CAP {
+            ex.events
+                .push(NodeEvent::Delivered {
+                    peer: [7; 16],
+                    id: [0u8; 16],
+                })
+                .unwrap();
+        }
+        // One counted drop lands alongside the full delivery queue.
+        let bytes = heapless::Vec::<u8, { consts::MAX_FRAME }>::from_slice(&[0u8; 10]).unwrap();
+        assert_eq!(ex.on_event(Event::Frame(1, bytes), &mut store, 0), None);
+
+        let drained = ex.drain_events();
+        let mut delivered = 0usize;
+        let mut dropped = 0usize;
+        for ev in drained {
+            match ev {
+                NodeEvent::Delivered { .. } => delivered += 1,
+                NodeEvent::Dropped { .. } => dropped += 1,
+            }
+        }
+        assert_eq!(
+            delivered,
+            consts::EVENT_QUEUE_CAP,
+            "every queued delivery survives a full queue"
+        );
+        assert_eq!(dropped, 1, "the counted drop is reported alongside them");
+    }
+
+    /// Once the drop-counter table is full, the next drop folds into a single
+    /// overflow counter reported with `addr: None`; the table's 32 entries are
+    /// all still reported with a real address.
+    #[test]
+    fn overflow_counter_has_no_addr() {
+        let mut store = MemStore::new();
+        let mut ex = Exchange::<u8>::new(ME);
+        // Drive DROP_TABLE_CAP + 1 distinct (addr, reason) pairs: the table
+        // holds DROP_TABLE_CAP, so the one beyond the cap folds into the single
+        // overflow counter and is reported with no address.
+        for addr in 0..=(consts::DROP_TABLE_CAP as u8) {
+            let bytes = heapless::Vec::<u8, { consts::MAX_FRAME }>::from_slice(&[0u8; 10]).unwrap();
+            assert_eq!(
+                ex.on_event(Event::Frame(addr, bytes.clone()), &mut store, 0),
+                None
+            );
+        }
+
+        let drained = ex.drain_events();
+        let mut reported = 0usize;
+        let mut overflow = 0usize;
+        for ev in drained {
+            match ev {
+                NodeEvent::Dropped { addr: Some(..), .. } => reported += 1,
+                NodeEvent::Dropped { addr: None, .. } => overflow += 1,
+                NodeEvent::Delivered { .. } => {}
+            }
+        }
+        assert_eq!(
+            overflow, 1,
+            "the drop beyond the table cap must report with no address"
+        );
+        assert_eq!(
+            reported,
+            consts::DROP_TABLE_CAP,
+            "all capped entries reported"
         );
     }
 }
