@@ -87,6 +87,11 @@ call `poll()` in its loop, and `observe()` when it sees something.
   this contact.
 - `NodeId = [u8; 16]`, `ObservationId = [u8; 16]`, `Tick = u64` (local
   monotonic ms, supplied on every call).
+- 1.0 trait extension rule: any method added to `Store`, `Transport` or
+  `BeliefPolicy` after 1.0 must have a default whose behaviour is safe — it
+  may lose performance or telemetry but never data or custody. A method that
+  can't have such a default is a 2.0 change (the rule `release` violated in
+  0.3.0).
 
 ### Review Focus (each covered by a test; keep it that way)
 
@@ -102,11 +107,19 @@ call `poll()` in its loop, and `observe()` when it sees something.
 
 ### Compile-time constants (`tines-core/src/consts.rs`)
 
-`MAX_TOPIC=64`, `MAX_PAYLOAD=1024`, `MAX_PEERS=8`, `SUMMARY_BYTES=512`,
-`BLOOM_K=3`, `SUMMARY_INTERVAL_MS=2000`, `REASSEMBLY_TIMEOUT_MS=5000`,
-`SEND_QUEUE_CAP=256`, `MAX_FRAME=1500`, `ACK_IDS_CAP=90`,
-`EVENT_QUEUE_CAP=64`, `BCAST_SENT_CAP=256`, `ACK_BUFFER_CAP=256`. Match the
-exact values above.
+Split into **wire** (frozen for wire v1 — changing one changes how a v1 peer
+decodes or interprets a frame) and **local** (never crosses the wire; may
+change in a minor release):
+
+- **Wire:** `WIRE_VERSION=4`, `MAX_TOPIC=64`, `MAX_PAYLOAD=1024`,
+  `MAX_FRAME=1500`, `SUMMARY_BYTES=512`, `ACK_IDS_CAP=90`, `MAX_SIG=64`,
+  `BLOOM_K=3`, plus the private `MAX_FRAGMENTS=64`.
+- **Local:** `MAX_PEERS=8`, `SUMMARY_INTERVAL_MS=2000`,
+  `REASSEMBLY_TIMEOUT_MS=5000`, `SEND_QUEUE_CAP=256`, `MIN_MTU`,
+  `EVENT_QUEUE_CAP=64`, `DROP_TABLE_CAP=32`, `BCAST_SENT_CAP=256`,
+  `ACK_BUFFER_CAP=256`.
+
+Match the exact values above.
 
 ## Crate layout
 
