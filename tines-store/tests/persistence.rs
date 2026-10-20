@@ -21,6 +21,7 @@ fn obs(observer: [u8; 16], seq: u64, age: u64, at: Option<u64>) -> Observation {
         topic: Topic::from_slice(b"door/3").unwrap(),
         payload: Payload::from_slice(b"open").unwrap(),
         dest: None,
+        sig: None,
     }
 }
 
@@ -346,6 +347,7 @@ mod fleet_fixes_f5 {
             topic: Topic::from_slice(b"door/3").unwrap(),
             payload: Payload::from_slice(b"open").unwrap(),
             dest: None,
+            sig: None,
         }
     }
 

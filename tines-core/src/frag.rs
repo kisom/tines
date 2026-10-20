@@ -218,6 +218,113 @@ mod tests {
             topic: Topic::from_slice(b"door/3").unwrap(),
             payload: Payload::from_slice(&std::vec![0u8; payload_len]).unwrap(),
             dest: None,
+            sig: None,
+        }
+    }
+
+    fn signed_max_obs(sig: crate::Signature) -> Observation {
+        let mut obs = obs_with_payload([1; 16], consts::MAX_PAYLOAD);
+        obs.sig = Some(sig);
+        obs
+    }
+
+    #[test]
+    fn reassembled_bad_signature_is_malformed() {
+        // A maximum-size signed obs carrying a malformed Ed25519 signature (wrong
+        // length) must be rejected on reassembly — never returned — exactly as a
+        // single-frame decode would reject it.
+        let obs = signed_max_obs(crate::Signature {
+            version: 1,
+            algo: crate::SigAlgo::Ed25519,
+            bytes: heapless::Vec::from_slice(&[0u8; 63]).unwrap(),
+        });
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        fragment([1; 16], &obs, 200, &mut |b| frames.push(b.to_vec()))
+            .expect("fragment signed max obs");
+        let mut r = Reassembler::new();
+        let mut last: Option<Observation> = None;
+        for f in frames.iter() {
+            if let Frame::Frag {
+                id,
+                index,
+                count,
+                data,
+                ..
+            } = Frame::decode(f).unwrap()
+            {
+                last = r.feed(id, index, count, &data, 0);
+            }
+        }
+        assert!(
+            last.is_none(),
+            "a malformed signature on reassembly must be rejected, never returned"
+        );
+    }
+
+    #[test]
+    fn reassembled_unknown_algo_signature_roundtrips() {
+        // An unknown-algorithm signature is carried verbatim on reassembly too.
+        let obs = signed_max_obs(crate::Signature {
+            version: 2,
+            algo: crate::SigAlgo::Unknown(7),
+            bytes: heapless::Vec::from_slice(&[9u8; 10]).unwrap(),
+        });
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        fragment([1; 16], &obs, 200, &mut |b| frames.push(b.to_vec()))
+            .expect("fragment signed max obs");
+        let mut r = Reassembler::new();
+        let mut last: Option<Observation> = None;
+        for f in frames.iter() {
+            if let Frame::Frag {
+                id,
+                index,
+                count,
+                data,
+                ..
+            } = Frame::decode(f).unwrap()
+            {
+                last = r.feed(id, index, count, &data, 0);
+            }
+        }
+        assert_eq!(last, Some(obs), "unknown-algo sig must reassemble verbatim");
+    }
+
+    #[test]
+    fn fragmentation_fits_mtu_sweep() {
+        // Review Focus #6: a full-size signed obs (MAX_PAYLOAD + 64-byte Ed25519
+        // sig) must fragment into <= MAX_FRAGMENTS frames each <= mtu, or — below
+        // the BLE floor — be given up cleanly as TooLarge, never emitted
+        // oversized, across every mtu from MIN_MTU to MAX_FRAME.
+        let obs = signed_max_obs(crate::Signature {
+            version: 1,
+            algo: crate::SigAlgo::Ed25519,
+            bytes: heapless::Vec::from_slice(&[0u8; 64]).unwrap(),
+        });
+        for mtu in consts::MIN_MTU..=consts::MAX_FRAME {
+            let mut frames: Vec<Vec<u8>> = Vec::new();
+            match fragment([1; 16], &obs, mtu, &mut |b| frames.push(b.to_vec())) {
+                Ok(count) => {
+                    assert!(
+                        count <= MAX_FRAGMENTS,
+                        "frame count {count} exceeds MAX_FRAGMENTS {MAX_FRAGMENTS}"
+                    );
+                    assert_eq!(frames.len(), count, "emit count must match at mtu {mtu}");
+                    for f in &frames {
+                        assert!(
+                            f.len() <= mtu,
+                            "frame of {} bytes exceeds mtu {mtu}",
+                            f.len()
+                        );
+                    }
+                }
+                Err(crate::wire::WireError::TooLarge) => {
+                    assert!(
+                        frames.is_empty(),
+                        "TooLarge at mtu {mtu} must emit no frames"
+                    );
+                }
+                Err(other) => panic!("unexpected error {other:?} at mtu {mtu}"),
+            }
         }
     }
 

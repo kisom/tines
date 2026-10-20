@@ -1024,6 +1024,7 @@ mod tests {
             topic: tines_core::Topic::from_slice(b"door/3").unwrap(),
             payload: tines_core::Payload::from_slice(b"open").unwrap(),
             dest: None,
+            sig: None,
         }
     }
 

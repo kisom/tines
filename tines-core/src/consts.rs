@@ -18,6 +18,11 @@ pub const MAX_TOPIC: usize = 64;
 /// Maximum payload length in bytes.
 pub const MAX_PAYLOAD: usize = 1024;
 
+/// Maximum signature length in bytes. The 1.0 signature slot reserves this on
+/// every observation (`[crate::observation::Signature]`); it is carried verbatim
+/// and never signed or verified until 1.1.
+pub const MAX_SIG: usize = 64;
+
 /// Maximum number of peers a node tracks.
 pub const MAX_PEERS: usize = 8;
 
@@ -35,6 +40,12 @@ pub const REASSEMBLY_TIMEOUT_MS: u64 = 5000;
 
 /// Maximum number of frames buffered for outbound delivery.
 pub const SEND_QUEUE_CAP: usize = 256;
+
+/// Minimum usable UDP frame size in bytes (the BLE floor below which a
+/// fragment header leaves no room for payload). [`crate::frag::fragment`] gives
+/// up cleanly with `WireError::TooLarge` for any `mtu` below this rather than
+/// emitting a truncated frame; the MTU sweep runs from here to [`MAX_FRAME`].
+pub const MIN_MTU: usize = 23;
 
 /// Maximum UDP frame size in bytes.
 pub const MAX_FRAME: usize = 1500;

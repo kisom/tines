@@ -92,6 +92,7 @@ impl<S: Store, T: Transport> Node<S, T> {
             topic,
             payload,
             dest: None,
+            sig: None,
         };
         self.next_seq += 1;
         let id = obs.id();
@@ -128,6 +129,7 @@ impl<S: Store, T: Transport> Node<S, T> {
             topic,
             payload,
             dest: Some(Dest { to, lifetime_ms }),
+            sig: None,
         };
         self.next_seq += 1;
         let id = obs.id();

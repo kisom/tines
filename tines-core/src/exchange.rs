@@ -1292,6 +1292,7 @@ mod tests {
             topic: Topic::from_slice(topic).unwrap(),
             payload: Payload::from_slice(payload).unwrap(),
             dest: None,
+            sig: None,
         }
     }
 

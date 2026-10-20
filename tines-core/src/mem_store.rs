@@ -215,6 +215,7 @@ mod tests {
             topic: Topic::from_slice(topic).unwrap(),
             payload: Payload::from_slice(b"").unwrap(),
             dest: None,
+            sig: None,
         }
     }
 

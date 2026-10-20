@@ -108,6 +108,7 @@ mod tests {
             topic: Topic::from_slice(b"door/3").unwrap(),
             payload: Payload::from_slice(b"open").unwrap(),
             dest: None,
+            sig: None,
         }
     }
 
