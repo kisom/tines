@@ -219,14 +219,15 @@ impl<S: Store, T: Transport> Node<S, T> {
         &self.store
     }
 
-    /// Mutable access to the backing store.
+    /// Best-effort durability flush, advancing each stored observation's age
+    /// up to `now`.
     ///
-    /// Lets a host call backend-specific methods that aren't on the [`Store`]
-    /// trait — e.g. `tines_store::LogStore::flush`, the durability boundary a
-    /// host reaches on its flush schedule. [`Self::trim`] takes `&mut self`;
-    /// this exposes the concrete backend the same way.
-    pub fn store_mut(&mut self) -> &mut S {
-        &mut self.store
+    /// This is the durability boundary a host reaches on its flush schedule —
+    /// delegates to [`Store::flush`], so it is infallible by contract: a failed
+    /// flush is, at worst, a duplicate custodian on the next exchange, never a
+    /// lost message.
+    pub fn flush(&mut self, now: Tick) -> Result<(), StoreError> {
+        self.store.flush(now)
     }
 
     /// Access the transport (e.g. to `connect`/`disconnect` a peer in tests).

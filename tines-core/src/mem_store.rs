@@ -479,3 +479,24 @@ mod tests {
         assert!(!s.is_released(&[0u8; 16]));
     }
 }
+
+#[cfg(all(test, feature = "conformance"))]
+mod conformance_tests {
+    use crate::store_conformance;
+
+    use super::MemStore;
+
+    // The whole suite runs against `MemStore` from its own crate.
+    #[test]
+    fn store_conforms() {
+        store_conformance::insert_get(MemStore::new);
+        store_conformance::dedupe(MemStore::new);
+        store_conformance::age_lineage(MemStore::new);
+        store_conformance::saturating_ticks(MemStore::new);
+        store_conformance::release_surviving_get(MemStore::new);
+        store_conformance::sig_round_trip(MemStore::new);
+        store_conformance::trim_order(MemStore::new);
+        store_conformance::no_tombstones(MemStore::new);
+        store_conformance::idempotent_flush(MemStore::new);
+    }
+}

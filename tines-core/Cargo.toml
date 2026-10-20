@@ -14,6 +14,11 @@ categories = ["no-std", "embedded", "network-programming", "science::robotics"]
 [features]
 default = ["alloc"]
 alloc = []
+# A `no_std`-clean conformance suite ([`store_conformance`]) that concrete
+# backends run against themselves to prove they honor the `Store` contract.
+# Std-free so it builds with `--no-default-features`; enabled only by the
+# backend crates that exercise the suite (MemStore, LogStore, CappedStore).
+conformance = []
 
 [dependencies]
 heapless = { version = "0.8", features = ["serde"] }

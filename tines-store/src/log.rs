@@ -232,7 +232,6 @@ pub struct LogStore {
     file: File,
     index: BTreeMap<ObservationId, Entry>,
     boot_count: u64,
-    now: Tick,
     /// Number of corrupt records skipped while rebuilding the index on the last
     /// [`Self::open`] (0 if the log was clean). Exposed for hosts to report.
     skipped_records: usize,
@@ -441,7 +440,6 @@ impl LogStore {
             file,
             index,
             boot_count,
-            now,
             skipped_records: skipped,
         })
     }
@@ -467,30 +465,34 @@ impl LogStore {
 
     /// Persist the current index state to disk.
     ///
-    /// This is the durability boundary: `flush()` advances each entry's age to
-    /// the current tick, appends a `Record::Clock` tick marker, and calls
-    /// `sync_all`, after which the appended observation and release records are
-    /// durable across a power loss. Because `insert` only reaches disk via a
-    /// subsequent `flush()`, hosts that need crash durability must call
-    /// `flush()` before shutdown (see the durability contract in the module
-    /// docs).
-    pub fn flush(&mut self) -> Result<(), StoreError> {
-        // Advance every entry's age up to this tick in memory, so each
+    /// This is the durability boundary: `flush(now)` advances each entry's age
+    /// to the caller's `now`, appends a `Record::Clock` tick marker stamped
+    /// with `now`, and calls `sync_all`, after which the appended observation
+    /// and release records are durable across a power loss. Because `insert`
+    /// only reaches disk via a subsequent `flush()`, hosts that need crash
+    /// durability must call `flush()` before shutdown (see the durability
+    /// contract in the module docs).
+    ///
+    /// `now` is the caller's current tick, which the marker records: anchoring
+    /// the reopen fold to when the host actually flushed — rather than the last
+    /// insert tick — keeps ages exact across a reboot.
+    pub fn flush(&mut self, now: Tick) -> Result<(), StoreError> {
+        // Advance every entry's age up to the caller's `now` in memory, so each
         // `entry.obs.age_ms` is the true current age and `stored_at` marks when
         // that age was computed. Ages are recomputed from each entry's own
-        // `stored_at` on the next load (see [`LogStore::open`]), so this keeps
-        // the in-memory representation coherent within this run.
+        // `stored_at` on the next load (see [`LogStore::open`]).
         for entry in self.index.values_mut() {
             entry.obs.age_ms = entry
                 .obs
                 .age_ms
-                .saturating_add(self.now.saturating_sub(entry.stored_at));
-            entry.stored_at = self.now;
+                .saturating_add(now.saturating_sub(entry.stored_at));
+            entry.stored_at = now;
         }
 
-        // Record a clock marker so the load-time age fold has a durable anchor
-        // for the time elapsed up to this flush.
-        let record = Record::Clock { tick: self.now };
+        // Record a clock marker stamped with the caller's `now` so the load-time
+        // age fold anchors to when the host actually flushed — not the last
+        // insert tick (that stale-marker bug was F18).
+        let record = Record::Clock { tick: now };
         write_record(&mut self.file, &record)?;
         self.file.sync_all().map_err(|_| StoreError::Backend)?;
         Ok(())
@@ -703,7 +705,6 @@ impl Store for LogStore {
             // Dedupe: keep the first-stored entry and its age lineage.
             return Ok(false);
         }
-        self.now = now;
         // The id is recomputed from `obs` on load, so it is not stored here.
         let record = Record::Obs {
             obs: Box::new(obs.clone()),
@@ -949,7 +950,7 @@ mod tests {
             assert!(s.insert(a, 1000).unwrap());
             assert!(s.insert(b, 1001).unwrap());
             assert!(s.insert(c, 1002).unwrap());
-            s.flush().unwrap();
+            s.flush(1002).unwrap();
         }
         // Flip a byte in the body of the second data record (Obs(b)).
         corrupt_body(&path, 2);
@@ -980,7 +981,7 @@ mod tests {
             let mut s = LogStore::open(&path, 0).unwrap();
             let a = obs([1; 16], 1, 0, Some(10));
             assert!(s.insert(a, 1000).unwrap());
-            s.flush().unwrap();
+            s.flush(1000).unwrap();
         }
         {
             let mut f = std::fs::OpenOptions::new()
@@ -1042,5 +1043,52 @@ mod tests {
         }
         data[pos + 12] ^= 0xFF; // flip a body byte (body starts after 12-byte header)
         std::fs::write(path, data).unwrap();
+    }
+}
+
+/// Conformance-suite shim for [`LogStore`].
+///
+/// Each suite case opens a brand-new temp log, so a case never inherits
+/// records (or an age-fold state) from a previous one. Run with:
+/// `cargo test -p tines-store --features conformance`.
+#[cfg(all(test, feature = "conformance"))]
+mod conformance_tests {
+    use crate::log::LogStore;
+    use std::path::PathBuf;
+    use tines_core::store_conformance;
+
+    fn unique_path() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let key = n as u128 * 1_000_000 + nanos;
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "tines-log-conformance-{}-{}",
+            std::process::id(),
+            key
+        ));
+        p
+    }
+
+    fn make() -> impl FnMut() -> LogStore {
+        // A fresh file (and thus a fresh age-fold state) on every call.
+        move || LogStore::open(&unique_path(), 0).expect("open fresh log for conformance")
+    }
+
+    #[test]
+    fn log_conforms() {
+        store_conformance::insert_get(make());
+        store_conformance::dedupe(make());
+        store_conformance::age_lineage(make());
+        store_conformance::saturating_ticks(make());
+        store_conformance::release_surviving_get(make());
+        store_conformance::sig_round_trip(make());
+        store_conformance::trim_order(make());
+        store_conformance::no_tombstones(make());
+        store_conformance::idempotent_flush(make());
     }
 }

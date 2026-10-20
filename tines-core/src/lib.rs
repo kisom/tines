@@ -14,6 +14,8 @@ pub mod mem_store;
 pub mod node;
 pub mod observation;
 pub mod store;
+#[cfg(feature = "conformance")]
+pub mod store_conformance;
 pub mod transport;
 mod wire;
 

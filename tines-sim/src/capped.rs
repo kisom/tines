@@ -80,4 +80,41 @@ impl Store for CappedStore {
     fn trim(&mut self, policy: &TrimPolicy, now: Tick) -> usize {
         self.inner.trim(policy, now)
     }
+
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    fn flush(&mut self, now: Tick) -> Result<(), StoreError> {
+        self.inner.flush(now)
+    }
+}
+
+/// Conformance-suite shim for [`CappedStore`].
+///
+/// `CappedStore` is a capacity-bounded wrapper over [`MemStore`], so it
+/// inherits the memory backend's conformance by delegating; this shim proves
+/// the delegation is complete. Run with:
+/// `cargo test -p tines-sim --features conformance`.
+#[cfg(all(test, feature = "conformance"))]
+mod conformance_tests {
+    use super::CappedStore;
+    use tines_core::store_conformance;
+
+    fn make() -> impl FnMut() -> CappedStore {
+        || CappedStore::default()
+    }
+
+    #[test]
+    fn capped_conforms() {
+        store_conformance::insert_get(make());
+        store_conformance::dedupe(make());
+        store_conformance::age_lineage(make());
+        store_conformance::saturating_ticks(make());
+        store_conformance::release_surviving_get(make());
+        store_conformance::sig_round_trip(make());
+        store_conformance::trim_order(make());
+        store_conformance::no_tombstones(make());
+        store_conformance::idempotent_flush(make());
+    }
 }

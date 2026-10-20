@@ -43,7 +43,6 @@ pub enum StoreError {
 /// differ only in age or `observed_at` share an id and dedupe on insert. Ages
 /// are reported as *current* ages, advanced by the elapsed ticks since each
 /// observation was stored.
-#[allow(clippy::len_without_is_empty)]
 pub trait Store {
     /// Insert an observation.
     ///
@@ -61,6 +60,11 @@ pub trait Store {
 
     /// Number of observations currently stored.
     fn len(&self) -> usize;
+
+    /// `true` if the store holds no observations.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     /// Visit every stored observation id.
     fn for_each_id(&self, f: &mut dyn FnMut(&ObservationId));
@@ -85,6 +89,10 @@ pub trait Store {
     /// Releasing an id that is not currently stored is a no-op. The mark
     /// persists for the lifetime of the entry (until it is trimmed); a
     /// re-inserted observation starts un-released.
+    ///
+    /// Release is best-effort and infallible: it never returns an error, and a
+    /// failed release is, at worst, a duplicate custodian on the next
+    /// exchange — never a lost message.
     fn release(&mut self, id: &ObservationId);
 
     /// Returns `true` if the observation with `id` has been released.
@@ -98,6 +106,19 @@ pub trait Store {
     /// the number of observations removed. Trimmed ids are not tombstoned:
     /// re-inserting them later is accepted.
     fn trim(&mut self, policy: &TrimPolicy, now: Tick) -> usize;
+
+    /// Best-effort durability flush, advancing each stored observation's age
+    /// up to the caller's `now` and recording `now` as the flush clock.
+    ///
+    /// Flush must not lose messages, must never resurrect a released message,
+    /// and is infallible by contract: a failed flush is, at worst, a
+    /// duplicate custodian on the next exchange — never a lost message.
+    /// Backends that cannot persist more cheaply default to a no-op that
+    /// simply returns `Ok(())`.
+    fn flush(&mut self, now: Tick) -> Result<(), StoreError> {
+        let _ = now;
+        Ok(())
+    }
 }
 
 /// Current (age-adjusted) age of a stored observation at tick `now`.

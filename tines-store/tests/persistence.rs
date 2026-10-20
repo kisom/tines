@@ -77,7 +77,7 @@ fn reopen_preserves_store() {
         assert!(!s.is_released(&ib));
         s.release(&ib);
         assert!(s.is_released(&ib));
-        s.flush().expect("flush before drop");
+        s.flush(1001).expect("flush before drop");
     }
 
     {
@@ -99,7 +99,7 @@ fn ages_rebase_on_load() {
         let mut s = LogStore::open(&path, 1000).unwrap();
         let o = obs([1; 16], 1, 500, Some(10));
         assert!(s.insert(o, 1000).unwrap());
-        s.flush().unwrap();
+        s.flush(1000).unwrap();
     }
 
     {
@@ -130,7 +130,7 @@ fn ages_rebase_after_nonidle_flush() {
         // non-idle.
         let b = obs([2; 16], 2, 0, Some(20));
         assert!(s.insert(b, 3000).unwrap());
-        s.flush().unwrap();
+        s.flush(3000).unwrap();
     }
 
     {
@@ -162,7 +162,7 @@ fn ages_include_time_to_clock_marker() {
         // earlier (at 1000) and sits idle until the store is dropped.
         let d = obs([2; 16], 2, 0, Some(20));
         assert!(s.insert(d, 3000).unwrap());
-        s.flush().unwrap();
+        s.flush(3000).unwrap();
     }
 
     {
@@ -268,7 +268,7 @@ fn reopen_recovers_from_torn_trailing_record() {
         let b = obs([2; 16], 2, 0, Some(20));
         assert!(s.insert(a, 1000).unwrap());
         assert!(s.insert(b, 1001).unwrap());
-        s.flush().expect("flush before drop");
+        s.flush(1001).expect("flush before drop");
     }
 
     // Simulate a torn append: write a length prefix claiming 64 body bytes but
@@ -305,7 +305,7 @@ fn reopen_recovers_from_oversized_record_length() {
         let mut s = LogStore::open(&path, 0).expect("open fresh store");
         let a = obs([1; 16], 1, 0, Some(10));
         assert!(s.insert(a, 1000).unwrap());
-        s.flush().expect("flush before drop");
+        s.flush(1000).expect("flush before drop");
     }
 
     {
@@ -371,7 +371,7 @@ mod fleet_fixes_f5 {
             assert!(s.insert(a_obs([1; 16], 1), 1000).unwrap());
             assert!(s.insert(a_obs([2; 16], 2), 1001).unwrap());
             assert!(s.insert(a_obs([3; 16], 3), 1002).unwrap());
-            s.flush().expect("flush");
+            s.flush(1002).expect("flush");
         }
         // Corrupt the middle observation (record index 2: Boot, obs-1, obs-2).
         corrupt_record(&path, 2);
@@ -399,7 +399,7 @@ mod fleet_fixes_f5 {
             let mut s = LogStore::open(&path, 0).expect("open fresh");
             assert!(s.insert(a_obs([1; 16], 1), 1000).unwrap());
             assert!(s.insert(a_obs([2; 16], 2), 1001).unwrap());
-            s.flush().expect("flush");
+            s.flush(1001).expect("flush");
         }
         // Append a record header (sync + len = 64) with only 20 of the body bytes.
         {

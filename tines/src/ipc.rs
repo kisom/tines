@@ -221,12 +221,12 @@ where
     }
 
     // On a schedule: trim stale observations and flush the store. Flush is
-    // `LogStore::flush` (not on the `Store` trait), so it's called on the
-    // concrete store through `Node::store_mut` — tines-core keeps no flush hook.
+    // `LogStore::flush`, reached through `Node::flush(now)`, which delegates to
+    // `Store::flush` — the infallible durability boundary.
     if *rounds >= POLL_CAP {
         *rounds = 0;
         node.trim(&TrimPolicy::default(), clock.now());
-        match node.store_mut().flush() {
+        match node.flush(clock.now()) {
             Ok(()) => {}
             Err(e) => eprintln!("tines: store flush failed: {e:?}"),
         }
