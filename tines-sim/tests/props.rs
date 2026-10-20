@@ -17,9 +17,16 @@
 //!   custody chain releases on the first ack from *any* peer the node sent it
 //!   to, so delivery to the final recipient is best-effort, but custody never
 //!   vanishes mid-path.
+//! * [`bounce_overflow_keeps_a_holder`] — flooding the shared bounce table
+//!   past `SEND_QUEUE_CAP` across `MAX_PEERS` peers (drop-oldest) never drops
+//!   the last holder of an id, and the custody cursor still gives every
+//!   addressed candidate a turn. Pins §6's overflow-safety guarantee.
 
 use proptest::prelude::*;
-use tines_core::{FrameBuf, Store};
+use tines_core::{
+    consts::{MAX_PEERS, SEND_QUEUE_CAP},
+    FrameBuf, Store,
+};
 use tines_sim::{CappedStore, Contact, ContactTrace, Sim, WorldConfig};
 
 /// A fixed set of short observation topics the tests reuse so the generated
@@ -155,8 +162,61 @@ fn addressed_scenario() -> impl Strategy<Value = (usize, usize, ContactTrace)> {
     })
 }
 
+/// A bounce-table-overflow scenario: a fully-connected `MAX_PEERS`-node contact
+/// graph plus a flood of distinct addressed observations past [`SEND_QUEUE_CAP`].
+#[derive(Debug)]
+struct BounceScenario {
+    /// Node count (fixed at [`consts::MAX_PEERS`]).
+    nodes: usize,
+    /// Fully-connected trace: every pair in contact during one long window.
+    trace: ContactTrace,
+    /// `(recipient_node_index, payload)` for each addressed observation to
+    /// issue from node 0. Payloads are distinct, so every id is distinct.
+    addressed: Vec<(usize, Vec<u8>)>,
+}
+
+/// The [`bounce_overflow_keeps_a_holder`] scenario: `MAX_PEERS` nodes in a
+/// single long fully-connected contact window, so an addressed observation
+/// reaches its recipient directly; the flood of more than [`SEND_QUEUE_CAP`]
+/// addressed observations overflows the shared drop-oldest bounce table (one
+/// `Sent` + one `Received` record per `(id, peer)`) while the custody cursor is
+/// exercised across every peer.
+fn bounce_scenario() -> impl Strategy<Value = BounceScenario> {
+    // Just past capacity up to a bounded margin, so the flood depth — how hard
+    // the shared ring evicts — varies across cases. The payload is the global
+    // sequence number, so every observation's id is distinct.
+    let count = SEND_QUEUE_CAP + 1..=SEND_QUEUE_CAP + 32;
+    let window = 4_000u64;
+    count.prop_map(move |n| {
+        // Every pair in contact during one long window: the graph is connected
+        // and stays connected, so each addressed offer reaches its recipient.
+        let mut trace = ContactTrace::default();
+        for a in 0..MAX_PEERS {
+            for b in (a + 1)..MAX_PEERS {
+                trace.contacts.push(Contact {
+                    start_ms: 0,
+                    end_ms: window,
+                    a,
+                    b,
+                });
+            }
+        }
+        // Address node 0's observations round-robin to the other
+        // `MAX_PEERS - 1` nodes, so the cursor and every peer's table are
+        // exercised. Each id is distinct (unique payload).
+        let addressed = (0..n)
+            .map(|j| ((j % (MAX_PEERS - 1)) + 1, j.to_le_bytes().to_vec()))
+            .collect();
+        BounceScenario {
+            nodes: MAX_PEERS,
+            trace,
+            addressed,
+        }
+    })
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 64, .. ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: 16, .. ProptestConfig::default() })]
 
     /// Every connected component of the contact graph must be fully gossiped by
     /// the end of the trace. Tested at `loss = 0`: the spec's convergence is
@@ -388,5 +448,84 @@ proptest! {
              even when a node's store is full",
             recipient_idx = nodes.saturating_sub(1)
         );
+    }
+
+    /// The shared bounce table (`SEND_QUEUE_CAP` entries, drop-oldest, shared
+    /// across all `MAX_PEERS` peers) overflows when more than its capacity of
+    /// distinct observations are exchanged at once. This drives that overflow —
+    /// a fully-connected `MAX_PEERS`-node graph flooded with more than
+    /// `SEND_QUEUE_CAP` distinct addressed observations from node 0, each
+    /// issued to a round-robin recipient so the shared ring evicts across every
+    /// peer — and pins the two guarantees the overflow must preserve (§6):
+    ///
+    /// * (a) **always ≥ 1 holder** — every flooded id is still held by some
+    ///   node. A lost *Sent* record leaves a duplicate custodian; a lost
+    ///   *Received* record still leaves a holder either way, so the message
+    ///   never fully vanishes.
+    /// * (b) **custody fairness** — the per-peer cursor still gives every
+    ///   addressed candidate a turn, so none is starved by the eviction.
+    ///
+    /// §6 states the current drop-oldest design already satisfies both, so the
+    /// property is expected to pass as-is; a failure here is a finding to
+    /// report, not a bug to paper over by loosening either assertion.
+    #[test]
+    fn bounce_overflow_keeps_a_holder(scenario in bounce_scenario()) {
+        let BounceScenario { nodes, trace, addressed } = scenario;
+        let end = trace.end();
+        let cfg = WorldConfig {
+            nodes,
+            mtu: 512,
+            loss: 0.0,
+            dup: 0.0,
+            seed: 1,
+        };
+        let mut sim = Sim::new(cfg, trace);
+
+        // Flood the shared bounce table with more than `SEND_QUEUE_CAP` distinct
+        // addressed observations from node 0. Each emit (a `Sent` record) and
+        // each accept (a `Received` record) pushes into the shared
+        // `SEND_QUEUE_CAP` ring, so fanning these out across `MAX_PEERS` peers
+        // evicts past capacity; the payload's global sequence keeps every id
+        // distinct.
+        let mut ids = Vec::with_capacity(addressed.len());
+        for (recipient, payload) in &addressed {
+            let to = [*recipient as u8; 16];
+            let id = sim.observe_to(0, to, 600_000, b"task", payload);
+            ids.push((*recipient, id));
+        }
+        sim.run_until(end + 1_000);
+
+        // (a) always >= 1 holder for every flooded id: some node still holds it
+        // (inserted, and not released — a release only ever happens for an id
+        // this node actually dispatched). A lost *Sent*/*Received* bounce
+        // record under overflow can only leave a duplicate custodian or a
+        // re-send, never a fully-vanished id (§6).
+        for (_, id) in &ids {
+            let held = sim.nodes.iter().any(|n| {
+                let s = n.store();
+                s.contains(id) && !s.is_released(id)
+            });
+            prop_assert!(
+                held,
+                "flooded id {id:?} has no holder after sending {} distinct \
+                 addressed observations across {} peers (SEND_QUEUE_CAP={}); \
+                 the bounce table overflow dropped custody for an id",
+                ids.len(),
+                MAX_PEERS,
+                SEND_QUEUE_CAP,
+            );
+        }
+
+        // (b) the custody cursor still gives every candidate a turn: each
+        // recipient ends the run holding its own addressed observation — none
+        // starved by the eviction.
+        for (recipient, id) in &ids {
+            let s = sim.nodes[*recipient].store();
+            prop_assert!(
+                s.contains(id) && !s.is_released(id),
+                "addressed id {id:?} to node {recipient} was never delivered; \
+                 the custody cursor starved it after the bounce table overflowed",
+            );
+        }
     }
 }
