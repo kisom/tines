@@ -43,6 +43,11 @@ Recommended order: fix F1–F5 in the fleet milestone (they're bugs), harden
 the hosts (F10–F12) before any robot leaves the lab, and settle the 1.1
 threat questions (§8) before designing signing.
 
+**Resolved 2026-10-19** (the fleet-fixes milestone, through `7df9f41`):
+F1 `2738de4` · F2 `d98895b` · F3 `7df9f41` · F4 `848721a` ·
+F5 `4718b6f`+`24b5a78` · F17 `6e2dc6f`. F6 and F8–F14 remain — F6/F8/F9/F13
+are in the 1.0 spec §10; the rest in the host-hardening spec.
+
 ## 2. System and trust boundaries
 
 ```mermaid
@@ -141,6 +146,7 @@ of a message the receiver didn't keep.
   `Ok(_)` (and, for duplicates, the copy isn't released). Add a sim/unit
   test with a store that returns `Full`. This was the fleet spec's own rule
   ("B never acks a … store-full receive").
+- **Fixed:** `2738de4`.
 
 ### F2 — The standalone service never runs the exchange (High, A0)
 
@@ -154,6 +160,8 @@ for a poll loop, `docs/superpowers/plans/2026-10-18-tines-fleet-deployment.md:20
   connected. Mostly a functional bug.
 - **Fix:** a poll loop (with `trim` on a schedule and `flush` after
   releases), off the IPC thread or interleaved with it.
+- **Fixed:** `d98895b` (runs inline in `serve` — the node isn't `Send`, so no
+  separate thread).
 
 ### F3 — tines-bt: no identity binding, no listener, no framing (High, A0/A1)
 
@@ -184,6 +192,8 @@ for a poll loop, `docs/superpowers/plans/2026-10-18-tines-fleet-deployment.md:20
 - Decode the advertised NodeId and bind the connection to it.
 - Drop frames whose `from` differs from the bound NodeId.
 - Emit `Contact`/`Lost`.
+- **Fixed:** `7df9f41` (SeqPacket framing, advertise+scan roles, UUID-checked
+  NodeId binding, `frame_sender` from-check, `Contact`/`Lost`, multi-peer).
 
 **Later (1.1):** authenticate the link (spec §2b). Advertised NodeIds are
 unauthenticated, so the binding only becomes meaningful once there's a
@@ -211,6 +221,7 @@ handshake.
   `Node` from it.
 - Flush on release and on a timer.
 - Add a host-level restart test.
+- **Fixed:** `848721a`.
 
 ### F5 — Log recovery can destroy good data (Medium, A0/A5)
 
@@ -240,6 +251,9 @@ handshake.
 - Take an exclusive `flock` on open.
 - Create the file with mode `0600`.
 - Recompute ids on load.
+- **Fixed:** `4718b6f` + `24b5a78` (format v1: header, per-record CRC-32C,
+  sync marker + skip-corrupt recovery, torn-tail truncation + dir fsync,
+  `flock`, 0600, recomputed ids).
 
 ### F6 — Peer identity is whatever the last frame said (Medium; High combined with F3)
 
@@ -417,6 +431,7 @@ full preimage, not the id.
 
 **Fix:** use a monotonic millisecond clock (`Instant` since process start)
 everywhere in the host, and open the store with the same clock.
+- **Fixed:** `6e2dc6f`.
 
 ## 7. Threats by STRIDE, mapped to findings
 
