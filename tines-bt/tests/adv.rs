@@ -73,55 +73,70 @@ fn advertising_payload_roundtrips_node_id() {
     assert_eq!(adv::decode_node_id(&p), Some(node));
 }
 
+/// A framed envelope: one tag byte, then the 16-byte `from`. This is the layout
+/// `frame_sender` peeks — the transport delivers this whole envelope to core
+/// (which decodes it), so the `from` must be stamped with the sender's id.
+fn frame(from: NodeId, payload: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(1 + 16 + payload.len());
+    b.push(0u8); // version/tag byte
+    b.extend_from_slice(&from);
+    b.extend_from_slice(payload);
+    b
+}
+
 #[test]
 fn from_mismatch_is_dropped() {
     let me: NodeId = [1u8; 16];
-    let peer: NodeId = [2u8; 16]; // the connection's advertised NodeId
-    let spoof: NodeId = [9u8; 16]; // claimed source that does not match `peer`
+    let peer: NodeId = [2u8; 16]; // the connection's advertised NodeId (bound Addr)
+    let spoof: NodeId = [9u8; 16]; // a declared sender that does not match `peer`
 
-    // A single spoofed frame: the transport drops it and emits nothing.
-    let mut radio = MockRadio::new(23);
-    radio.push(RadioEvent::Data {
-        from: spoof,
-        data: vec![0xCA, 0xFE],
-    });
-    let mut t = BtTransport::new(me, peer, radio);
-    assert_eq!(
-        t.poll(),
-        None,
-        "a frame from a non-advertised id yields no Event::Frame"
-    );
-
-    // A legitimate frame from `peer` is delivered unchanged.
+    // A legitimate frame from `peer` (envelope stamped with `peer`) is delivered
+    // unchanged, envelope included — core decodes the whole thing.
     let mut good = MockRadio::new(23);
     good.push(RadioEvent::Data {
         from: peer,
-        data: vec![0x01, 0x02],
+        data: frame(peer, &[0x01, 0x02]),
     });
     let mut t = BtTransport::new(me, peer, good);
     match t.poll() {
         Some(Event::Frame(from, data)) => {
             assert_eq!(from, peer);
-            assert_eq!(&data[..], &[0x01, 0x02]);
+            assert_eq!(&data[..], &frame(peer, &[0x01, 0x02])[..]);
         }
         other => panic!("expected a Frame from {peer:?}, got {other:?}"),
     }
 
-    // And a spoofed frame sitting before a legit one is simply skipped.
+    // A frame whose envelope `from` (peeked by frame_sender) is `spoof`, not the
+    // bound peer, is dropped by the from-check — even though the event claims the
+    // bound peer as its source.
+    let mut mismatched = MockRadio::new(23);
+    mismatched.push(RadioEvent::Data {
+        from: peer,
+        data: frame(spoof, &[0xCA, 0xFE]),
+    });
+    let mut t = BtTransport::new(me, peer, mismatched);
+    assert_eq!(
+        t.poll(),
+        None,
+        "a frame whose decoded `from` differs from the bound Addr is dropped"
+    );
+
+    // And a mismatched frame sitting before a legit one is simply skipped; the
+    // legit one is delivered.
     let mut mixed = MockRadio::new(23);
     mixed.push(RadioEvent::Data {
-        from: spoof,
-        data: vec![0xFF],
+        from: peer,
+        data: frame(spoof, &[0xFF]),
     });
     mixed.push(RadioEvent::Data {
         from: peer,
-        data: vec![0x03],
+        data: frame(peer, &[0x03]),
     });
     let mut t = BtTransport::new(me, peer, mixed);
     match t.poll() {
         Some(Event::Frame(from, data)) => {
             assert_eq!(from, peer);
-            assert_eq!(&data[..], &[0x03]);
+            assert_eq!(&data[..], &frame(peer, &[0x03])[..]);
         }
         other => panic!("expected the Frame from {peer:?}, got {other:?}"),
     }

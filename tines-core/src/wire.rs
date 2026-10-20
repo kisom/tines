@@ -69,6 +69,34 @@ impl Frame {
     }
 }
 
+/// Peek the [`NodeId`] a wire frame was sent by, without fully decoding it.
+///
+/// A [`Frame`] envelope is an externally-tagged postcard enum: one tag byte at
+/// index `0`, then its fields in declaration order. `from` is the first field,
+/// so it occupies the 16 bytes at `bytes[1..17]`. This reads those 16 bytes and
+/// returns `None` for anything shorter than a full envelope (so a truncated or
+/// non-frame payload reports no sender rather than panicking).
+///
+/// The leading byte is skipped on purpose: it is the externally-tagged variant
+/// tag today and the reserved version-byte slot in 1.0, so reading `from` from
+/// a fixed offset keeps this accessor correct when 1.0 prepends a version byte
+/// ahead of the envelope.
+///
+/// `tines-bt` uses this to enforce that a frame's declared sender matches the
+/// NodeId advertised by its transport connection (the from-check), without
+/// importing the private `Frame` layout.
+pub fn frame_sender(bytes: &[u8]) -> Option<NodeId> {
+    // The envelope is one tag byte then the `from` field; `NodeId` is 16 bytes.
+    const ENVELOPE_OVERHEAD: usize = 1;
+    const NODE_ID_BYTES: usize = core::mem::size_of::<NodeId>();
+    if bytes.len() < ENVELOPE_OVERHEAD + NODE_ID_BYTES {
+        return None;
+    }
+    let mut from = [0u8; NODE_ID_BYTES];
+    from.copy_from_slice(&bytes[ENVELOPE_OVERHEAD..ENVELOPE_OVERHEAD + NODE_ID_BYTES]);
+    Some(from)
+}
+
 /// Errors produced while (de)serializing frames on the wire.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WireError {
@@ -227,6 +255,52 @@ mod tests {
             bits: Vec::from_slice(&[0xAAu8; consts::SUMMARY_BYTES]).unwrap(),
         };
         assert_eq!(Frame::decode(&GOLDEN).unwrap(), expected);
+    }
+
+    #[test]
+    fn frame_sender_peeks_from_field() {
+        // The golden Summary encodes `from: [3;16]` starting at byte 1.
+        const GOLDEN: [u8; 200] = [
+            0u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8,
+            239u8, 253u8, 182u8, 245u8, 13u8, 128u8, 4u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
+            170u8, 170u8,
+        ];
+        assert_eq!(frame_sender(&GOLDEN), Some([3u8; 16]));
+    }
+
+    #[test]
+    fn frame_sender_reads_from_fixed_offset_not_just_the_start() {
+        // The leading byte (the externally-tagged variant tag) is skipped, so a
+        // payload whose first byte is not the sender must still yield the `from`
+        // recorded at byte 1.
+        let bytes = {
+            let mut b = [0u8; 32];
+            b[0] = 0xFF; // tag/version slot
+            b[1..17].copy_from_slice(&[9u8; 16]); // from
+            b
+        };
+        assert_eq!(frame_sender(&bytes), Some([9u8; 16]));
+    }
+
+    #[test]
+    fn frame_sender_truncated_returns_none() {
+        assert_eq!(frame_sender(&[0u8; 0]), None);
+        assert_eq!(frame_sender(&[0u8; 16]), None); // tag + from missing
+        assert_eq!(frame_sender(&[0u8; 17]), Some([0u8; 16])); // exactly tag + from
     }
 
     #[test]

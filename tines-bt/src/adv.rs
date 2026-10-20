@@ -10,7 +10,11 @@
 //! of the service-data record is exactly what [`decode_node_id`] does — the
 //! invariant the round-trip test pins.
 
+use std::collections::{BTreeSet, HashMap};
+
 use tines_core::observation::NodeId;
+
+use bluer::{Uuid, UuidExt};
 
 /// The LE flags byte carried in the flags AD record: LE General Available and
 /// BR/EDR not supported (`0x06`).
@@ -107,6 +111,34 @@ pub fn decode_node_id(payload: &[u8]) -> Option<NodeId> {
         i = end;
     }
     None
+}
+
+/// Decode a [`NodeId`] advertised by a tines advertiser.
+///
+/// Returns `None` if the advertisement does not carry the tines service UUID,
+/// if no [`NodeId`] can be parsed, or if the advertiser is this local
+/// [`NodeId`] (a node advertises *and* scans, so it never dials itself).
+///
+/// Unlike [`decode_node_id`], the 2-byte service UUID is *verified* here, so a
+/// frame from a non-tines broadcaster is rejected.
+///
+/// A non-empty `allow` narrows decoding to a whitelist of [`NodeId`]s; an empty
+/// `allow` accepts any tines advertiser (this is the default once the
+/// transport binds by NodeId).
+pub fn decode_ad_node_id(
+    service_data: &HashMap<Uuid, Vec<u8>>,
+    me: NodeId,
+    allow: &BTreeSet<NodeId>,
+) -> Option<NodeId> {
+    let advertised = service_data.get(&Uuid::from_u16(SERVICE_UUID))?;
+    let node: NodeId = advertised.as_slice().try_into().ok()?;
+    if node == me {
+        return None;
+    }
+    if !allow.is_empty() && !allow.contains(&node) {
+        return None;
+    }
+    Some(node)
 }
 
 #[cfg(test)]

@@ -18,4 +18,6 @@ mod transport;
 pub use adv::{
     advertise, decode_node_id, ADVERTISING_BUFFER_LEN, ADV_FLAGS, NODE_ID_LEN, SERVICE_UUID,
 };
-pub use transport::{is_central, BluerRadio, BtTransport, Radio, RadioError, RadioEvent};
+pub use transport::{
+    is_central, resolve_bound, BluerRadio, BtTransport, Radio, RadioError, RadioEvent,
+};
