@@ -15,16 +15,17 @@
 //! ```
 //!
 //! Each frame is one of the [`Request`] or [`Response`] enums, tagged by a
-//! `"kind"` field (serde externally-tagged). Frames are capped at 1 MiB; a
-//! longer frame is treated as a malformed request and the connection is
-//! dropped. There is no framing negotiation — the first byte after the length
-//! prefix is `"`.
+//! `"kind"` field (serde internally tagged). Frames are capped at 1 MiB. A
+//! longer length prefix gets an error response, but its body isn't consumed,
+//! so the connection is out of sync afterwards; the host-hardening spec makes
+//! it close the connection instead (`THREAT_MODEL.md` F11). There is no
+//! framing negotiation: the first byte after the length prefix is `{`.
 //!
 //! Observations are content-addressed, so IDs are exchanged as lowercase hex
 //! (the hex form of the 16-byte `ObservationId`). Topics and payloads are
 //! passed to `observe` the same way: as hex.
 //!
-//! # Sequence numbers
+//! # Clock
 //!
 //! `now` is the tines tick passed to `observe`/`belief`. The service reads it
 //! from its own monotonic millisecond [`HostClock`] (an `Instant` captured at

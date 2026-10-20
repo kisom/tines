@@ -3,13 +3,16 @@
 - **Assessed:** `master` at `3b1a644` (tines-core / tines-store / tines-bt /
   tines-ros2 / tines 0.3.0, fleet-deployment milestone mostly landed)
 - **Date:** 2026-10-19
-- **Status:** first version. This is a living document, not a spec: update
-  it when the code or the trust assumptions change.
+- **Updated:** 2026-10-20 at `89041ea`, after the fleet fixes landed. The
+  findings keep their original text; each fixed one ends with a **Fixed**
+  or **Partly fixed** line, and §6 adds F18, found in the re-check.
+- **Status:** living document.It's not a spec: update it when the code or the
+  trust assumptions change.
 - **Related:** the 1.0 spec (`docs/superpowers/specs/2026-10-18-tines-1-0-design.md`),
   especially §2a (signature slot) and §2b (age and the 1.1 threat model).
 
 Every finding below was checked against the source; `file:line` references
-are to `3b1a644`.
+are to `3b1a644` unless a line says otherwise.
 
 ## 1. Summary
 
@@ -43,10 +46,22 @@ Recommended order: fix F1–F5 in the fleet milestone (they're bugs), harden
 the hosts (F10–F12) before any robot leaves the lab, and settle the 1.1
 threat questions (§8) before designing signing.
 
-**Resolved 2026-10-19** (the fleet-fixes milestone, through `7df9f41`):
-F1 `2738de4` · F2 `d98895b` · F3 `7df9f41` · F4 `848721a` ·
-F5 `4718b6f`+`24b5a78` · F17 `6e2dc6f`. F6 and F8–F14 remain — F6/F8/F9/F13
-are in the 1.0 spec §10; the rest in the host-hardening spec.
+**Fleet fixes, 2026-10-19** (through `89041ea`):
+
+| # | Status | Commit |
+|---|---|---|
+| F1 | Fixed | `2738de4` |
+| F2 | Fixed | `d98895b` |
+| F3 | **Partly fixed**: framing, roles, binding and `Contact`/`Lost` are in, but the host is still limited to one configured peer (see F3) | `7df9f41` |
+| F4 | **Partly fixed**: seqs and releases are durable, but flushing isn't on a schedule (F18) | `848721a` |
+| F5 | Fixed | `4718b6f`, `24b5a78` |
+| F17 | Fixed | `6e2dc6f` |
+
+Still open:
+- F6, F8, F9 and F13: the 1.0 spec §10.
+- F10–F12: the host-hardening spec.
+- F7 and F14: 1.1.
+- F18 (new) and the rest of F3: host work, not yet specced (§10).
 
 ## 2. System and trust boundaries
 
@@ -72,9 +87,9 @@ flowchart LR
 
 | Boundary | What crosses it | Who can be on the other side today |
 |---|---|---|
-| **B1 radio** | Advertisements (NodeId in clear), L2CAP frames: Summary, Obs, Frag, Ack | Any BLE device in range. There's no pairing, encryption or allowlist. |
+| **B1 radio** | Advertisements (NodeId in clear), L2CAP frames: Summary, Obs, Frag, Ack | Any BLE device in range. There's no pairing or encryption. Since `7df9f41` a connection is bound to an advertised NodeId on an allowlist, but advertisements are unauthenticated, so anyone can advertise an allowed NodeId. |
 | **B2 local IPC / ROS2** | Observations in, beliefs/payloads and events out | Any local user who can reach the socket (permissions come from umask); any participant on the ROS2 DDS domain (no SROS2). |
-| **B3 storage** | The observation log, released set, `next_seq` | Anyone with write access to the log file (mode from umask). |
+| **B3 storage** | The observation log: observations, releases, the boot counter | Anyone with write access to the log file. Since `4718b6f` the file is created `0600` (its directory `0700` when the store creates it) and locked against a second opener. |
 | Core ↔ transport | `Addr`, raw frames | Trusted code. Core relies on the transport to bind `Addr` to a NodeId (AGENTS.md: "core never maps Addr to NodeId"). |
 
 ## 3. Assets
@@ -110,16 +125,19 @@ in software), compromise of BlueZ/the kernel, and supply chain.
 
 ## 5. Security properties: claimed vs actual
 
-| Property | Claimed (specs/AGENTS.md) | Actual at `3b1a644` |
-|---|---|---|
-| No panic on untrusted input (core) | Hard constraint | **Holds** as far as reviewed: saturating age arithmetic, guarded shifts and indexing, `expect`s unreachable from wire input (exchange.rs:437, 1092; frag.rs:147). The sim's `garbage_frames_never_panic` covers random bytes only (§9). |
-| Malformed frames dropped | Hard constraint | **Holds** in core (wire.rs:64-69). The 1.0 spec adds reporting. |
-| Bounded memory in core | Fixed-capacity buffers | **Holds** for the exchange (§6 table). **Doesn't hold for the system**: MemStore and LogStore are unbounded without `trim`, and no host calls `trim` (F10). |
-| Custody: ≥ 1 holder (no carrier failure) | Fleet spec, sim property | **Breaks without an attacker** when a store is full (F1). Breaks trivially under A1 (F7). |
-| Frames bound to the advertised NodeId | Fleet spec ("frames whose `from` differs … are dropped at the transport") | **Doesn't hold** (F3, F6). |
-| Released messages not re-forwarded after reboot | Fleet spec | **Doesn't hold**: release flags are never flushed (F4). Safe direction (duplicate custodian), but wasteful. |
-| `next_seq` persisted across reboots | Core contract | **Doesn't hold** in either host (F4). |
-| Age continues across reboot | Fleet spec | Partly. Hosts open the store at tick 0, and the service's tick is wall-clock *seconds* (F17). |
+The third column is the original assessment. The fourth is the state after
+the fleet fixes.
+
+| Property | Claimed (specs/AGENTS.md) | Actual at `3b1a644` | At `89041ea` |
+|---|---|---|---|
+| No panic on untrusted input (core) | Hard constraint | **Holds** as far as reviewed: saturating age arithmetic, guarded shifts and indexing, `expect`s unreachable from wire input (exchange.rs:437, 1092; frag.rs:147). The sim's `garbage_frames_never_panic` covers random bytes only (§9). | Unchanged. |
+| Malformed frames dropped | Hard constraint | **Holds** in core (wire.rs:64-69). The 1.0 spec adds reporting. | Unchanged; 1.0 adds reporting. |
+| Bounded memory in core | Fixed-capacity buffers | **Holds** for the exchange (§6 table). **Doesn't hold for the system**: MemStore and LogStore are unbounded without `trim`, and no host calls `trim` (F10). | Unchanged in practice: the service calls `trim` with an empty default policy, tines-ros2 never does (F10, F18). |
+| Custody: ≥ 1 holder (no carrier failure) | Fleet spec, sim property | **Breaks without an attacker** when a store is full (F1). Breaks trivially under A1 (F7). | Holds without an attacker (F1 fixed, with a sim property). Still breaks under A1 (F7). |
+| Frames bound to the advertised NodeId | Fleet spec ("frames whose `from` differs … are dropped at the transport") | **Doesn't hold** (F3, F6). | **Holds at the transport** for tines-bt (F3), against unauthenticated adverts. Core still re-reads `from` per frame (F6). |
+| Released messages not re-forwarded after reboot | Fleet spec | **Doesn't hold**: release flags are never flushed (F4). Safe direction (duplicate custodian), but wasteful. | **Holds**: `Release` records are appended at once (not fsynced until the next flush, so a power cut can still lose one). |
+| `next_seq` persisted across reboots | Core contract | **Doesn't hold** in either host (F4). | **Holds**: a persisted boot counter seeds `first_seq` in both hosts. |
+| Age continues across reboot | Fleet spec | Partly. Hosts open the store at tick 0, and the service's tick is wall-clock *seconds* (F17). | Partly. Monotonic ms (F17 fixed) and clock markers fold age across a restart, but only up to the last flush, which may be long ago or never (F18). |
 
 ## 6. Findings
 
@@ -192,8 +210,20 @@ for a poll loop, `docs/superpowers/plans/2026-10-18-tines-fleet-deployment.md:20
 - Decode the advertised NodeId and bind the connection to it.
 - Drop frames whose `from` differs from the bound NodeId.
 - Emit `Contact`/`Lost`.
-- **Fixed:** `7df9f41` (SeqPacket framing, advertise+scan roles, UUID-checked
-  NodeId binding, `frame_sender` from-check, `Contact`/`Lost`, multi-peer).
+- **Partly fixed:** `7df9f41` (SeqPacket framing, advertise+scan roles,
+  UUID-checked NodeId binding, `frame_sender` from-check, `Contact`/`Lost`).
+  Re-checked at `89041ea`:
+  - The fleet-fixes spec's allowlist (empty = any tines advertiser) and
+    multi-peer support aren't reachable. The service config still takes one
+    required `peer`. `BluerRadio::new` builds the allowlist as exactly
+    `{peer}`, and `BtTransport::poll` drops every frame and event whose
+    address isn't that peer (tines-bt/src/transport.rs:186-202, 274). The
+    radio loop can hold several connections, but only one is ever used, so
+    each robot exchanges with one configured partner.
+  - Inbound and outbound channels are still unbounded (F10).
+  - No BLE security level is requested (unchanged; 1.1).
+  - No two-radio check of the SeqPacket path is recorded yet.
+    tines-bt/README.md gives the procedure but no result.
 
 **Later (1.1):** authenticate the link (spec §2b). Advertised NodeIds are
 unauthenticated, so the binding only becomes meaningful once there's a
@@ -221,7 +251,9 @@ handshake.
   `Node` from it.
 - Flush on release and on a timer.
 - Add a host-level restart test.
-- **Fixed:** `848721a`.
+- **Partly fixed:** `848721a`. The boot counter seeds `first_seq` in both
+  hosts, and releases are appended as records immediately. Flushing isn't
+  on a schedule, though; see F18.
 
 ### F5 — Log recovery can destroy good data (Medium, A0/A5)
 
@@ -290,6 +322,8 @@ custody of every addressed message in range and drop it.
 frame, and removed only on `Lost` (exchange.rs:674-708). A full table drops
 all frames from new addresses. There's no idle eviction. With BLE never
 emitting `Lost` (F3), entries effectively never leave on real hardware.
+(Since `7df9f41` tines-bt emits `Lost`, so honest peers leave; spoofed
+addresses on other transports still can't be evicted.)
 Eight spoofed addresses lock a robot out of exchange until restart.
 
 **Fix:** idle-timeout eviction in core (a local constant), and real
@@ -315,6 +349,10 @@ re-queues what was already sent.
 - `MemStore` and `LogStore` are bounded only by `Node::trim`. Neither host
   calls it. The log also never compacts (log.rs: append-only, and every
   flush appends the full released list).
+  - *At `89041ea`:* the service calls `trim` with `TrimPolicy::default()`,
+    which removes nothing; tines-ros2 never calls it. Releases are now one
+    small record each rather than a growing list, but the log still never
+    compacts.
 - Unbounded channels: tines-bt's inbound and outbound `mpsc`
   (transport.rs:207-208), and tines-ros2's inbound `mpsc` (node.rs:152).
 - The IPC server allocates up to 1 MiB per request frame.
@@ -433,6 +471,37 @@ full preimage, not the id.
 everywhere in the host, and open the store with the same clock.
 - **Fixed:** `6e2dc6f`.
 
+### F18 — Hosts don't flush on a schedule (Medium, A0)
+
+*Found in the re-check at `89041ea`.* `LogStore::flush` writes the clock
+marker that carries age across a restart, and it's the only `fsync` for
+inserts and trims (log.rs module docs, "Durability contract").
+
+- The service runs `trim` and `flush` only after `POLL_CAP` (64) polls that
+  each stored something new (tines/src/ipc.rs:199-217). The counter
+  advances only while observations arrive, so a robot that is mostly
+  offline, the normal case, may never flush.
+- tines-ros2 never calls `flush` or `trim`.
+- Even when it runs, `flush` writes `LogStore`'s own tick as the clock
+  marker, and that tick advances only when something new is inserted
+  (tines-store/src/log.rs:698). On a quiet robot the marker is stale, and
+  the time since the last insert is lost.
+- **Effect:**
+  - After a restart, every stored observation's age is folded only up to the
+    last clock marker. Time since that marker is lost, so facts look fresher
+    than they are and addressed messages outlive their `lifetime_ms`, by up
+    to the whole previous uptime. That is F17's effect again, by another
+    route.
+  - On a power cut, observations inserted since the last flush can be lost.
+    That includes a robot's own observations, though their seqs aren't
+    reused.
+- **Fix:** give flush the caller's `now` (proposed for 1.0: `Store::flush(now)`
+  and `Node::flush(now)`, replacing `Node::store_mut`), and
+  flush and trim on a wall-time schedule (every
+  `flush_interval_ms`, from the host's monotonic clock) in both hosts, and
+  on clean shutdown. The fleet-fixes spec asked for "a scheduled flush". The
+  trim defaults belong to host hardening (F10).
+
 ## 7. Threats by STRIDE, mapped to findings
 
 | | Threat | Status today | Findings | Planned mitigation |
@@ -477,32 +546,44 @@ The sim covers honest-node custody properties and random garbage frames
 
 - well-formed malicious frames: forged acks, spoofed `from`/`observer`,
   NodeId changes mid-contact;
-- a store returning `Full` (F1);
+- ~~a store returning `Full` (F1)~~ (covered since `2738de4`: a unit test
+  and the full-store custody sim property);
 - summary floods and peer-table exhaustion (F8, F9);
 - reassembly abuse;
-- `LogStore` corruption in the middle, an oversized `Meta`, concurrent
-  openers, a full disk, and restart and seq continuity (F4, F5);
-- anything in the hosts: IPC abuse, ROS2 injection and self-echo
-  (F11, F12).
+- a full disk (`LogStore` corruption in the middle, oversized records,
+  concurrent openers, and restart and seq continuity are covered since
+  `848721a` and `4718b6f`);
+- a quiet host restarting without having flushed (F18);
+- most of the hosts: IPC abuse, ROS2 injection and self-echo (F11, F12).
+  The service now has a two-instance exchange test (`d98895b`), and
+  tines-bt has mock-radio tests for framing, binding and contact events
+  (`7df9f41`).
 
 The 1.0 fuzz harness (spec §7) should take an *adversarial peer* mode, not
 just random bytes: structured frames with chosen ids and identities.
 
 ## 10. Where each finding is being fixed
 
-| Findings | Where | Spec |
-|---|---|---|
-| F1–F5, F17 | Fleet milestone (M3), now | `docs/superpowers/specs/2026-10-19-tines-fleet-fixes.md` |
-| F10–F12 | Host hardening, before a robot leaves the lab | `docs/superpowers/specs/2026-10-19-tines-host-hardening.md` |
-| F6, F8, F9, F13 | tines-core 1.0 | `docs/superpowers/specs/2026-10-18-tines-1-0-design.md` §10 |
-| F7, F14, §8 | 1.1 (threat model, link authentication, signing) | 1.0 spec §2a, §2b |
-| F15, F16 | Accepted for now | — |
+| Findings | Where | Spec | Status |
+|---|---|---|---|
+| F1, F2, F5, F17 | Fleet milestone (M3) | `docs/superpowers/specs/2026-10-19-tines-fleet-fixes.md` | Fixed (§1) |
+| F3, F4 | Fleet milestone (M3) | same | Partly fixed; the rest has no spec yet |
+| F18 | Host work, with or before host hardening | none yet | Open |
+| F10–F12 | Host hardening, before a robot leaves the lab | `docs/superpowers/specs/2026-10-19-tines-host-hardening.md` | Open |
+| F6, F8, F9, F13 | tines-core 1.0 | `docs/superpowers/specs/2026-10-18-tines-1-0-design.md` §10 | Open |
+| F7, F14, §8 | 1.1 (threat model, link authentication, signing) | 1.0 spec §2a, §2b | Open |
+| F15, F16 | Accepted for now | — | — |
 
 Mark each finding fixed here, with its commit, when it lands.
 
+The remaining F3 work (one configured peer) and F18 are host-only. Neither
+blocks the tines-core 1.0 work, but both block a fleet of more than two
+robots.
+
 ## 11. Recommendations, in order
 
-1. **Fleet milestone bugs:**
+1. **Fleet milestone bugs** (done 2026-10-19, except the F3 and F4
+   remainders):
    - F1 (ack only what was stored).
    - F2 (poll loop).
    - F3 (framing, listener, NodeId binding, Contact/Lost).
@@ -511,20 +592,22 @@ Mark each finding fixed here, with its commit, when it lands.
      locking).
    - F17 (monotonic ms clock).
    - Each with a regression test.
-2. **Host hardening before any robot leaves the lab:**
+2. **Host follow-ups:** the F3 multi-peer allowlist and F18 scheduled
+   flush. Small, and needed before more than two robots share a fleet.
+3. **Host hardening before any robot leaves the lab:**
    - F10 (trim, bounded channels, compaction).
    - F11 (socket permissions, peer creds, timeouts).
    - F12 (ignore own publications, SROS2 guidance, rate limits).
-3. **Core hardening (can ride with 1.0):**
+4. **Core hardening (rides with 1.0):**
    - F8 (idle eviction).
    - F9 (summary rate limit, no re-queue).
    - F13 (event drop-oldest, purge acks on peer loss, reject trailing
      bytes).
    - F6 (refuse NodeId change within a contact).
-4. **1.1:**
+5. **1.1:**
    - Write the full threat model from §4/§8.
    - Choose link authentication.
    - Add signing per spec §2a (F14, F7).
    - Add "replace if better signed" dedupe.
-5. **Later:** confidentiality and rotating rendezvous identifiers (F15),
+6. **Later:** confidentiality and rotating rendezvous identifiers (F15),
    only if the deployment needs them.

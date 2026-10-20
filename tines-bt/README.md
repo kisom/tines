@@ -52,6 +52,12 @@ violation).
 Up to [`MAX_PEERS`] connections may be live at once, one per bound [`NodeId`];
 a second connection to the same [`NodeId`] replaces the first.
 
+**Current limit:** `BluerRadio::new` and `BtTransport::new` still take a single
+`peer`. The allowlist is exactly that one `NodeId`, and `BtTransport` drops
+frames and events from any other peer, so in practice each node exchanges with
+one configured partner. A configurable allowlist (empty = any tines advertiser)
+is still to come; see `THREAT_MODEL.md` F3.
+
 ## Manual verification
 
 The SeqPacket framing can't be exercised in CI (it needs two real radios), so
@@ -63,6 +69,10 @@ verify it by hand with two devices running the `tines` service:
    trace lines);
 3. send a burst of observations on one device and confirm the other receives
    each as a separate, intact frame (no merged or truncated frames).
+
+No result has been recorded yet. Once it's done, note the date, hardware and
+BlueZ version here, along with whether SeqPacket worked or the length-prefix
+fallback was needed.
 
 [`Transport`]: https://docs.rs/tines-core/latest/tines_core/transport/trait.Transport.html
 [`NodeId`]: https://docs.rs/tines-core/latest/tines_core/observation/struct.NodeId.html

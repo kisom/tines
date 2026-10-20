@@ -21,12 +21,15 @@ hear each other.
 - [Observations](#observations)
 - [The exchange protocol](#the-exchange-protocol)
 - [Addressed delivery](#addressed-delivery)
+- [Receipts](#receipts)
 - [Usage](#usage)
 - [Writing a transport](#writing-a-transport)
 - [Writing a store](#writing-a-store)
 - [The simulator](#the-simulator)
+- [Running on a robot](#running-on-a-robot)
 - [Crate layout](#crate-layout)
 - [Building and CI](#building-and-ci)
+- [Security](#security)
 - [Where to read more](#where-to-read-more)
 
 ## Design at a glance
@@ -43,6 +46,8 @@ hear each other.
   defensively; malformed bytes are dropped.
 - **The application sets the pace.** `Node::poll` emits at most one frame per
   call, so duty cycle and airtime are the application's call.
+- **No trust layer yet.** Anyone in radio range can read and inject. See
+  [Security](#security).
 
 ## Architecture
 
@@ -109,9 +114,11 @@ saturates rather than underflowing.
 ### Sequence numbers must survive reboots
 
 `seq` is part of the id, so a robot must not reuse one for different content.
-Persist `Node::next_seq()` and pass it back as `first_seq`, typically as
-`boot_count << 32 | counter`. A repeated `seq` with identical content simply
-dedupes (`insert` returns `Ok(false)`).
+Pass `Node::new` a `first_seq` that is higher than any seq used before,
+typically `boot_count << 32`, with a boot counter persisted across reboots.
+`tines-store`'s `LogStore` keeps that counter for you: seed the node with
+`store.first_seq()`. A repeated `seq` with identical content simply dedupes
+(`insert` returns `Ok(false)`).
 
 ## The exchange protocol
 
@@ -169,7 +176,15 @@ classDiagram
         count: u8
         data: bytes
     }
+    class Ack {
+        from: NodeId
+        ids: ≤90 ObservationIds
+    }
 ```
+
+A transport that binds a connection to a peer's identity can check a frame's
+claimed sender with `tines_core::wire::frame_sender`, without decoding the
+whole frame.
 
 ### Fragmentation
 
@@ -217,9 +232,9 @@ flowchart TD
 
 Most observations are broadcasts: everyone gets everything. An observation can
 also be **addressed** to one robot with `Node::observe_to`, e.g. a tasking from
-a base station. Addressed messages travel by store-and-forward: any robot that
-meets a carrier becomes a carrier too, until the message reaches its recipient
-or its lifetime runs out.
+a base station. Addressed messages travel along a **custody chain**: a message
+has one custodian at a time, and each handoff is confirmed by a receipt before
+the old custodian lets go.
 
 ```mermaid
 sequenceDiagram
@@ -229,27 +244,59 @@ sequenceDiagram
     participant R3 as Robot 3 (recipient)
     Base->>Base: observe_to(R3, lifetime 60 s, "task", …)
     Note over Base,R1: contact
-    Base->>R1: Obs to=R3 (epidemic forward)
+    Base->>R1: Obs to=R3 (forward)
+    R1->>Base: Ack
+    Note over Base: releases its copy:<br/>no longer offered to anyone
     Note over R1,R2: later contact
-    R1->>R2: Obs to=R3 (epidemic forward)
+    R1->>R2: Obs to=R3 (forward)
+    R2->>R1: Ack
     Note over R2,R3: later contact
     R2->>R3: Obs to=R3 (delivery)
+    R3->>R2: Ack
     Note over R3: shows up in R3's belief()
-    Note over R1,R2: carriers drop it once age > lifetime
+    Note over Base,R3: anyone still holding it drops it once age > lifetime
 ```
 
+- A custodian offers the message to the recipient when it meets it
+  (**delivery**), and otherwise to any peer it meets (**forwarding**).
+  Delivery is preferred. Custody and broadcast take turns for each peer, so
+  neither can starve the other.
+- The receiver acks only once it has stored the message. When the ack comes
+  back, the sender **releases** its copy: the copy stays in its store until
+  it expires or is trimmed, but is never offered again.
+- If an ack is lost, the sender keeps offering the message, so a message can
+  briefly have two custodians. That costs airtime, never the message. A
+  custodian that fails after handing the message on does lose it; that's
+  accepted.
 - Addressed messages **never appear in a summary**, so their existence doesn't
   leak to unrelated robots through gossip.
-- **Delivery** (the peer is the recipient) is preferred over **forwarding**.
-  Custody and broadcast take turns for each peer, so neither can starve the
-  other.
 - **Bounce suppression:** within one contact, a robot never offers a message
   back to the peer it came from, or to a peer that already has it.
 - **Expiry is local and silent.** A message older than its `lifetime_ms` is
-  never forwarded and never stored. There are no acks and no cancellation
-  messages.
+  never forwarded and never stored. There are no end-to-end delivery reports
+  and no cancellation messages.
 - `belief()` sees broadcasts and messages addressed *to me*. Messages carried
   for others exist only to be forwarded.
+
+## Receipts
+
+Each robot acknowledges what it receives with `Ack` frames, sent as it goes
+during a contact (up to 90 ids per frame), for both kinds of observation:
+
+| Kind      | What an ack means to the sender                                        |
+|-----------|-------------------------------------------------------------------------|
+| addressed | custody has moved: release my copy                                      |
+| broadcast | confidence only: "peer P has observation X"; nothing changes in storage |
+
+An ack is accepted only from a peer the id was actually sent to during the
+current contact. A robot never acks an observation it failed to store (for
+example, because its store is full), and never acks an addressed duplicate
+it has already released, since that would hand custody back to a robot that
+no longer carries the message.
+
+Broadcast confirmations surface as `ConfidenceEvent { peer, id }` from
+`Node::drain_events`. The event queue is bounded (64): events are telemetry,
+and losing one never loses data.
 
 ## Usage
 
@@ -260,18 +307,13 @@ over any `Store` and `Transport`:
 use tines_core::{LatestWins, MemStore, Node, NodeId, TrimPolicy};
 
 let me: NodeId = [7; 16];
-let boot_count = 0u64;
-let counter = 3u64;
+let boot_count = 0u64; // persisted and incremented on every boot
 let store = MemStore::new();
 let transport = /* any Transport implementation */;
 
-// first_seq must survive reboot: boot_count << 32 | counter
-let mut node: Node<MemStore, _> = Node::new(
-    me,
-    boot_count << 32 | counter,
-    store,
-    transport,
-);
+// first_seq must not repeat across reboots. With tines-store's LogStore,
+// pass store.first_seq() instead.
+let mut node: Node<MemStore, _> = Node::new(me, boot_count << 32, store, transport);
 
 // Record something you saw. observed_at is an optional absolute clock
 // (ms since epoch); `now` is a local monotonic Tick on every call.
@@ -290,6 +332,11 @@ let stored = node.poll(500);
 // Ask what you believe about a topic prefix, under a belief policy
 // (e.g. the youngest observation wins).
 let belief = node.belief(b"door", &LatestWins, 500);
+
+// Which peers have confirmed holding which of your broadcasts.
+for event in node.drain_events() {
+    println!("peer {:?} has {:?}", event.peer, event.id);
+}
 
 // Keep the store bounded.
 node.trim(
@@ -370,11 +417,15 @@ flash or SQLite backend implements the `Store` trait:
 | `for_each_id`           | every stored id, any order                                               |
 | `for_each_broadcast_id` | ids with `to == None`; these feed the summary                            |
 | `for_each_addressed_id` | ids with `to == Some(_)`; scanned for custody on every poll              |
+| `release`               | mark an id as handed off, so it's never offered again; a no-op if the id isn't stored |
+| `is_released`           | whether an id has been released; a re-inserted observation starts un-released |
 | `for_each_topic`        | age-adjusted observations whose topic starts with a prefix               |
 | `trim`                  | apply a `TrimPolicy` (per-topic, then age, then count); return how many were removed |
 
 The store must remember when each observation was inserted (`stored_at`, in
-the caller's `Tick`s) so it can report current ages.
+the caller's `Tick`s) so it can report current ages. `insert` may return
+`Err(StoreError::Full)`; the exchange then doesn't ack, so the sender keeps
+custody.
 
 `for_each_addressed_id` has a default implementation that visits every id,
 which is correct but makes the exchange read every broadcast observation on
@@ -420,10 +471,72 @@ check that:
 - no store depends on the order of contacts;
 - a store only ever grows during a run (union is monotone);
 - garbage frames never panic and never change a store;
-- addressed messages reach their recipient along a connected path.
+- an unexpired addressed message always has a holder, a custodian or its
+  recipient, including when some robots' stores are full.
 
-`tines-sim/tests/relay.rs` adds scripted relay scenarios, including a message
-that expires before it reaches its recipient and is never stored.
+`tines-sim/tests/relay.rs` adds scripted relay scenarios: a message relayed
+down a custody chain to its recipient, one that expires before it gets there
+and is never stored, and a released duplicate that isn't acked.
+
+## Running on a robot
+
+`tines-core` is only the library. The host crates put it on a Linux robot
+(a Pi, or a Jetson running ROS2):
+
+```mermaid
+flowchart LR
+    subgraph robot["One robot"]
+        direction TB
+        clients(["IPC clients"]) -- "Unix socket,<br/>length-prefixed JSON" --> svc["tines<br/>(service)"]
+        ros(["ROS2 nodes"]) -- "/tines/… topics" --> rosnode["tines-ros2<br/>(TinesNode)"]
+        svc & rosnode --> core["tines-core<br/>Node"]
+        core --> log[("tines-store<br/>LogStore")]
+        core --> bt["tines-bt<br/>BtTransport"]
+    end
+    bt <-- "BLE L2CAP" --> other(["other robots"])
+```
+
+A robot runs either the service or the ROS2 node, not both: each owns its
+`Node` and its log.
+
+- **`tines-store`**: `LogStore`, an append-only log file.
+  - Each record is checksummed (CRC-32C). Recovery skips a corrupt record and
+    truncates only a torn tail.
+  - Releases are written as they happen.
+  - A boot counter provides `first_seq()`.
+  - `flush()` writes a clock marker, so ages carry across a restart, and
+    fsyncs the log.
+  - The file is created `0600` and locked, so only one process can open it.
+- **`tines-bt`**: BLE over BlueZ, using L2CAP SeqPacket channels (one
+  frame per packet).
+  - Every robot advertises its `NodeId` and scans. The smaller `NodeId`
+    dials and the larger accepts.
+  - A connection is bound to the advertised `NodeId`, and frames claiming
+    any other sender are dropped.
+  - Connections produce `Contact` and `Lost` events. See
+    [`tines-bt/README.md`](tines-bt/README.md).
+- **`tines`**: the standalone service, for robots without ROS2.
+  - It runs the exchange on a poll loop and answers `Observe`, `Belief`,
+    `Events` and `Status` requests on a Unix socket.
+  - It's configured by a JSON file: `node_id`, `peer`, `log_path`,
+    `socket_path` and `poll_interval_ms`.
+- **`tines-ros2`**: a ROS2 node.
+  - It publishes each tines topic under `/tines/` and confidence events on
+    `/tines/receipts`.
+  - It turns messages on those topics into observations.
+  - rclrs is behind the `ros2` feature, so the crate builds without a ROS2
+    toolchain.
+
+The hosts use a monotonic millisecond clock that starts at 0 when the
+process does. Neither host sets `observed_at` yet.
+
+**Current limits** (tracked in [`THREAT_MODEL.md`](THREAT_MODEL.md)):
+- The service talks to one configured `peer`.
+- The hosts don't yet flush on a timer.
+- The host-hardening work (trim defaults, bounded channels, socket
+  permissions, ROS2 isolation) hasn't landed.
+
+The two-device BLE check in `tines-bt/README.md` hasn't been recorded yet.
 
 ## Crate layout
 
@@ -435,7 +548,11 @@ tines/
                 `alloc` is a default feature; without it, tines-core builds
                 for thumbv7em-none-eabihf (only MemStore needs alloc).
   tines-sim/    std: the simulator, contact traces, and the convergence /
-                order-independence / relay property tests.
+                order-independence / custody property tests.
+  tines-store/  std: LogStore, the persistent append-only backend.
+  tines-bt/     std: the BLE transport (BlueZ via bluer).
+  tines/        std: the standalone service with Unix-socket IPC.
+  tines-ros2/   std: the ROS2 node (rclrs behind the `ros2` feature).
 ```
 
 Fixed limits, all compile-time constants in `tines-core/src/consts.rs`:
@@ -451,6 +568,10 @@ Fixed limits, all compile-time constants in `tines-core/src/consts.rs`:
 | `REASSEMBLY_TIMEOUT_MS` | 5000   | partial observation discard time         |
 | `SEND_QUEUE_CAP`        | 256    | ids queued per peer                      |
 | `MAX_FRAME`             | 1500   | largest frame (and MTU) supported        |
+| `ACK_IDS_CAP`           | 90     | ids in one `Ack` frame                   |
+| `EVENT_QUEUE_CAP`       | 64     | confidence events awaiting `drain_events`|
+| `BCAST_SENT_CAP`        | 256    | broadcast sends remembered per peer, to validate acks |
+| `ACK_BUFFER_CAP`        | 256    | received ids waiting to be acked, per kind |
 
 ## Building and CI
 
@@ -465,13 +586,28 @@ sh scripts/ci.sh
 GitHub Actions runs the same script on every push to `master` and on every
 pull request.
 
+## Security
+
+tines has **no trust layer yet**, by design. Anyone in radio range can read
+everything, inject observations under any identity, and take custody of
+addressed messages. That's acceptable only where the radio environment is
+trusted. Signatures are planned for 1.1, with room for them reserved in the
+1.0 wire format.
+
+[`THREAT_MODEL.md`](THREAT_MODEL.md) has the full assessment: trust
+boundaries, adversaries, findings, and which spec fixes each one.
+
 ## Where to read more
 
 The specs are authoritative; the plans argue from them.
 
 - **Core design:** `docs/superpowers/specs/2026-10-16-tines-design.md`
 - **Addressed delivery:** `docs/superpowers/specs/2026-10-18-tines-addressed-delivery.md`
+  (its epidemic forwarding is superseded by the fleet spec's custody chain)
+- **Fleet deployment:** `docs/superpowers/specs/2026-10-18-tines-fleet-deployment-design.md`
+- **Fleet fixes:** `docs/superpowers/specs/2026-10-19-tines-fleet-fixes.md`
+- **Host hardening (next for the hosts):** `docs/superpowers/specs/2026-10-19-tines-host-hardening.md`
+- **tines-core 1.0 (next for the core):** `docs/superpowers/specs/2026-10-18-tines-1-0-design.md`
+- **Threat model:** [`THREAT_MODEL.md`](THREAT_MODEL.md)
 - **Plans:** `docs/superpowers/plans/`
-
-Not yet built (a second plan): `tines-udp`, `tines-sqlite`, `tines-cli`, and
-`tines-serial`.
+- **Changes:** [`CHANGELOG.md`](CHANGELOG.md)

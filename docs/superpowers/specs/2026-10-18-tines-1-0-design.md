@@ -1,10 +1,11 @@
 # tines-core 1.0 — design
 
 Date: 2026-10-18
-Status: draft v6. Kyle decided D1–D5 and Q1–Q3 (2026-10-18) and the
-review decisions R1–R3 and the `observed_at` definition (2026-10-19);
-review fixes applied. v6 adds §10 (core hardening from `THREAT_MODEL.md`)
-and the adversarial fuzz mode; these additions aren't reviewed yet.
+Status: approved by Kyle (2026-10-20). Kyle decided D1–D5 and Q1–Q3
+(2026-10-18) and the review decisions R1–R3 and the `observed_at`
+definition (2026-10-19); review fixes applied. v6 added §10 (core hardening
+from `THREAT_MODEL.md`) and the adversarial fuzz mode; Kyle reviewed and
+approved both (2026-10-20).
 Builds on: `2026-10-16-tines-design.md`, `2026-10-18-tines-addressed-delivery.md`,
 `2026-10-18-tines-fleet-deployment-design.md` (assumed fully implemented)
 

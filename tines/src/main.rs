@@ -4,9 +4,9 @@
 //! `bluer`), and serves the IPC ([`tines::serve`]) over a Unix-domain socket.
 //! One instance per device — the typical deployment on robots without ROS2.
 //!
-//! The node/peer ids are 32 lowercase hex chars (the 16-byte `NodeId`), and
-//! The tines sequence numbers are seeded from the LogStore's boot counter, so
-//! they persist across reboots without a separate config field.
+//! The node and peer ids are 32 lowercase hex chars (the 16-byte `NodeId`).
+//! Sequence numbers are seeded from the LogStore's boot counter, so they don't
+//! repeat across reboots and need no config field.
 
 use std::error::Error;
 use std::path::Path;

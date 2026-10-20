@@ -4,6 +4,85 @@ All notable changes to the tines crates. Versions follow
 [Semantic Versioning](https://semver.org/); before 1.0, a minor bump may break
 the API.
 
+## Unreleased
+
+The fleet-deployment milestone and the fleet fixes (security assessment
+findings F1–F5 and F17; see `THREAT_MODEL.md`). The workspace version is
+still 0.3.0.
+
+### Added
+
+- **Handoff receipts** (tines-core). The new `Ack` frame (the last `Frame`
+  variant) carries up to `ACK_IDS_CAP` (90) ids. Acks are sent as the
+  exchange runs and are accepted only from a peer the id was sent to during
+  the current contact.
+  - An ack for an addressed observation moves custody: the sender releases
+    its copy (`Store::release`) and never offers it again.
+  - An ack for a broadcast is confidence only. It surfaces as a
+    `ConfidenceEvent { peer, id }` from the new `Node::drain_events`.
+- New constants: `ACK_IDS_CAP`, `EVENT_QUEUE_CAP`, `BCAST_SENT_CAP`,
+  `ACK_BUFFER_CAP`.
+- `wire::frame_sender(bytes) -> Option<NodeId>`: a frame's claimed sender,
+  for transports that bind a connection to an identity.
+- `Node::store_mut`, so a host can call backend methods such as
+  `LogStore::flush`.
+- **New host crates:**
+  - `tines-store`: `LogStore`, a persistent append-only backend.
+  - `tines-bt`: a BLE transport over BlueZ.
+  - `tines`: a standalone service with Unix-socket JSON IPC.
+  - `tines-ros2`: a ROS2 node; rclrs is behind the `ros2` feature.
+
+### Changed
+
+- **Addressed delivery is a custody chain.** It used to be epidemic
+  forwarding. A message has one custodian at a time, which hands it on and
+  releases it when the next holder acks. A lost ack can leave two
+  custodians for a while; a message is never dropped by the protocol.
+- Bounce records carry a direction, so only records of an actual send
+  validate an ack.
+- **`LogStore` log format v1** (incompatible; there's no migration, so delete
+  old logs):
+  - The file starts with a `"TINESLOG"` header and a format version.
+  - Each record has a sync marker, a length and a CRC-32C.
+  - Ids are recomputed on load, not stored.
+- `LogStore` persists a boot counter, and `first_seq()` returns
+  `boot_count << 32`. Both hosts seed `Node::new` from it, and the
+  `first_seq` config field is gone.
+- `LogStore::release` writes a `Release` record immediately. `flush` writes
+  a clock marker, so ages carry across a restart.
+- `LogStore::open` takes an exclusive lock and creates the file `0600`.
+- tines-bt rewrite:
+  - L2CAP SeqPacket channels, one frame per packet.
+  - Every node advertises and scans; the smaller `NodeId` dials and the
+    larger accepts.
+  - Connections are bound to the advertised `NodeId`, and frames whose
+    claimed sender differs are dropped.
+  - Connections emit `Contact` and `Lost`.
+
+### Fixed
+
+- A receiver whose store returned `Err` (for example `Full`) still acked, so
+  the sender released custody of a message nobody kept. Now nothing is
+  acked unless it was stored, addressed or broadcast (F1).
+- The standalone service never polled its `Node`, so it never exchanged
+  anything. It now runs the exchange on a poll loop (F2).
+- tines-bt had no listener, lost frame boundaries on a stream socket, and
+  stamped every frame with the configured peer (F3).
+- Sequence numbers repeated after every restart, and released flags were
+  never persisted (F4).
+- One corrupt record in the middle of the log truncated everything after it.
+  Recovery now skips bad records and truncates only a torn tail, with an
+  fsync of the file and its directory (F5).
+- The service's tick was wall-clock *seconds*. Both hosts now use one
+  monotonic millisecond clock (F17).
+
+### Known issues
+
+- The service talks to exactly one configured `peer`. The multi-peer
+  allowlist the fleet-fixes spec describes isn't wired up (F3).
+- Neither host flushes on a timer, and tines-ros2 never flushes or trims
+  (F18).
+
 ## 0.3.0 — 2026-10-18
 
 ### Breaking

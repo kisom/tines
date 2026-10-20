@@ -18,11 +18,17 @@ architecture in the **spec first**:
 - **Core design (authoritative):** `docs/superpowers/specs/2026-10-16-tines-design.md`
 - **Addressed delivery (authoritative):** `docs/superpowers/specs/2026-10-18-tines-addressed-delivery.md`
 - **Fleet deployment v1 (authoritative):** `docs/superpowers/specs/2026-10-18-tines-fleet-deployment-design.md` — supersedes the addressed-delivery spec's epidemic forwarding (custody chain with handoff receipts).
+- **Fleet fixes (done):** `docs/superpowers/specs/2026-10-19-tines-fleet-fixes.md` — security-assessment findings F1–F5 and F17.
+- **tines-core 1.0 (next, core):** `docs/superpowers/specs/2026-10-18-tines-1-0-design.md` — wire version, public API, signature slot, core hardening (§10).
+- **Host hardening (next, hosts):** `docs/superpowers/specs/2026-10-19-tines-host-hardening.md` — findings F10–F12.
 - **Implementation plans:** `docs/superpowers/plans/`
 
 The plans argue from the specs. Where a plan is silent, the **spec rules**.
 Do not edit the specs or the plans — they are design history, not source.
 `README.md` is the user-facing overview and should track the code.
+`THREAT_MODEL.md` is the living security assessment: when a change fixes or
+changes a finding, update its status there (§1 and §10) with the commit.
+`CHANGELOG.md` records each release.
 
 ## Architecture (three layers)
 
@@ -68,9 +74,14 @@ call `poll()` in its loop, and `observe()` when it sees something.
 - Addressed observations (`to = Some`) never appear in a summary Bloom
   filter, and an addressed observation past its `lifetime_ms` is never
   stored or forwarded.
-- `Node::next_seq()` must be persisted by the application across reboots
-  (`boot_count << 32 | counter`); a repeated seq after reboot collides in the
-  ID hash and must dedupe silently (`insert` returns `Ok(false)`).
+- `first_seq` passed to `Node::new` must not repeat across reboots
+  (`boot_count << 32`, with a persisted boot counter; `LogStore::first_seq`
+  provides it). A repeated seq after reboot collides in the ID hash and must
+  dedupe silently (`insert` returns `Ok(false)`).
+- Receipts: a receive the store rejects (`Err`, e.g. `Full`) is never acked,
+  addressed or broadcast; an addressed duplicate whose local copy is released
+  is never acked; an `Ack` is accepted only from a peer the id was sent to
+  this contact.
 - `NodeId = [u8; 16]`, `ObservationId = [u8; 16]`, `Tick = u64` (local
   monotonic ms, supplied on every call).
 
@@ -82,12 +93,17 @@ call `poll()` in its loop, and `observe()` when it sees something.
 4. Frame from an address with no prior `Contact` → treated as implicit contact.
 5. Tick going backwards → age saturates at stored value, never underflow.
 6. Every emitted frame fits the transport's `mtu()`, including summaries.
+7. Store-full receive → no `Ack`; custody stays with the sender (unit test and
+   the full-store sim property).
+8. Released addressed duplicate → no `Ack`.
 
 ### Compile-time constants (`tines-core/src/consts.rs`)
 
 `MAX_TOPIC=64`, `MAX_PAYLOAD=1024`, `MAX_PEERS=8`, `SUMMARY_BYTES=512`,
 `BLOOM_K=3`, `SUMMARY_INTERVAL_MS=2000`, `REASSEMBLY_TIMEOUT_MS=5000`,
-`SEND_QUEUE_CAP=256`, `MAX_FRAME=1500`. Match the exact values above.
+`SEND_QUEUE_CAP=256`, `MAX_FRAME=1500`, `ACK_IDS_CAP=90`,
+`EVENT_QUEUE_CAP=64`, `BCAST_SENT_CAP=256`, `ACK_BUFFER_CAP=256`. Match the
+exact values above.
 
 ## Crate layout
 
@@ -96,9 +112,20 @@ tines/
   tines-core/   no_std core: Observation, Store/Transport/BeliefPolicy traits,
                 exchange state machine, Node facade, in-memory store, reference
                 policies
-  tines-sim/    std: simulator, contact traces, convergence and relay
+  tines-sim/    std: simulator, contact traces, convergence, relay and custody
                 property tests
+  tines-store/  std: LogStore, the persistent append-only backend
+  tines-bt/     std: BLE transport over BlueZ (bluer)
+  tines/        std: standalone service, Unix-socket JSON IPC
+  tines-ros2/   std: ROS2 node; rclrs behind the `ros2` feature
 ```
+
+Only `tines-core` is headed for 1.0; the host crates stay 0.x (1.0 spec, D4).
+They're std-only and may use threads and I/O, but they're still the trust
+boundary for radio, IPC and disk input (see `THREAT_MODEL.md`).
+
+`tines-ros2` with `--features ros2` is outside the default gate: check it
+with the ROS2 Docker job (`Dockerfile.ros2`, `scripts/check-ros2.sh`).
 
 ## Not started
 
