@@ -34,5 +34,13 @@ jobs:
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # System library for tines-bt's bluer crate (D-Bus dev headers); the
+      # workspace build links libdbus-sys against system dbus-1. Keep in sync
+      # with Dockerfile.ros2.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
+
       - name: Run CI gate
         run: sh scripts/ci.sh
