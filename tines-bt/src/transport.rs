@@ -54,9 +54,9 @@ use bluer::{
 };
 
 use tines_core::consts::{MAX_FRAME, MAX_PEERS};
+use tines_core::frame_sender;
 use tines_core::observation::NodeId;
 use tines_core::transport::{Event, FrameBuf, SendError, Transport};
-use tines_core::wire::frame_sender;
 
 /// The radio I/O seam for [`BtTransport`].
 ///

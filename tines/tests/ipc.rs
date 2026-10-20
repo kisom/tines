@@ -16,7 +16,8 @@ use heapless::Vec as HeaplessVec;
 use std::fmt::Write as _;
 use tines::{handle, serve, HostClock, Request, Response};
 use tines_core::{
-    consts, Event, Frame, FrameBuf, Node, NodeEvent, NodeId, ObservationId, SendError, Transport,
+    consts, Event, FrameBuf, Node, NodeEvent, NodeId, Observation, ObservationId, SendError,
+    Transport,
 };
 use tines_store::LogStore;
 
@@ -56,27 +57,27 @@ impl Transport for MockTransport {
 
     fn send(&mut self, to: &NodeId, frame: &[u8]) -> Result<(), SendError> {
         self.sent.push(frame.to_vec());
-        match Frame::decode(frame) {
-            Ok(Frame::Obs { obs, .. }) => {
+        match frame_kind(frame) {
+            Some(OBS_TAG) => {
                 // A well-behaved peer acks each distinct observed broadcast.
-                if self.acked.insert(obs.id()) {
-                    let ack = ack_frame(*to, obs.id());
-                    self.pending.push_back(frame_event(*to, &ack));
+                if let Ok((_, obs)) = postcard::from_bytes::<(NodeId, Observation)>(&frame[2..]) {
+                    if self.acked.insert(obs.id()) {
+                        self.pending.push_back(ack_event(*to, obs.id()));
+                    }
                 }
             }
-            Ok(Frame::Summary { salt, .. }) => {
+            Some(SUMMARY_TAG) => {
                 // Echo back an empty, full-size Summary so the exchange learns
                 // the peer holds nothing and broadcasts its diff (which we then
                 // ack, firing a NodeEvent::Delivered).
-                let raw: [u8; consts::SUMMARY_BYTES] = [0u8; consts::SUMMARY_BYTES];
-                let bits: HeaplessVec<u8, { consts::SUMMARY_BYTES }> =
-                    HeaplessVec::from_slice(&raw).expect("512 fits SUMMARY_BYTES");
-                let reply = Frame::Summary {
-                    from: *to,
-                    salt,
-                    bits,
-                };
-                self.pending.push_back(frame_event(*to, &reply));
+                if let Ok((from, salt, _)) = postcard::from_bytes::<(
+                    NodeId,
+                    u32,
+                    HeaplessVec<u8, { consts::SUMMARY_BYTES }>,
+                )>(&frame[2..])
+                {
+                    self.pending.push_back(summary_event(from, salt));
+                }
             }
             _ => {}
         }
@@ -88,19 +89,49 @@ impl Transport for MockTransport {
     }
 }
 
-fn ack_frame(from: NodeId, id: ObservationId) -> Frame {
-    let ids: HeaplessVec<ObservationId, { consts::ACK_IDS_CAP }> =
-        HeaplessVec::from_slice(&[id]).expect("one id fits ACK_IDS_CAP");
-    Frame::Ack { from, ids }
+// Wire-variant tags, mirroring tines-core's private `Frame` enum order
+// (Summary=0, Obs=1, Frag=2, Ack=3). tines-core keeps `Frame` internal, so the
+// mock peer re-derives these here to classify inbound frames and synthesize the
+// acks/summaries the exchange expects from a well-behaved peer.
+const SUMMARY_TAG: u8 = 0;
+const OBS_TAG: u8 = 1;
+const ACK_TAG: u8 = 3;
+
+/// Returns a wire frame's postcard variant tag, or `None` if `frame` is not a
+/// well-formed tines frame (too short, or a wrong leading version byte).
+fn frame_kind(frame: &[u8]) -> Option<u8> {
+    (frame.len() >= 2 && frame[0] == consts::WIRE_VERSION).then_some(frame[1])
 }
 
-fn frame_event(from: NodeId, frame: &Frame) -> Event<NodeId> {
+/// Encode a `Frame`-variant-shaped tuple as wire bytes: the WIRE_VERSION byte,
+/// the variant tag, then the postcard payload — mirroring tines-core's
+/// internal `Frame::encode`, using only `tines_core`'s public types.
+fn encode_frame<T: serde::Serialize>(from: NodeId, tag: u8, payload: &T) -> Event<NodeId> {
     let mut buf = [0u8; consts::MAX_FRAME];
-    let n = frame.encode(&mut buf).expect("frame fits MAX_FRAME");
+    buf[0] = consts::WIRE_VERSION;
+    buf[1] = tag;
+    let n = postcard::to_slice(payload, &mut buf[2..])
+        .expect("frame fits MAX_FRAME")
+        .len();
     Event::Frame(
         from,
-        FrameBuf::from_slice(&buf[..n]).expect("frame fits FrameBuf"),
+        FrameBuf::from_slice(&buf[..2 + n]).expect("frame fits FrameBuf"),
     )
+}
+
+/// Synthesize the Ack a well-behaved peer sends for one observed id.
+fn ack_event(from: NodeId, id: ObservationId) -> Event<NodeId> {
+    let ids: HeaplessVec<ObservationId, { consts::ACK_IDS_CAP }> =
+        HeaplessVec::from_slice(&[id]).expect("one id fits ACK_IDS_CAP");
+    encode_frame(from, ACK_TAG, &(from, ids))
+}
+
+/// Synthesize the full-size, all-zero Summary a well-behaved peer echoes for an
+/// incoming Summary (telling the exchange the peer holds nothing).
+fn summary_event(from: NodeId, salt: u32) -> Event<NodeId> {
+    let bits: HeaplessVec<u8, { consts::SUMMARY_BYTES }> =
+        HeaplessVec::from_slice(&[0u8; consts::SUMMARY_BYTES]).expect("512 fits SUMMARY_BYTES");
+    encode_frame(from, SUMMARY_TAG, &(from, salt, bits))
 }
 
 fn topic() -> Vec<u8> {

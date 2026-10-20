@@ -1,21 +1,22 @@
 //! Node facade for tines-core.
 //!
 //! [`Node`] is the single entry point that ties the [`Store`], the
-//! [`Exchange`] state machine, and a [`Transport`] together behind the two
+//! `Exchange` state machine, and a [`Transport`] together behind the two
 //! operations an application needs: [`Node::observe`] to record an observation,
 //! and [`Node::poll`] to drive the exchange.
 //!
 //! The facade never touches the heap: its only owned buffer, `out`, is a fixed
 //! `[u8; MAX_FRAME]`. It also panics on nothing — oversized topics/payloads
 //! become [`ObserveError::TooLarge`] rather than truncating, and malformed
-//! transport frames are dropped by the [`Exchange`].
+//! transport frames are dropped by the `Exchange`.
 
 use crate::{
-    consts, BeliefPolicy, Dest, Exchange, NodeEvent, NodeId, Observation, ObservationId, Payload,
-    Store, StoreError, Tick, Topic, Transport, TrimPolicy,
+    consts, exchange::Exchange, BeliefPolicy, Dest, NodeEvent, NodeId, Observation, ObservationId,
+    Payload, Store, StoreError, Tick, Topic, Transport, TrimPolicy,
 };
 
 /// Errors returned by [`Node::observe`].
+#[non_exhaustive]
 #[derive(Debug, PartialEq, Eq)]
 pub enum ObserveError {
     /// The topic or payload exceeded `MAX_TOPIC`/`MAX_PAYLOAD`. The
@@ -105,7 +106,7 @@ impl<S: Store, T: Transport> Node<S, T> {
     ///
     /// The resulting observation has `dest = Some(Dest { to, lifetime_ms })`,
     /// so the exchange will deliver it only
-    /// to `to` (see [`Exchange`]). Returns the observation's content-derived
+    /// to `to` (see `Exchange`). Returns the observation's content-derived
     /// id. An oversized topic or payload is rejected with
     /// [`ObserveError::TooLarge`] rather than truncated; a store rejection is
     /// surfaced as [`ObserveError::Store`]. Duplicate ids are accepted (the id
@@ -143,7 +144,7 @@ impl<S: Store, T: Transport> Node<S, T> {
     /// Returns the number of *new* observations stored this round. If the
     /// transport refuses the frame with `Busy` or `Unreachable`, the exchange
     /// rolls back and offers the same frame on a later poll; a `TooLarge`
-    /// frame is dropped (see [`Exchange::on_send_error`]).
+    /// frame is dropped (see `Exchange::on_send_error`).
     pub fn poll(&mut self, now: Tick) -> usize {
         let mut stored = 0usize;
         while let Some(ev) = self.transport.poll() {
@@ -165,7 +166,7 @@ impl<S: Store, T: Transport> Node<S, T> {
         stored
     }
 
-    /// Drains the [`NodeEvent`]s the [`Exchange`] has collected: confirmed
+    /// Drains the [`NodeEvent`]s the `Exchange` has collected: confirmed
     /// deliveries first (oldest-first), then one [`NodeEvent::Dropped`] per
     /// counted drop.
     ///

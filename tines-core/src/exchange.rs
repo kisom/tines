@@ -1,6 +1,6 @@
 //! Exchange state machine for tines-core.
 //!
-//! [`Exchange`] tracks the peers this node knows about and drives the
+//! `Exchange` tracks the peers this node knows about and drives the
 //! content-defined gossip protocol: acknowledging received observations,
 //! summarizing what we hold, requesting what peers are missing, and delivering
 //! observations (fragmenting them across the wire when they exceed the MTU).
@@ -13,8 +13,10 @@
 
 use crate::consts;
 use crate::{
-    Bloom, Event, Frame, NodeId, Observation, ObservationId, Reassembler, SendError, Store, Tick,
-    WireError,
+    bloom::Bloom,
+    frag::Reassembler,
+    wire::{Frame, WireError},
+    Event, NodeId, Observation, ObservationId, SendError, Store, Tick,
 };
 use heapless::Vec;
 
@@ -31,7 +33,7 @@ const SUMMARY_OVERHEAD: usize = 25;
 /// MTU changed). The stream is then abandoned and restarted rather than
 /// sending bytes the receiver cannot reassemble.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InFlight {
+pub(crate) struct InFlight {
     /// The observation being fragmented.
     pub id: ObservationId,
     /// Index of the next fragment to send.
@@ -45,8 +47,8 @@ pub struct InFlight {
     pub len: usize,
 }
 
-/// Why the [`Exchange`] dropped an inbound frame it could not use; reported
-/// via [`NodeEvent::Dropped`]. A peer's [`Exchange`] rejects expired addressed
+/// Why the `Exchange` dropped an inbound frame it could not use; reported
+/// via [`NodeEvent::Dropped`]. A peer's `Exchange` rejects expired addressed
 /// observations by policy — those are *not* counted as drops.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -57,7 +59,7 @@ pub enum DropReason {
         /// The version byte read off the wire.
         version: u8,
     },
-    /// The frame was not a valid [`Frame`] (truncated, garbage, or empty).
+    /// The frame was not a valid `Frame` (truncated, garbage, or empty).
     Malformed,
 }
 
@@ -91,7 +93,7 @@ pub enum NodeEvent<A> {
     },
 }
 
-/// The [`Exchange`]'s counted-drop table: up to [`consts::DROP_TABLE_CAP`]
+/// The `Exchange`'s counted-drop table: up to [`consts::DROP_TABLE_CAP`]
 /// distinct `(addr, DropReason)` pairs, each with a saturating count, plus a
 /// single overflow counter. Counters are drained — and reset — through
 /// [`Exchange::drain_events`].
@@ -163,8 +165,8 @@ impl<A: Clone + PartialEq> DropTable<A> {
     }
 }
 
-/// A single peer the [`Exchange`] is tracking.
-pub struct Peer<A> {
+/// A single peer the `Exchange` is tracking.
+pub(crate) struct Peer<A> {
     /// Wire address of the peer.
     pub addr: A,
     /// Node id learned from the first frame received from this peer.
@@ -266,7 +268,7 @@ struct UndoAck<A> {
 }
 
 /// The exchange state machine, tracking up to [`consts::MAX_PEERS`] peers.
-pub struct Exchange<A> {
+pub(crate) struct Exchange<A> {
     me: NodeId,
     salt: u32,
     peers: Vec<Peer<A>, { consts::MAX_PEERS }>,
@@ -763,12 +765,14 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         Some((addr, n))
     }
 
+    // Only reached from alloc-gated tests, so unused under --no-default-features.
+    #[allow(dead_code)]
     /// Returns the current peers.
     pub fn peers(&self) -> &[Peer<A>] {
         &self.peers
     }
 
-    /// [`Exchange`]s emit [`NodeEvent`]s — confirmed deliveries plus counted
+    /// `Exchange`s emit [`NodeEvent`]s — confirmed deliveries plus counted
     /// drops — through `Exchange::drain_events`; `tines` surfaces them to its
     /// transport, so the drain method is unused inside `tines-core` itself.
     ///
@@ -3103,7 +3107,7 @@ mod tests {
     }
 
     /// A frame that passes the version gate (byte 0 is WIRE_VERSION) but whose
-    /// body isn't a valid postcard [`Frame`] is a counted malformed drop.
+    /// body isn't a valid postcard `Frame` is a counted malformed drop.
     #[test]
     fn malformed_is_counted() {
         let mut store = MemStore::new();

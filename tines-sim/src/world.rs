@@ -112,8 +112,8 @@ impl SimWorld {
     /// A test seam: it lets tests feed arbitrary or malformed byte strings
     /// straight to a node's exchange, which is where the "never panic on
     /// untrusted wire input" guarantee lives. The frame is not validated here —
-    /// a malformed frame is dropped by the receiving node's
-    /// [`Exchange`](tines_core::Exchange) rather than stored.
+    /// a malformed frame is dropped by the receiving
+    /// [`Node`](tines_core::Node) rather than stored.
     pub fn inject_frame(&mut self, node: usize, peer: usize, bytes: FrameBuf) {
         self.inboxes[node].push_back(Event::Frame(peer, bytes));
     }

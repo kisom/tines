@@ -13,6 +13,10 @@ use crate::observation::{Observation, ObservationId, Tick};
 /// Rules are applied in the order listed here: per-topic retention, then a
 /// global age cutoff, then a global count cap. Any field left as `None` is
 /// ignored.
+///
+/// `#[non_exhaustive]`: build via [`TrimPolicy::default`] and set fields, so a
+/// future 1.x can add policy knobs without a breaking change.
+#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct TrimPolicy {
     /// Keep the `N` youngest (lowest current age) observations per exact topic.
@@ -24,6 +28,7 @@ pub struct TrimPolicy {
 }
 
 /// Errors returned by [`Store`] operations.
+#[non_exhaustive]
 #[derive(Debug, PartialEq, Eq)]
 pub enum StoreError {
     /// The store is full and cannot accept new observations.

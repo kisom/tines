@@ -5,29 +5,27 @@
 extern crate alloc;
 
 pub mod belief;
-pub mod bloom;
+mod bloom;
 pub mod consts;
-pub mod exchange;
-pub mod frag;
+mod exchange;
+mod frag;
 #[cfg(feature = "alloc")]
 pub mod mem_store;
 pub mod node;
 pub mod observation;
 pub mod store;
 pub mod transport;
-pub mod wire;
+mod wire;
 
 pub use belief::{BeliefPolicy, LatestWins, SelfFirst};
-pub use bloom::Bloom;
-pub use exchange::{DropReason, Exchange, NodeEvent, Peer};
-pub use frag::{fragment, Reassembler};
+pub use exchange::{DropReason, NodeEvent};
 pub use node::{Node, ObserveError};
 pub use observation::{
     Dest, NodeId, Observation, ObservationId, Payload, SigAlgo, Signature, Tick, Topic,
 };
 pub use store::{Store, StoreError, TrimPolicy};
 pub use transport::{Event, FrameBuf, SendError, Transport};
-pub use wire::{Frame, WireError};
+pub use wire::frame_sender;
 
 #[cfg(feature = "alloc")]
 pub use mem_store::MemStore;

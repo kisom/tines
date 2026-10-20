@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// large, so the informative `large_enum_variant` lint is suppressed here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
-pub enum Frame {
+pub(crate) enum Frame {
     Summary {
         from: NodeId,
         salt: u32,
@@ -85,7 +85,7 @@ impl Frame {
 
 /// Peek the [`NodeId`] a wire frame was sent by, without fully decoding it.
 ///
-/// A [`Frame`] envelope is a `WIRE_VERSION` byte, then an externally-tagged
+/// A `Frame` envelope is a `WIRE_VERSION` byte, then an externally-tagged
 /// postcard enum: `bytes[0]` is the version, `bytes[1]` the variant tag, and
 /// `from` (the first field) occupies the 16 bytes at `bytes[2..18]`. This skips
 /// the two leading bytes, reads those 16 bytes, and returns `None` for anything
@@ -114,7 +114,7 @@ pub fn frame_sender(bytes: &[u8]) -> Option<NodeId> {
 
 /// Errors produced while (de)serializing frames on the wire.
 #[derive(Debug, PartialEq, Eq)]
-pub enum WireError {
+pub(crate) enum WireError {
     /// The output buffer was too small to hold the serialized frame.
     TooLarge,
     /// The input bytes were malformed, truncated, or not a valid `Frame`.

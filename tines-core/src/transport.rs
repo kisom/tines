@@ -15,6 +15,7 @@ pub type FrameBuf = heapless::Vec<u8, { consts::MAX_FRAME }>;
 /// `Contact`/`Lost`; the `large_enum_variant` lint is intentionally suppressed
 /// to keep `FrameBuf` off the heap in the `no_std` core.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 #[allow(clippy::large_enum_variant)]
 pub enum Event<A> {
     /// A peer became reachable.
@@ -26,6 +27,7 @@ pub enum Event<A> {
 }
 
 /// Reasons a `Transport::send` call can fail.
+#[non_exhaustive]
 #[derive(Debug, PartialEq, Eq)]
 pub enum SendError {
     /// The transport is busy with an in-flight send and cannot accept another.

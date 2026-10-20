@@ -5,7 +5,7 @@
 
 /// Wire envelope version byte prepended to every serialized `Frame`.
 ///
-/// The first byte of every frame on the wire; [`crate::wire::Frame::decode`]
+/// The first byte of every frame on the wire; `crate::wire::Frame::decode`
 /// rejects any frame whose leading byte differs from this
 /// (`WireError::VersionMismatch`), and [`crate::wire::frame_sender`] skips it.
 /// `4` is the first value in the `4..=0x7F` range that fits a single-byte
@@ -42,7 +42,7 @@ pub const REASSEMBLY_TIMEOUT_MS: u64 = 5000;
 pub const SEND_QUEUE_CAP: usize = 256;
 
 /// Minimum usable UDP frame size in bytes (the BLE floor below which a
-/// fragment header leaves no room for payload). [`crate::frag::fragment`] gives
+/// fragment header leaves no room for payload). `crate::frag::fragment` gives
 /// up cleanly with `WireError::TooLarge` for any `mtu` below this rather than
 /// emitting a truncated frame; the MTU sweep runs from here to [`MAX_FRAME`].
 pub const MIN_MTU: usize = 23;

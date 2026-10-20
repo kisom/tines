@@ -1,11 +1,14 @@
 //! Fragmentation and reassembly of `Observation`s over a byte-oriented link.
 
 use crate::consts;
-use crate::{Frame, NodeId, Observation, ObservationId, Tick, WireError};
+use crate::{
+    wire::{Frame, WireError},
+    NodeId, Observation, ObservationId, Tick,
+};
 use heapless::Vec;
 
 /// Header allowance per fragment (bytes), pinned.
-pub const FRAG_OVERHEAD: usize = 65;
+pub(crate) const FRAG_OVERHEAD: usize = 65;
 
 /// The most fragments one observation may be split into: the reassembler
 /// tracks received indices in a `u64` bitset.
@@ -27,9 +30,11 @@ pub(crate) fn plan(len: usize, mtu: usize) -> Option<(usize, usize)> {
     Some((chunk, count))
 }
 
+// Only reached from alloc-gated tests, so unused under --no-default-features.
+#[allow(dead_code)]
 /// Encodes `obs` as one Obs frame if it fits in `mtu`, else as N Frag frames.
 /// Returns the number of frames; writes each via `emit(frame_bytes)`.
-pub fn fragment(
+pub(crate) fn fragment(
     from: NodeId,
     obs: &Observation,
     mtu: usize,
@@ -74,7 +79,7 @@ pub fn fragment(
 }
 
 /// A single-slot reassembler for inbound Frag streams.
-pub struct Reassembler {
+pub(crate) struct Reassembler {
     id: Option<ObservationId>,
     count: u8,
     received: u64,

@@ -35,6 +35,11 @@ pub struct Dest {
 }
 
 /// An observation published by a node, with content-derived identity.
+///
+/// `#[non_exhaustive]`: a future 1.x may add fields, so build it via the
+/// constructors on [`Observation`] rather than a struct literal outside
+/// `tines-core`.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Observation {
     pub observer: NodeId,

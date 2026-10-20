@@ -7,21 +7,19 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tines_core::{Observation, Payload, Store, Topic};
+use tines_core::{Observation, Store};
 use tines_store::LogStore;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn obs(observer: [u8; 16], seq: u64, age: u64, at: Option<u64>) -> Observation {
-    Observation {
-        observer,
-        seq,
-        age_ms: age,
-        observed_at: at,
-        topic: Topic::from_slice(b"door/3").unwrap(),
-        payload: Payload::from_slice(b"open").unwrap(),
-        dest: None,
-        sig: None,
+    // `Observation` is `#[non_exhaustive]` outside `tines-core` (Task 5);
+    // build it via the public constructor instead of a struct literal.
+    let base = Observation::broadcast(observer, seq, b"door/3", b"open").aged(age);
+    if let Some(at) = at {
+        base.with_observed_at(at)
+    } else {
+        base
     }
 }
 
@@ -335,20 +333,13 @@ mod fleet_fixes_f5 {
     use super::*;
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
-    use tines_core::{Observation, Payload, Store, Topic};
+    use tines_core::{Observation, Store};
     use tines_store::LogStore;
 
     fn a_obs(observer: [u8; 16], seq: u64) -> Observation {
-        Observation {
-            observer,
-            seq,
-            age_ms: 0,
-            observed_at: Some(10),
-            topic: Topic::from_slice(b"door/3").unwrap(),
-            payload: Payload::from_slice(b"open").unwrap(),
-            dest: None,
-            sig: None,
-        }
+        // `Observation` is `#[non_exhaustive]` outside `tines-core` (Task 5);
+        // build it via the public constructor instead of a struct literal.
+        Observation::broadcast(observer, seq, b"door/3", b"open").with_observed_at(10)
     }
 
     /// Flip a byte in the body of the `n`-th record after the header (0 = Boot),

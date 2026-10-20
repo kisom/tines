@@ -21,8 +21,8 @@ use crate::observation::ObservationId;
 
 /// A fixed-size salted Bloom filter keyed by `ObservationId`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Bloom {
-    pub salt: u32,
+pub(crate) struct Bloom {
+    pub(crate) salt: u32,
     bits: [u8; consts::SUMMARY_BYTES],
     /// Bytes in use: a power of two in `1..=SUMMARY_BYTES`.
     len: usize,

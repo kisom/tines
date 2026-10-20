@@ -19,3 +19,7 @@ serde_json = "1"
 
 [dev-dependencies]
 heapless = "0.8"
+# Only for the ipc mock peer, which reconstructs wire frames from tines-core's
+# public `Observation` to classify inbound and synthesize ack/summary frames —
+# without reaching into the private `Frame` enum.
+postcard = "1"

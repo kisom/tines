@@ -1016,15 +1016,13 @@ mod tests {
     }
 
     fn obs(observer: [u8; 16], seq: u64, age: u64, at: Option<u64>) -> Observation {
-        Observation {
-            observer,
-            seq,
-            age_ms: age,
-            observed_at: at,
-            topic: tines_core::Topic::from_slice(b"door/3").unwrap(),
-            payload: tines_core::Payload::from_slice(b"open").unwrap(),
-            dest: None,
-            sig: None,
+        // `Observation` is `#[non_exhaustive]` outside `tines-core` (Task 5);
+        // build it via the public constructor instead of a struct literal.
+        let base = Observation::broadcast(observer, seq, b"door/3", b"open").aged(age);
+        if let Some(at) = at {
+            base.with_observed_at(at)
+        } else {
+            base
         }
     }
 
