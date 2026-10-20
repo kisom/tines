@@ -22,7 +22,7 @@ pub use bloom::Bloom;
 pub use exchange::{DropReason, Exchange, NodeEvent, Peer};
 pub use frag::{fragment, Reassembler};
 pub use node::{Node, ObserveError};
-pub use observation::{NodeId, Observation, ObservationId, Payload, Tick, Topic};
+pub use observation::{Dest, NodeId, Observation, ObservationId, Payload, Tick, Topic};
 pub use store::{Store, StoreError, TrimPolicy};
 pub use transport::{Event, FrameBuf, SendError, Transport};
 pub use wire::{Frame, WireError};

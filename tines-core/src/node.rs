@@ -11,8 +11,8 @@
 //! transport frames are dropped by the [`Exchange`].
 
 use crate::{
-    consts, BeliefPolicy, Exchange, NodeEvent, NodeId, Observation, ObservationId, Payload, Store,
-    StoreError, Tick, Topic, Transport, TrimPolicy,
+    consts, BeliefPolicy, Dest, Exchange, NodeEvent, NodeId, Observation, ObservationId, Payload,
+    Store, StoreError, Tick, Topic, Transport, TrimPolicy,
 };
 
 /// Errors returned by [`Node::observe`].
@@ -91,8 +91,7 @@ impl<S: Store, T: Transport> Node<S, T> {
             observed_at,
             topic,
             payload,
-            to: None,
-            lifetime_ms: None,
+            dest: None,
         };
         self.next_seq += 1;
         let id = obs.id();
@@ -103,8 +102,8 @@ impl<S: Store, T: Transport> Node<S, T> {
     /// Records an observation addressed to `to` with a `lifetime_ms`, made
     /// "now" (with `age_ms = 0`) under `topic`.
     ///
-    /// The resulting observation has `to = Some(to)` and
-    /// `lifetime_ms = Some(lifetime_ms)`, so the exchange will deliver it only
+    /// The resulting observation has `dest = Some(Dest { to, lifetime_ms })`,
+    /// so the exchange will deliver it only
     /// to `to` (see [`Exchange`]). Returns the observation's content-derived
     /// id. An oversized topic or payload is rejected with
     /// [`ObserveError::TooLarge`] rather than truncated; a store rejection is
@@ -128,8 +127,7 @@ impl<S: Store, T: Transport> Node<S, T> {
             observed_at,
             topic,
             payload,
-            to: Some(to),
-            lifetime_ms: Some(lifetime_ms),
+            dest: Some(Dest { to, lifetime_ms }),
         };
         self.next_seq += 1;
         let id = obs.id();
@@ -198,7 +196,7 @@ impl<S: Store, T: Transport> Node<S, T> {
         self.store.for_each_topic(topic_prefix, now, &mut |obs| {
             // App-facing view: broadcast plus addressed to `me` only.
             // Drop anything addressed to a different node.
-            if matches!(obs.to, Some(other) if other != self.me) {
+            if matches!(obs.dest.as_ref().map(|d| d.to), Some(other) if other != self.me) {
                 return;
             }
             let prev = acc.take();

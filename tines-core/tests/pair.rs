@@ -236,8 +236,8 @@ fn observe_to_creates_addressed_message() {
 
     let obs = node.store().get(&id, 0).expect("observation stored");
     assert_eq!(obs.observer, [1; 16]);
-    assert_eq!(obs.to, Some([2; 16]));
-    assert_eq!(obs.lifetime_ms, Some(5000));
+    assert_eq!(obs.dest.as_ref().map(|d| d.to), Some([2; 16]));
+    assert_eq!(obs.dest.as_ref().map(|d| d.lifetime_ms), Some(5000));
     assert_eq!(obs.age_ms, 0);
 }
 

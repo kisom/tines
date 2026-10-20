@@ -145,7 +145,7 @@ mod crc32c {
 /// Magic header: the first 8 bytes of every v1 log.
 const MAGIC: [u8; 8] = *b"TINESLOG";
 /// The `format_version` field of the header. Bump for an incompatible encoding.
-const FORMAT_VERSION: u16 = 1;
+const FORMAT_VERSION: u16 = 2;
 /// 4-byte record sync marker (`b"TING"`), lets a torn/corrupt record be
 /// located and skipped by scanning forward. Made `pub` so hosts/tests can emit
 /// (and corrupt) framing directly.
@@ -502,7 +502,7 @@ impl LogStore {
     }
 }
 
-/// Write the v1 header: `magic ‖ format_version ‖ reserved`.
+/// Write the log header: `magic ‖ format_version ‖ reserved`.
 fn write_header(file: &mut File) -> Result<(), StoreError> {
     file.write_all(&MAGIC).map_err(|_| StoreError::Backend)?;
     file.write_all(&FORMAT_VERSION.to_le_bytes())
@@ -516,9 +516,10 @@ fn write_header(file: &mut File) -> Result<(), StoreError> {
 /// naming the fix (delete the log) in the message.
 fn reject_bad_header(path: &Path, reason: &str) -> Result<(), StoreError> {
     eprintln!(
-        "tines-store: log header invalid ({reason}): {} is not a v1 \
+        "tines-store: log header invalid ({reason}): {} is not a v{} \
          'TINESLOG' log — delete it and start fresh (fleet-fixes F5).",
-        path.display()
+        path.display(),
+        FORMAT_VERSION,
     );
     Err(StoreError::Backend)
 }
@@ -533,7 +534,14 @@ fn validate_header(data: &[u8], path: &Path) -> Result<(), StoreError> {
     }
     let version = u16::from_le_bytes([data[8], data[9]]);
     if version != FORMAT_VERSION {
-        return reject_bad_header(path, &format!("version {version} != {FORMAT_VERSION}"));
+        return reject_bad_header(
+            path,
+            &format!(
+                "on-disk format_version {version} != {FORMAT_VERSION}: the \
+                 Observation encoding changed in 1.0, so this log can no longer \
+                 be decoded"
+            ),
+        );
     }
     Ok(())
 }
@@ -735,22 +743,22 @@ impl Store for LogStore {
 
     fn for_each_broadcast_id(&self, f: &mut dyn FnMut(&ObservationId)) {
         for (id, entry) in self.index.iter() {
-            if entry.obs.to.is_none() {
+            if entry.obs.dest.is_none() {
                 f(id);
             }
         }
     }
 
-    /// Visit the ids of observations addressed to someone (`to == Some`),
+    /// Visit the ids of observations addressed to someone (`dest` is `Some`),
     /// excluding those already released.
     ///
     /// This is stricter than the [`Store`] trait's documented contract
-    /// (`addressed == to == Some`): a released addressed observation has
+    /// (`addressed` == `dest` is `Some`): a released addressed observation has
     /// already been sent to its recipient, so it is intentionally skipped and
     /// not offered for exchange again until (and if) it is re-inserted.
     fn for_each_addressed_id(&self, f: &mut dyn FnMut(&ObservationId)) {
         for (id, entry) in self.index.iter() {
-            if entry.obs.to.is_some() && !entry.released {
+            if entry.obs.dest.is_some() && !entry.released {
                 f(id);
             }
         }
@@ -1015,8 +1023,7 @@ mod tests {
             observed_at: at,
             topic: tines_core::Topic::from_slice(b"door/3").unwrap(),
             payload: tines_core::Payload::from_slice(b"open").unwrap(),
-            to: None,
-            lifetime_ms: None,
+            dest: None,
         }
     }
 

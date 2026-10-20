@@ -217,8 +217,7 @@ mod tests {
             observed_at: None,
             topic: Topic::from_slice(b"door/3").unwrap(),
             payload: Payload::from_slice(&std::vec![0u8; payload_len]).unwrap(),
-            to: None,
-            lifetime_ms: None,
+            dest: None,
         }
     }
 

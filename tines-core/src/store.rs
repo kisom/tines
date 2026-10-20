@@ -61,14 +61,14 @@ pub trait Store {
     fn for_each_id(&self, f: &mut dyn FnMut(&ObservationId));
 
     /// Visit the ids of observations that are not addressed to anyone
-    /// (`to == None`), i.e. broadcasts. Order is unspecified.
+    /// (`dest` is `None`), i.e. broadcasts. Order is unspecified.
     fn for_each_broadcast_id(&self, f: &mut dyn FnMut(&ObservationId));
 
-    /// Visit the ids of observations addressed to someone (`to == Some`).
+    /// Visit the ids of observations addressed to someone (`dest` is `Some`).
     /// Order is unspecified.
     ///
     /// The default visits every id, which is correct since callers still
-    /// check `to`; backends that can filter cheaply should override it so the
+    /// check `dest`; backends that can filter cheaply should override it so the
     /// exchange does not read every broadcast on each poll.
     fn for_each_addressed_id(&self, f: &mut dyn FnMut(&ObservationId)) {
         self.for_each_id(f)

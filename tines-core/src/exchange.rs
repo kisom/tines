@@ -703,9 +703,9 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         for deliver in [true, false] {
             let found = select_addressed(store, now, &self.bounce, &addr, cursor, |id, obs| {
                 let wanted = if deliver {
-                    obs.to == Some(recipient)
+                    obs.dest.as_ref().map(|d| d.to) == Some(recipient)
                 } else {
-                    obs.to.is_some() && obs.to != Some(me)
+                    obs.dest.is_some() && obs.dest.as_ref().map(|d| d.to) != Some(me)
                 };
                 // `out` is scratch here; the chosen frame is re-encoded below.
                 wanted && encode_frame(me, *id, obs, None, mtu, out).is_some()
@@ -753,7 +753,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                 peer.send_queue.remove(pos);
                 undo.requeue = Some((pos, id));
             }
-            if obs.to.is_some()
+            if obs.dest.is_some()
                 && record_bounce(&mut self.bounce, id, addr.clone(), BounceKind::Sent)
             {
                 undo.bounce = Some(id);
@@ -908,7 +908,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                 // recipient alike. The custody chain tracks that a copy left us,
                 // so we stop forwarding this id; final delivery to the recipient
                 // is best-effort, not guaranteed.
-                if store.get(id, now).is_some_and(|obs| obs.to.is_some()) {
+                if store.get(id, now).is_some_and(|obs| obs.dest.is_some()) {
                     store.release(id);
                 }
             } else if bcast_sent_contains(&self.bcast_sent, *id, &addr) {
@@ -938,7 +938,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
             return None;
         }
         let id = obs.id();
-        let addressed = obs.to.is_some();
+        let addressed = obs.dest.is_some();
         let returned = obs.clone();
         let res = store.insert(obs, now);
         // Enqueue a pending ack only for what the store actually kept: a newly
@@ -1003,20 +1003,17 @@ fn summary_bytes(mtu: usize) -> Option<usize> {
 }
 
 /// Returns `true` when a received [`Observation`] must be dropped before it is
-/// stored: either its addressing is malformed, or it is an addressed message
-/// whose age has passed its lifetime.
+/// stored: it is an addressed message (`dest = Some`) whose age has passed its
+/// lifetime.
 ///
-/// An addressed message (`to = Some`) must carry a `lifetime_ms`; a mismatched
-/// pair — `to = Some` with no lifetime, or a lifetime with no recipient —
-/// violates the addressing invariant and is dropped in either direction. A
-/// well-formed addressed message is rejected once its age exceeds its
-/// lifetime. Broadcasts (`to = None`, `lifetime_ms = None`) are never rejected.
+/// An addressed message always carries a lifetime, so the only way to reject
+/// is age exceeding that lifetime. Broadcasts (`dest = None`) are never
+/// rejected. The `Dest` type now enforces the addressed/broadcast pairing, so
+/// there is no separate "malformed addressing" case to drop.
 fn reject(obs: &Observation) -> bool {
-    match (obs.to, obs.lifetime_ms) {
-        (None, None) => false,
-        (Some(_), Some(lifetime)) => obs.age_ms > lifetime,
-        _ => true,
-    }
+    obs.dest
+        .as_ref()
+        .is_some_and(|d| obs.age_ms > d.lifetime_ms)
 }
 
 /// Finds the non-expired, well-formed addressed observation matching
@@ -1054,7 +1051,7 @@ fn select_addressed<S: Store, A: PartialEq>(
         let Some(obs) = store.get(id, now) else {
             return;
         };
-        if obs.to.is_none() || reject(&obs) || store.is_released(id) || !predicate(id, &obs) {
+        if obs.dest.is_none() || reject(&obs) || store.is_released(id) || !predicate(id, &obs) {
             return;
         }
         if is_ahead {
@@ -1272,7 +1269,9 @@ fn insert_pos(heap: &Vec<(ObservationId, u64), { consts::SEND_QUEUE_CAP }>, age:
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
-    use crate::{MemStore, Observation, Payload, SendError, Store, StoreError, Topic, TrimPolicy};
+    use crate::{
+        Dest, MemStore, Observation, Payload, SendError, Store, StoreError, Topic, TrimPolicy,
+    };
     use std::vec::Vec;
 
     const ME: NodeId = [42; 16];
@@ -1292,8 +1291,7 @@ mod tests {
             observed_at: at,
             topic: Topic::from_slice(topic).unwrap(),
             payload: Payload::from_slice(payload).unwrap(),
-            to: None,
-            lifetime_ms: None,
+            dest: None,
         }
     }
 
@@ -1378,8 +1376,8 @@ mod tests {
 
     #[test]
     fn rebuild_send_queue_excludes_addressed() {
-        // A store with one broadcast (`to == None`) and one addressed
-        // (`to = Some([3; 16])`) observation. After a peer contacts us and
+        // A store with one broadcast (`dest = None`) and one addressed
+        // (`dest = Some([3; 16])`) observation. After a peer contacts us and
         // sends an empty Summary (lacking everything), the broadcast diff must
         // queue only the broadcast id and never leak in the addressed id.
         let mut ex = Exchange::new(ME);
@@ -1387,7 +1385,10 @@ mod tests {
         let b = obs([2; 16], 1, 0, None, b"t", b"b");
         let a_id = {
             let mut a = obs([2; 16], 2, 0, None, b"t", b"a");
-            a.to = Some([3; 16]);
+            a.dest = Some(Dest {
+                to: [3; 16],
+                lifetime_ms: consts::SUMMARY_INTERVAL_MS * 10,
+            });
             a.id()
         };
         let b_id = b.id();
@@ -1396,7 +1397,10 @@ mod tests {
             .insert(
                 {
                     let mut a = obs([2; 16], 2, 0, None, b"t", b"a");
-                    a.to = Some([3; 16]);
+                    a.dest = Some(Dest {
+                        to: [3; 16],
+                        lifetime_ms: consts::SUMMARY_INTERVAL_MS * 10,
+                    });
                     a
                 },
                 0,
@@ -1454,9 +1458,10 @@ mod tests {
         payload: &[u8],
     ) -> Observation {
         let mut o = obs(observer, seq, 0, None, topic, payload);
-        o.to = Some(to);
-        // An addressed message must carry a lifetime or `reject` drops it.
-        o.lifetime_ms = Some(consts::SUMMARY_INTERVAL_MS * 10);
+        o.dest = Some(Dest {
+            to,
+            lifetime_ms: consts::SUMMARY_INTERVAL_MS * 10,
+        });
         o
     }
 
@@ -2035,8 +2040,10 @@ mod tests {
         ex.on_event(Event::Contact(1), &mut store, 0);
         // Addressed to us, lifetime 100ms, but age 200ms -> expired.
         let mut o = obs([2; 16], 7, 0, None, b"t", b"hi");
-        o.to = Some(ME);
-        o.lifetime_ms = Some(100);
+        o.dest = Some(Dest {
+            to: ME,
+            lifetime_ms: 100,
+        });
         o.age_ms = 200;
         let frame = Frame::Obs {
             from: [2; 16],
@@ -2060,8 +2067,10 @@ mod tests {
         let mut store = MemStore::new();
         // A large addressed obs that must be fragmented; already expired.
         let mut big = obs([2; 16], 7, 0, None, b"t", &[0u8; 1024]);
-        big.to = Some(ME);
-        big.lifetime_ms = Some(100);
+        big.dest = Some(Dest {
+            to: ME,
+            lifetime_ms: 100,
+        });
         big.age_ms = 200;
         let mut frames: Vec<heapless::Vec<u8, { consts::MAX_FRAME }>> = Vec::new();
         crate::frag::fragment([2; 16], &big, 200, &mut |b| {
@@ -2079,38 +2088,16 @@ mod tests {
     }
 
     #[test]
-    fn addressing_invariant_violation_is_dropped() {
-        let mut ex = Exchange::new(ME);
-        let mut store = MemStore::new();
-        ex.on_event(Event::Contact(1), &mut store, 0);
-        // to = Some but lifetime_ms = None: the lifetime==to invariant is
-        // violated, so this frame is malformed and must be dropped, not stored.
-        let mut o = obs([2; 16], 7, 0, None, b"t", b"hi");
-        o.to = Some(ME);
-        o.lifetime_ms = None;
-        let frame = Frame::Obs {
-            from: [2; 16],
-            obs: o.clone(),
-        };
-        assert!(ex
-            .on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0)
-            .is_none());
-        assert_eq!(
-            store.len(),
-            0,
-            "an invariant-violating frame must not be stored"
-        );
-    }
-
-    #[test]
     fn valid_addressed_obs_is_accepted() {
         let mut ex = Exchange::new(ME);
         let mut store = MemStore::new();
         ex.on_event(Event::Contact(1), &mut store, 0);
         // A well-formed, non-expired addressed obs addressed to us IS stored.
         let mut o = obs([2; 16], 7, 0, None, b"t", b"hi");
-        o.to = Some(ME);
-        o.lifetime_ms = Some(1000);
+        o.dest = Some(Dest {
+            to: ME,
+            lifetime_ms: 1000,
+        });
         let id = o.id();
         let frame = Frame::Obs {
             from: [2; 16],
@@ -2126,38 +2113,16 @@ mod tests {
     }
 
     #[test]
-    fn addressing_invariant_violation_reverse_is_dropped() {
-        let mut ex = Exchange::new(ME);
-        let mut store = MemStore::new();
-        ex.on_event(Event::Contact(1), &mut store, 0);
-        // to = None but lifetime_ms = Some: the invariant is violated in the
-        // reverse direction, so this frame is malformed and must be dropped.
-        let mut o = obs([2; 16], 7, 0, None, b"t", b"hi");
-        o.to = None;
-        o.lifetime_ms = Some(100);
-        let frame = Frame::Obs {
-            from: [2; 16],
-            obs: o.clone(),
-        };
-        assert!(ex
-            .on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0)
-            .is_none());
-        assert_eq!(
-            store.len(),
-            0,
-            "an invariant-violating frame must not be stored"
-        );
-    }
-
-    #[test]
     fn expired_addressed_obs_is_not_forwarded() {
         let mut ex = Exchange::new(ME);
         let mut store = MemStore::new();
         // An addressed obs already past its lifetime, inserted directly so it
         // bypasses the receive-side reject (this tests the FORWARD path).
         let mut o = obs([2; 16], 7, 0, None, b"t", b"hi");
-        o.to = Some([3; 16]);
-        o.lifetime_ms = Some(100);
+        o.dest = Some(Dest {
+            to: [3; 16],
+            lifetime_ms: 100,
+        });
         o.age_ms = 200;
         let id = o.id();
         store.insert(o, 0).unwrap();
@@ -2189,7 +2154,10 @@ mod tests {
         let b = obs([2; 16], 1, 0, None, b"t", b"b");
         let b_id = b.id();
         let mut a = obs([2; 16], 2, 0, None, b"t", b"a");
-        a.to = Some([2; 16]);
+        a.dest = Some(Dest {
+            to: [2; 16],
+            lifetime_ms: consts::SUMMARY_INTERVAL_MS * 10,
+        });
         let a_id = a.id();
         store.insert(b, 0).unwrap();
         store.insert(a, 0).unwrap();
@@ -2214,7 +2182,7 @@ mod tests {
         }
     }
 
-    /// Drains `next_frame` and returns the first `Obs` frame whose `to` matches
+    /// Drains `next_frame` and returns the first `Obs` frame whose destination matches
     /// `want`, along with its destination address — skipping summaries and
     /// non-Obs frames. Breaks on the first match or when `next_frame` yields
     /// `None`.
@@ -2228,7 +2196,7 @@ mod tests {
             let mut buf = [0u8; consts::MAX_FRAME];
             match ex.next_frame(store, consts::MAX_FRAME, 0, &mut buf) {
                 Some((addr, n)) => match Frame::decode(&buf[..n]).unwrap() {
-                    Frame::Obs { obs, .. } if obs.to == want => {
+                    Frame::Obs { obs, .. } if obs.dest.as_ref().map(|d| d.to) == want => {
                         result = Some((addr, obs.id()));
                         break;
                     }
@@ -2246,8 +2214,10 @@ mod tests {
         let mut store = MemStore::new();
         // An addressed obs to [2;16] already held in the store.
         let mut o = obs([2; 16], 5, 0, None, b"t", b"hi");
-        o.to = Some([2; 16]);
-        o.lifetime_ms = Some(consts::SUMMARY_INTERVAL_MS * 10);
+        o.dest = Some(Dest {
+            to: [2; 16],
+            lifetime_ms: consts::SUMMARY_INTERVAL_MS * 10,
+        });
         let id = o.id();
         store.insert(o, 0).unwrap();
 
@@ -2275,8 +2245,10 @@ mod tests {
         let mut store = MemStore::new();
         // Addressed to an unknown node [3;16]; the only peer's id is [2;16].
         let mut o = obs([2; 16], 5, 0, None, b"t", b"hi");
-        o.to = Some([3; 16]);
-        o.lifetime_ms = Some(consts::SUMMARY_INTERVAL_MS * 10);
+        o.dest = Some(Dest {
+            to: [3; 16],
+            lifetime_ms: consts::SUMMARY_INTERVAL_MS * 10,
+        });
         let id = o.id();
         store.insert(o, 0).unwrap();
 
@@ -2302,8 +2274,10 @@ mod tests {
         let mut store = MemStore::new();
         // A single addressed obs, received from addr 1, addressed to [3;16].
         let mut o = obs([2; 16], 7, 0, None, b"t", b"hi");
-        o.to = Some([3; 16]);
-        o.lifetime_ms = Some(consts::SUMMARY_INTERVAL_MS * 10);
+        o.dest = Some(Dest {
+            to: [3; 16],
+            lifetime_ms: consts::SUMMARY_INTERVAL_MS * 10,
+        });
         let frame = Frame::Obs {
             from: [2; 16],
             obs: o,
@@ -2317,7 +2291,9 @@ mod tests {
             let mut buf = [0u8; consts::MAX_FRAME];
             match ex.next_frame(&store, consts::MAX_FRAME, 0, &mut buf) {
                 Some((addr, n)) => match Frame::decode(&buf[..n]).unwrap() {
-                    Frame::Obs { obs, .. } if obs.to == Some([3; 16]) && addr == 1 => {
+                    Frame::Obs { obs, .. }
+                        if obs.dest.as_ref().map(|d| d.to) == Some([3; 16]) && addr == 1 =>
+                    {
                         bounced = true;
                         break;
                     }
@@ -2340,8 +2316,10 @@ mod tests {
 
     fn addressed(observer: [u8; 16], seq: u64, to: [u8; 16], payload: &[u8]) -> Observation {
         let mut o = obs(observer, seq, 0, None, b"t", payload);
-        o.to = Some(to);
-        o.lifetime_ms = Some(1_000_000);
+        o.dest = Some(Dest {
+            to,
+            lifetime_ms: 1_000_000,
+        });
         o
     }
 
@@ -2498,7 +2476,7 @@ mod tests {
         let mut saw_broadcast = false;
         for _ in 0..700 {
             match poll_frame(&mut ex, &store, consts::MAX_FRAME, 0) {
-                Some((_, Frame::Obs { obs, .. }, _)) if obs.to.is_some() => {
+                Some((_, Frame::Obs { obs, .. }, _)) if obs.dest.is_some() => {
                     got.insert(obs.id());
                 }
                 Some((_, Frame::Obs { obs, .. }, _)) if obs.id() == bid => saw_broadcast = true,
@@ -2924,7 +2902,7 @@ mod tests {
         let frame = Frame::Obs { from: peer, obs: x };
         ex.on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0);
         assert!(store.contains(&x_id));
-        assert!(store.get(&x_id, 0).unwrap().to.is_none());
+        assert!(store.get(&x_id, 0).unwrap().dest.is_none());
 
         let ids = heapless::Vec::from_slice(&[x_id]).unwrap();
         let ack = Frame::Ack { from: peer, ids };
@@ -2953,12 +2931,12 @@ mod tests {
         // offered.
         store.release(&b_id);
         let empty: &[(ObservationId, u8, BounceKind)] = &[];
-        let found = select_addressed(&store, 0, empty, &1u8, None, |_id, obs| obs.to.is_some());
+        let found = select_addressed(&store, 0, empty, &1u8, None, |_id, obs| obs.dest.is_some());
         assert_eq!(found.map(|(id, _)| id), Some(a_id));
 
         // Release the addressed id too: nothing remains selectable.
         store.release(&a_id);
-        let found = select_addressed(&store, 0, empty, &1u8, None, |_id, obs| obs.to.is_some());
+        let found = select_addressed(&store, 0, empty, &1u8, None, |_id, obs| obs.dest.is_some());
         assert!(found.is_none(), "an id released by an Ack is not selected");
     }
 
@@ -3189,8 +3167,10 @@ mod tests {
         let mut ex = Exchange::<u8>::new(ME);
         // Addressed to us, lifetime 100ms, but age 200ms -> expired.
         let mut o = obs([2; 16], 7, 200, None, b"t", b"hi");
-        o.to = Some(ME);
-        o.lifetime_ms = Some(100);
+        o.dest = Some(Dest {
+            to: ME,
+            lifetime_ms: 100,
+        });
         let frame = Frame::Obs {
             from: [2; 16],
             obs: o,

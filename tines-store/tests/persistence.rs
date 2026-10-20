@@ -20,8 +20,7 @@ fn obs(observer: [u8; 16], seq: u64, age: u64, at: Option<u64>) -> Observation {
         observed_at: at,
         topic: Topic::from_slice(b"door/3").unwrap(),
         payload: Payload::from_slice(b"open").unwrap(),
-        to: None,
-        lifetime_ms: None,
+        dest: None,
     }
 }
 
@@ -40,6 +39,28 @@ fn store_path(tag: &str) -> PathBuf {
         key
     ));
     p
+}
+
+/// A log whose header declares an older `format_version` must be refused on
+/// open. The 1.0 work changed the Observation encoding (the `dest` field
+/// replaces the old `to`/`lifetime_ms` pair), so a v1 log's records can no
+/// longer be decoded: `open` fails and names the fix (delete the log).
+#[test]
+fn old_format_is_refused() {
+    let path = store_path("oldfmt");
+    {
+        let mut f = std::fs::File::create(&path).unwrap();
+        // magic ‖ format_version (v1, little-endian) ‖ reserved: a genuine v1
+        // header that this build (v2) no longer accepts.
+        f.write_all(b"TINESLOG").unwrap();
+        f.write_all(&1u16.to_le_bytes()).unwrap();
+        f.write_all(&0u16.to_le_bytes()).unwrap();
+        f.flush().unwrap();
+    }
+    assert!(
+        LogStore::open(&path, 0).is_err(),
+        "open must refuse a log whose format_version is older than this build"
+    );
 }
 
 #[test]
@@ -324,8 +345,7 @@ mod fleet_fixes_f5 {
             observed_at: Some(10),
             topic: Topic::from_slice(b"door/3").unwrap(),
             payload: Payload::from_slice(b"open").unwrap(),
-            to: None,
-            lifetime_ms: None,
+            dest: None,
         }
     }
 
@@ -333,7 +353,7 @@ mod fleet_fixes_f5 {
     /// mirroring on-disk corruption of a complete record.
     fn corrupt_record(path: &Path, n: usize) {
         let mut data = std::fs::read(path).expect("read log");
-        let mut pos = 12usize; // past the v1 header
+        let mut pos = 12usize; // past the header
         let mut i = 0;
         while i < n {
             assert!(pos + 12 <= data.len(), "record {i} out of range");

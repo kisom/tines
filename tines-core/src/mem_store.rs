@@ -106,7 +106,7 @@ impl Store for MemStore {
 
     fn for_each_broadcast_id(&self, f: &mut dyn FnMut(&ObservationId)) {
         for (id, held) in self.map.iter() {
-            if held.obs.to.is_none() {
+            if held.obs.dest.is_none() {
                 f(id);
             }
         }
@@ -116,7 +116,7 @@ impl Store for MemStore {
         for (id, held) in self.map.iter() {
             // Skipping released ids is an optimization; the exchange predicate
             // is the load-bearing check.
-            if held.obs.to.is_some() && !held.released {
+            if held.obs.dest.is_some() && !held.released {
                 f(id);
             }
         }
@@ -203,7 +203,7 @@ impl Store for MemStore {
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::MemStore;
-    use crate::observation::{Observation, Payload, Topic};
+    use crate::observation::{Dest, Observation, Payload, Topic};
     use crate::store::{Store, TrimPolicy};
 
     fn obs(observer: [u8; 16], seq: u64, age: u64, at: Option<u64>, topic: &[u8]) -> Observation {
@@ -214,8 +214,7 @@ mod tests {
             observed_at: at,
             topic: Topic::from_slice(topic).unwrap(),
             payload: Payload::from_slice(b"").unwrap(),
-            to: None,
-            lifetime_ms: None,
+            dest: None,
         }
     }
 
@@ -406,7 +405,10 @@ mod tests {
         let broadcast = obs([1; 16], 1, 0, None, b"door/1");
         let broadcast_id = broadcast.id();
         let mut addressed = obs([1; 16], 2, 0, None, b"door/1");
-        addressed.to = Some([2; 16]);
+        addressed.dest = Some(Dest {
+            to: [2; 16],
+            lifetime_ms: 1_000_000,
+        });
         s.insert(broadcast, 0).unwrap();
         s.insert(addressed, 0).unwrap();
 
@@ -423,7 +425,10 @@ mod tests {
         // 10 addressed observations with increasing current age.
         for i in 0..10u64 {
             let mut addressed = obs([1; 16], i, (i + 1) * 10, None, b"t");
-            addressed.to = Some([2; 16]);
+            addressed.dest = Some(Dest {
+                to: [2; 16],
+                lifetime_ms: 1_000_000,
+            });
             s.insert(addressed, 0).unwrap();
         }
         // One broadcast, youngest of all, so the count trim keeps it.
