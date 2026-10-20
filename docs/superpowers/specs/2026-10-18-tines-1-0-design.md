@@ -5,7 +5,7 @@ Status: approved by Kyle (2026-10-20). Kyle decided D1–D5 and Q1–Q3
 (2026-10-18) and the review decisions R1–R3 and the `observed_at`
 definition (2026-10-19); review fixes applied. v6 added §10 (core hardening
 from `THREAT_MODEL.md`) and the adversarial fuzz mode; Kyle reviewed and
-approved both (2026-10-20).
+approved both (2026-10-20). Decisions F (`flush`) and G (age across downtime) added 2026-10-20.
 Builds on: `2026-10-16-tines-design.md`, `2026-10-18-tines-addressed-delivery.md`,
 `2026-10-18-tines-fleet-deployment-design.md` (assumed fully implemented)
 
@@ -220,6 +220,33 @@ pub struct Dest { pub to: NodeId, pub lifetime_ms: u64 }
     monotonic milliseconds and never crosses the wire.
 
   The rustdoc on the field says all of this.
+- **`age_ms` is a lower bound on the true age (decision G).** It counts the
+  time the observation spent on running clocks, and not counted are:
+  - time a holder was powered off, since `Tick` restarts at 0 on every boot;
+  - time between a holder's last `flush` and a crash (§4);
+  - time in flight, since a frame carries the age it had when sent.
+
+  So errors only ever make an observation look younger, which is the
+  dangerous direction:
+  - a stale fact wins `LatestWins`;
+  - a young age spreads, and first-copy-wins dedupe keeps it;
+  - an addressed message outlives its `lifetime_ms`;
+  - `trim` by `max_age_ms` keeps what it should drop.
+
+  1.0 handles each gap:
+  - **Power-off time** is recovered by the store, from a wall clock, when it
+    opens (§9). The fleet assumes every robot has a clock it can trust
+    across a sleep, an RTC or GPS (decision G). It's cheap, and robots sleep
+    through charge cycles.
+  - **Crash time** is bounded by how often the host flushes (§4; host work,
+    `THREAT_MODEL.md` F18).
+  - **In-flight time** is negligible on the links tines targets, and is
+    accepted.
+
+  The rustdoc on `age_ms` says it's a lower bound and points applications
+  that need absolute time to `observed_at`. With a trusted clock assumed,
+  hosts set `observed_at` on every observation they make (R4). Today both
+  hosts pass `None`.
 - `reject()` keeps only the expiry check; the malformed-pair branch and its
   tests go away (the pairing is now enforced by the type, including on
   decode).
@@ -386,7 +413,11 @@ is a doc-comment link in `tines-sim/src/world.rs`, which is updated.
   (`TrimPolicy::default()` + field assignment still works).
 - `Node` keeps its current methods: `new`, `id`, `next_seq`, `observe`,
   `observe_to`, `poll`, `drain_events`, `belief`, `trim`, `store`,
-  `transport_mut`. `drain_events` returns `NodeEvent<T::Addr>`s: queued
+  `transport_mut`.
+  - It gains `flush(now) -> Result<(), StoreError>`, which delegates to
+    `Store::flush` (§4; decision F).
+  - `store_mut`, added by the fleet fixes so the service could reach
+    `LogStore::flush`, is removed. Read access through `store()` stays. `drain_events` returns `NodeEvent<T::Addr>`s: queued
   `Delivered` events, then one `Dropped` per nonzero drop counter (§1).
 - Every remaining public item is documented; `#![deny(missing_docs)]` goes in
   `tines-core/src/lib.rs` (26 items are missing docs as of the fleet
@@ -401,6 +432,23 @@ changes:
 
 - **`is_empty()`** gains a default (`len() == 0`), dropping the
   `len_without_is_empty` allow.
+- **`flush(&mut self, now: Tick) -> Result<(), StoreError>`** is added,
+  with a default that does nothing and returns `Ok(())` (decision F). It's
+  the store's durability point, and it does two things:
+  - everything inserted, released or trimmed so far is durable;
+  - `now` becomes the time anchor for ages after a restart.
+
+  More of the contract:
+  - Flushing twice is harmless.
+  - A `now` earlier than the last anchor is clamped to it.
+  - A failure returns `Err(StoreError::Backend)` and leaves the store
+    usable.
+  - The application decides when to flush; core never calls `flush`
+    itself. On flash, every flush costs wear, so how often is the
+    application's call, like `poll` and `trim`.
+  - `MemStore` keeps the default. `LogStore` implements it, and its clock
+    marker uses the caller's `now`; today it uses the tick of the last new
+    insert (`THREAT_MODEL.md` F18).
 - **Release semantics are documented as best-effort.** `release` stays
   infallible (`()`): if a persistent backend fails to record a release, the
   worst case after reboot is a resumed copy, i.e. a duplicate custodian.
@@ -426,7 +474,8 @@ changes:
   - release surviving `get`,
   - `sig` round-tripping,
   - trim order,
-  - no tombstones.
+  - no tombstones,
+  - `flush` being idempotent and leaving the store usable.
 
   `MemStore` and `tines-store` both run it. This is new public API, called
   out per AGENTS.md: it's what makes a third-party `Store` trustworthy.
@@ -566,6 +615,35 @@ the new `Observation` encoding. There is no migration:
   `Observation` encoding. Opening a log with an older version is an error
   that names the fix (delete the log). Silently misparsing an old log is
   not allowed.
+- **Ages across downtime (decision G).** The same format bump adds a
+  wall-clock reading to the clock marker `flush` writes: the host's trusted
+  wall time in milliseconds since the Unix epoch, or none.
+  - `LogStore::open` takes the host's current trusted wall time,
+    `Option<u64>`. The host passes `None` if its clock isn't trusted, for
+    example a dead RTC battery with no GPS fix yet.
+  - **Downtime known:** both readings are present and now ≥ the marker.
+    `open` adds `now − marker` to every held observation's age,
+    saturating, on top of the tick fold it already does.
+  - **Downtime unknown:** either reading is missing, or the clock went
+    backwards. `open` treats every held **addressed** observation as
+    expired: its age is set past `lifetime_ms`, so core never delivers or
+    forwards it, and `open` reports the count once. A custodian that can't
+    tell how long it slept must not deliver a directive that may have
+    expired. Losing a possibly valid one is the lesser harm, because
+    sharing is opportunistic and the originator can re-issue.
+  - **Broadcasts when downtime is unknown:** they're kept, but their age
+    isn't trusted. `open` raises every held broadcast's age to at least
+    `unknown_downtime_age_ms`, an open option the host configures.
+    - They lose `LatestWins` to any fresher fact and age out with the rest.
+    - They stay available as a last resort for topics nobody else has
+      reported.
+    - The floor must be below the host's trim `max_age_ms`; otherwise the
+      next trim drops them, and that's option 2 (drop) by another name.
+      The default is left to the builder (host hardening, F10, sets the
+      trim defaults).
+  - Every `open` that runs a fold reports the downtime it applied, or that
+    it was unknown, once (stderr plus a counter, like the skipped-record
+    count).
 - Hosts wipe pre-1.0 logs on upgrade. That's acceptable because no robot
   runs tines yet, and none will be deployed with a pre-1.0 `tines-core`.
 - The header is what makes a later migration possible if one is ever
@@ -675,6 +753,34 @@ The review's other fixes are applied too:
 - **R4. `observed_at` is defined** as the observer's wall-clock time in
   milliseconds since the Unix epoch (UTC), or `None` if the observer has no
   trusted clock. Relays never change it, and it's unrelated to `Tick` (§2).
+
+## Decisions (Kyle, 2026-10-20)
+
+- **F. `flush` goes on the `Store` trait, and `Node::flush(now)` replaces
+  `Node::store_mut`** (§3, §4).
+  - Every persistent backend needs a durability point and a time anchor,
+    so it belongs in the trait contract, not in one backend's own method.
+  - The default does nothing, so core stays I/O-free and `MemStore`
+    doesn't change.
+  - The application controls when flushes happen.
+  - Removing `store_mut` stops applications from changing the store behind
+    the exchange's back.
+  - Taking `now` also fixes `LogStore`'s stale clock marker (F18).
+  - The hosts' timed and shutdown flushes stay host work (F18).
+
+- **G. Age across downtime** (§2, §9).
+  - `age_ms` is documented as a lower bound on the true age.
+  - Robots are assumed to have a trusted wall clock (RTC or GPS), cheap
+    for robots that sleep through charge cycles.
+  - Stores add power-off time on open, using a wall-clock reading in the
+    flush marker.
+  - When downtime can't be known, held addressed messages are expired:
+    possibly delivering an expired directive is worse than possibly
+    dropping a valid one, since sharing is opportunistic.
+  - Hosts set `observed_at`.
+  - When downtime can't be known, held broadcasts are kept but their age
+    is floored at `unknown_downtime_age_ms` (Kyle, 2026-10-20): assume the
+    worst about freshness without discarding data.
 
 ## Left to the builder
 

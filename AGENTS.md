@@ -24,7 +24,10 @@ architecture in the **spec first**:
 - **Implementation plans:** `docs/superpowers/plans/`
 
 The plans argue from the specs. Where a plan is silent, the **spec rules**.
-Do not edit the specs or the plans — they are design history, not source.
+Do not edit the specs or the plans on your own initiative — they are design
+history, not source. Change one only to record something Kyle has discussed
+and agreed, and record it as a dated decision in that document. Anything
+else that needs changing in a spec goes to Kyle first.
 `README.md` is the user-facing overview and should track the code.
 `THREAT_MODEL.md` is the living security assessment: when a change fixes or
 changes a finding, update its status there (§1 and §10) with the commit.
