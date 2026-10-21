@@ -25,7 +25,7 @@ pub use node::{Node, ObserveError};
 pub use observation::{
     Dest, NodeId, Observation, ObservationId, Payload, SigAlgo, Signature, Tick, Topic,
 };
-pub use store::{Store, StoreError, TrimPolicy};
+pub use store::{Store, StoreError, TrimPolicy, WallClockStore};
 pub use transport::{Event, FrameBuf, SendError, Transport};
 pub use wire::{frame_sender, Frame, WireError};
 

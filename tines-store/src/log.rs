@@ -88,7 +88,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tines_core::{Observation, ObservationId, Store, StoreError, Tick, TrimPolicy};
+use tines_core::{Observation, ObservationId, Store, StoreError, Tick, TrimPolicy, WallClockStore};
 
 mod crc32c {
     //! A minimal, std-only CRC-32C (Castagnoli).
@@ -799,6 +799,18 @@ impl LogStore {
     /// otherwise (mirrors [`LogStore::fold_report`]).
     pub fn fold_report(&self) -> Option<FoldReport> {
         self.fold_report
+    }
+}
+
+impl WallClockStore for LogStore {
+    type FoldReport = FoldReport;
+
+    fn set_wall_clock(&mut self, wall_now: u64, now: Tick) -> FoldReport {
+        LogStore::set_wall_clock(self, wall_now, now)
+    }
+
+    fn peer_time_estimate(&self, now: Tick) -> Option<u64> {
+        LogStore::peer_time_estimate(self, now)
     }
 }
 

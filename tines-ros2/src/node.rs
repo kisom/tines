@@ -223,10 +223,10 @@ impl TinesNode {
         if self.clock.is_trusted() {
             return;
         }
-        let Some(est) = self.tines.store_mut().peer_time_estimate(now) else {
+        let Some(est) = self.tines.peer_time_estimate(now) else {
             return;
         };
-        let report = self.tines.store_mut().set_wall_clock(est, now);
+        let report = self.tines.set_wall_clock(est, now);
         self.clock.anchor_wall(est, now);
         match report.downtime_ms {
             Some(ms) => println!("tines: trusted wall clock from peer (folded {ms} ms downtime)"),

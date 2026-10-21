@@ -691,7 +691,6 @@ fn smallest_age_wins() {
 
     let now = t;
     let est = node_b
-        .store_mut()
         .peer_time_estimate(now)
         .expect("peer_time_estimate should find both observations");
     // The young observation's observed_at (wall + 5000) is newer, so the
@@ -744,7 +743,6 @@ fn time_from_peer() {
     // which is A's broadcast.
     let now_b = t;
     let est = node_b
-        .store_mut()
         .peer_time_estimate(now_b)
         .expect("peer_time_estimate should find A's broadcast");
 
@@ -763,7 +761,7 @@ fn time_from_peer() {
     // (unknown) downtime B is in, the fold ages its held observation past
     // lifetime and lifts its quarantine (the "becomes visible" event): the fold
     // report counts exactly that one addressed observation expiring.
-    let report = node_b.store_mut().set_wall_clock(est, now_b);
+    let report = node_b.set_wall_clock(est, now_b);
     assert_eq!(
         report.downtime_ms, None,
         "unknown downtime for a fresh store"

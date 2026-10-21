@@ -127,3 +127,25 @@ pub trait Store {
 pub(crate) fn current_age(obs: &Observation, stored_at: Tick, now: Tick) -> u64 {
     obs.age_ms.saturating_add(now.saturating_sub(stored_at))
 }
+
+/// A [`Store`] that a host can feed trusted wall-clock time into.
+///
+/// tines-core itself never deals with wall time — this trait is a host-facing
+/// hook so a host can lift the quarantine on observations held across a
+/// power-off, and estimate trusted time from a peer's observation, without a
+/// general `&mut Store` backdoor (decision F in the spec). Only backends that
+/// support a wall-clock fold implement it; `MemStore` and other pure-tick
+/// stores do not.
+pub trait WallClockStore: Store {
+    /// Summary of a wall-clock fold, for the host's logs.
+    type FoldReport;
+
+    /// Fold trusted wall time into the store, lifting the quarantine on held
+    /// observations. The host calls this exactly once, on the first trusted
+    /// time.
+    fn set_wall_clock(&mut self, wall_now: u64, now: Tick) -> Self::FoldReport;
+
+    /// Best estimate of trusted wall time from a peer's observation stored
+    /// since the last open, if any. `None` means stay quarantined.
+    fn peer_time_estimate(&self, now: Tick) -> Option<u64>;
+}

@@ -12,7 +12,7 @@
 
 use crate::{
     consts, exchange::Exchange, BeliefPolicy, Dest, NodeEvent, NodeId, Observation, ObservationId,
-    Payload, Store, StoreError, Tick, Topic, Transport, TrimPolicy,
+    Payload, Store, StoreError, Tick, Topic, Transport, TrimPolicy, WallClockStore,
 };
 
 /// Errors returned by [`Node::observe`].
@@ -219,13 +219,22 @@ impl<S: Store, T: Transport> Node<S, T> {
         &self.store
     }
 
-    /// Mutable access to the backing store.
-    ///
-    /// Used by the host for the trusted-time state machine — peer-observation
-    /// time estimation (`LogStore::peer_time_estimate`) and, once trusted,
-    /// anchoring the wall clock (`LogStore::set_wall_clock`).
-    pub fn store_mut(&mut self) -> &mut S {
-        &mut self.store
+    /// Lift the quarantine on held observations once the host has trusted wall
+    /// time, by folding the wall clock into a [`WallClockStore`] backend.
+    pub fn set_wall_clock(&mut self, wall_now: u64, now: Tick) -> <S as WallClockStore>::FoldReport
+    where
+        S: WallClockStore,
+    {
+        self.store.set_wall_clock(wall_now, now)
+    }
+
+    /// Best estimate of trusted wall time from a peer's observation, if the
+    /// backend supports it (see [`WallClockStore`]).
+    pub fn peer_time_estimate(&self, now: Tick) -> Option<u64>
+    where
+        S: WallClockStore,
+    {
+        self.store.peer_time_estimate(now)
     }
 
     /// Best-effort durability flush, advancing each stored observation's age

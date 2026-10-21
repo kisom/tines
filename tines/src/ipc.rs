@@ -238,8 +238,8 @@ where
     // quarantined — the robot's own fail-safe is outside tines.
     if !clock.is_trusted() {
         let now = clock.now();
-        if let Some(est) = node.store_mut().peer_time_estimate(now) {
-            node.store_mut().set_wall_clock(est, now);
+        if let Some(est) = node.peer_time_estimate(now) {
+            node.set_wall_clock(est, now);
             clock.anchor_wall(est, now);
             eprintln!("tines: trusted wall clock from peer (estimate {est} ms)");
         }
