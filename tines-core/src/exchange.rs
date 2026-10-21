@@ -61,6 +61,10 @@ pub enum DropReason {
     },
     /// The frame was not a valid `Frame` (truncated, garbage, or empty).
     Malformed,
+    /// The frame's `from` no longer matches the node id this peer was pinned to
+    /// on its first frame (F6). The pinned id is kept; the frame is not stored.
+    #[non_exhaustive]
+    IdentityChanged,
 }
 
 /// Emitted by [`crate::Node::drain_events`] for either a broadcast a peer
@@ -171,6 +175,12 @@ pub(crate) struct Peer<A> {
     pub addr: A,
     /// Node id learned from the first frame received from this peer.
     pub id: Option<NodeId>,
+    /// Tick of the last inbound frame this peer sent; used to evict a peer
+    /// idle beyond [`consts::PEER_IDLE_MS`] as if Lost.
+    last_inbound: Option<Tick>,
+    /// Tick of the last summary we acted on from this peer; enforces the
+    /// one-summary-per-[`consts::SUMMARY_INTERVAL_MS`] replay limit (F9).
+    last_summary_received: Option<Tick>,
     /// The peer's last-sent summary, if any. Used to queue only what they lack.
     pub their_summary: Option<Bloom>,
     /// Observations to send to this peer, youngest (lowest current age) first;
@@ -199,6 +209,8 @@ impl<A> Peer<A> {
         Peer {
             addr,
             id: None,
+            last_inbound: None,
+            last_summary_received: None,
             their_summary: None,
             send_queue: Vec::new(),
             last_summary_sent: None,
@@ -246,6 +258,11 @@ impl<A: Clone> AckBuffer<A> {
 
     fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Empty the buffer (F13): purge all pending acks when the peer goes away.
+    fn clear(&mut self) {
+        self.entries.clear();
     }
 
     /// Enqueue `(id, addr)`, dropping the oldest entry if the buffer is full.
@@ -817,6 +834,10 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         if let Some(idx) = self.peers.iter().position(|p| p.addr == *addr) {
             self.peers.remove(idx);
         }
+        // F13: purge any pending acks to the removed peer so their ids are
+        // never acked again under this contact.
+        self.acks.clear();
+        self.bcast_acks.clear();
         self.forget_bounces(addr);
     }
 
@@ -863,12 +884,43 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         };
         let idx = self.peer_index(&addr)?;
         let peer = &mut self.peers[idx];
-        peer.id = Some(frame.sender());
+        // F8: a peer silent past the idle window is removed as if Lost — no
+        // further inbound frame is stored for it under this contact.
+        if let Some(last) = peer.last_inbound {
+            if now.saturating_sub(last) > consts::PEER_IDLE_MS {
+                self.remove_peer(&addr);
+                return None;
+            }
+        }
+        // F6: the first frame pins the peer's node id; a later frame whose
+        // sender no longer matches is dropped and counted as IdentityChanged and
+        // the pinned id is NOT upgraded to the newcomer. The pin resets on
+        // Contact/Lost via `peer_index`'s implicit-contact peer.
+        let sender = frame.sender();
+        if let Some(pinned) = peer.id {
+            if pinned != sender {
+                self.drops.record(addr, DropReason::IdentityChanged);
+                return None;
+            }
+        } else {
+            peer.id = Some(sender);
+        }
+        peer.last_inbound = Some(now);
         match frame {
             Frame::Summary { salt, bits, .. } => {
-                if let Some(bloom) = Bloom::from_parts(salt, &bits) {
-                    peer.their_summary = Some(bloom);
-                    rebuild_send_queue(peer, &*store, now);
+                // F9: act on at most one received Summary per peer per
+                // SUMMARY_INTERVAL_MS. A replayed summary within the interval is
+                // ignored — a policy, not a drop.
+                let recently = match peer.last_summary_received {
+                    Some(received) => now.saturating_sub(received) < consts::SUMMARY_INTERVAL_MS,
+                    None => false,
+                };
+                if !recently {
+                    if let Some(bloom) = Bloom::from_parts(salt, &bits) {
+                        peer.last_summary_received = Some(now);
+                        peer.their_summary = Some(bloom);
+                        rebuild_send_queue(peer, &*store, now);
+                    }
                 }
                 None
             }
@@ -916,7 +968,13 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                     store.release(id);
                 }
             } else if bcast_sent_contains(&self.bcast_sent, *id, &addr) {
-                // Broadcast: the peer confirms it holds our broadcast.
+                // Broadcast: the peer confirms it holds our broadcast. When the
+                // delivery queue is full, drop the OLDEST Delivered rather than
+                // the newest (a bare `push` drops the newest) so the freshest
+                // confirmed deliveries survive overflow (F13).
+                if self.events.is_full() {
+                    let _ = self.events.remove(0);
+                }
                 let _ = self.events.push(NodeEvent::Delivered {
                     peer: from,
                     id: *id,
@@ -3267,5 +3325,207 @@ mod tests {
             consts::DROP_TABLE_CAP,
             "all capped entries reported"
         );
+    }
+
+    /// F6: the first frame from a peer pins its node id. A later frame whose
+    /// sender no longer matches is dropped and counted as `IdentityChanged`,
+    /// and the pinned id is NOT upgraded to the newcomer.
+    #[test]
+    fn id_changes_are_dropped_as_identity_changed() {
+        let a: NodeId = [2; 16];
+        let b: NodeId = [9; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        ex.on_event(Event::Contact(1), &mut store, 0);
+
+        // Frame 1 pins the peer id to A.
+        let f1 = Frame::Obs {
+            from: a,
+            obs: obs(a, 1, 0, None, b"t", b"x"),
+        };
+        ex.on_event(Event::Frame(1, frame_bytes(&f1)), &mut store, 0);
+        assert_eq!(ex.peers()[0].id, Some(a));
+
+        // Frame 2 claims from = B: dropped as IdentityChanged, id not upgraded.
+        let f2 = Frame::Obs {
+            from: b,
+            obs: obs(b, 1, 0, None, b"t", b"y"),
+        };
+        assert!(
+            ex.on_event(Event::Frame(1, frame_bytes(&f2)), &mut store, 0)
+                .is_none(),
+            "a changed-identity frame is not stored"
+        );
+        assert_eq!(
+            ex.peers()[0].id,
+            Some(a),
+            "the pinned id is not upgraded to B"
+        );
+
+        // The drop is counted as IdentityChanged.
+        let drained = ex.drain_events();
+        assert!(
+            drained.iter().any(|e| matches!(
+                e,
+                NodeEvent::Dropped {
+                    addr: Some(1u8),
+                    reason: DropReason::IdentityChanged,
+                    ..
+                }
+            )),
+            "a changed identity is counted as IdentityChanged; drained: {drained:?}"
+        );
+    }
+
+    /// F8: a peer with no inbound frame for longer than `PEER_IDLE_MS` is
+    /// removed as if Lost.
+    #[test]
+    fn idle_peer_is_evicted() {
+        let a: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        assert_eq!(ex.peers().len(), 1);
+
+        // First frame at now=0 establishes last_inbound.
+        let f1 = Frame::Obs {
+            from: a,
+            obs: obs(a, 1, 0, None, b"t", b"x"),
+        };
+        ex.on_event(Event::Frame(1, frame_bytes(&f1)), &mut store, 0);
+        assert_eq!(ex.peers().len(), 1);
+
+        // A second frame arriving past the idle window evicts the peer.
+        let idle = consts::PEER_IDLE_MS + 1;
+        assert!(
+            ex.on_event(Event::Frame(1, frame_bytes(&f1)), &mut store, idle)
+                .is_none(),
+            "a frame past the idle window is not stored"
+        );
+        assert_eq!(ex.peers().len(), 0, "an idle peer is removed as if Lost");
+    }
+
+    /// F9: two summaries from one peer within `SUMMARY_INTERVAL_MS` — the
+    /// second is ignored (a policy, not a drop) and produces no re-send.
+    #[test]
+    fn replayed_summary_is_ignored() {
+        let a: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        // One broadcast the peer lacks.
+        let b = obs(a, 1, 0, None, b"t", b"bc");
+        let b_id = b.id();
+        store.insert(b, 0).unwrap();
+
+        // Summary 1 (empty) at now=0: peer lacks everything → broadcast queued.
+        empty_summary(&mut ex, &mut store, 1, a);
+        let mut buf = [0u8; consts::MAX_FRAME];
+        let mut sent = false;
+        for _ in 0..consts::MAX_FRAME {
+            let n = match ex.next_frame(&store, consts::MAX_FRAME, 0, &mut buf) {
+                Some((_, n)) => n,
+                None => break,
+            };
+            match Frame::decode(&buf[..n]).unwrap() {
+                Frame::Obs { obs, .. } if obs.id() == b_id => {
+                    sent = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(sent, "the broadcast was dispatched once");
+
+        // Summary 2 within the interval: ignored, so the broadcast is never
+        // re-sent.
+        empty_summary(&mut ex, &mut store, 1, a);
+        let mut reemitted = false;
+        for _ in 0..consts::MAX_FRAME {
+            let mut buf2 = [0u8; consts::MAX_FRAME];
+            let n = match ex.next_frame(&store, consts::MAX_FRAME, 0, &mut buf2) {
+                Some((_, n)) => n,
+                None => break,
+            };
+            match Frame::decode(&buf2[..n]).unwrap() {
+                Frame::Obs { obs, .. } if obs.id() == b_id => {
+                    reemitted = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            !reemitted,
+            "a second summary within the interval is ignored, not re-sent"
+        );
+    }
+
+    /// F13: when the delivery queue overflows, the OLDEST `Delivered` is
+    /// dropped (not the newest, as a bare push does).
+    #[test]
+    fn events_drop_oldest() {
+        let peer: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let b = obs([3; 16], 1, 0, None, b"t", b"bc");
+        let b_id = b.id();
+        store.insert(b, 0).unwrap();
+        deliver_to(&mut ex, &mut store, 1, b_id);
+
+        let ack = Frame::Ack {
+            from: peer,
+            ids: heapless::Vec::from_slice(&[b_id]).unwrap(),
+        };
+
+        // Fill the delivery queue to capacity with sentinel ids 0..64.
+        for seq in 0..consts::EVENT_QUEUE_CAP as u64 {
+            let id = [seq as u8; 16];
+            ex.events.push(NodeEvent::Delivered { peer, id }).unwrap();
+        }
+        assert!(ex.events.is_full());
+
+        // The ack fires a Delivered for b_id; the queue is full, so the oldest
+        // (seq 0) is dropped and b_id retained as the newest.
+        ex.on_event(Event::Frame(1, frame_bytes(&ack)), &mut store, 0);
+
+        let drained = ex.drain_events();
+        let first = match &drained[0] {
+            NodeEvent::Delivered { id, .. } => *id,
+            other => panic!("expected a Delivered event, got {other:?}"),
+        };
+        assert_eq!(first, [1u8; 16], "the oldest Delivered (seq 0) was dropped");
+        match drained.last().unwrap() {
+            NodeEvent::Delivered { id, .. } => {
+                assert_eq!(*id, b_id, "the newest Delivered is retained")
+            }
+            other => panic!("expected a Delivered event, got {other:?}"),
+        }
+    }
+
+    /// F13: pending acks to a removed peer are cleared on Lost.
+    #[test]
+    fn lost_peer_purges_pending_acks() {
+        let a: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        empty_summary(&mut ex, &mut store, 1, a);
+
+        // A received broadcast has a pending broadcast ack.
+        let y = obs(a, 1, 0, None, b"t", b"bc");
+        let frame = Frame::Obs { from: a, obs: y };
+        ex.on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0);
+        assert_eq!(
+            ex.bcast_acks.len(),
+            1,
+            "a received broadcast has a pending broadcast ack"
+        );
+
+        // Lost(addr 1) must purge pending acks.
+        ex.on_event(Event::Lost(1), &mut store, 0);
+        assert!(
+            ex.bcast_acks.entries.is_empty(),
+            "Lost purges pending broadcast acks"
+        );
+        assert!(ex.acks.entries.is_empty(), "Lost purges pending acks");
     }
 }

@@ -83,3 +83,8 @@ pub const BCAST_SENT_CAP: usize = 256;
 /// LOCAL. Pending ack-id buffer (`acks` for addressed, `bcast_acks` for
 /// broadcast) before the next Ack is emitted; overflow drops the oldest entry.
 pub const ACK_BUFFER_CAP: usize = 256;
+
+/// LOCAL. Idle eviction window: a peer with no inbound frame for longer than
+/// this many ticks is removed as if Lost (`crate::exchange`). Never crosses
+/// the wire; local only.
+pub const PEER_IDLE_MS: u64 = 30_000;

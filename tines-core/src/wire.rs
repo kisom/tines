@@ -76,8 +76,18 @@ impl Frame {
         if bytes[0] != consts::WIRE_VERSION {
             return Err(WireError::VersionMismatch { version: bytes[0] });
         }
-        match postcard::from_bytes::<Frame>(&bytes[1..]) {
-            Ok(frame) => Ok(frame),
+        match postcard::take_from_bytes::<Frame>(&bytes[1..]) {
+            // Require a CANONICAL frame: the whole payload after the version
+            // byte must be the frame, with zero trailing bytes. Anything extra
+            // (a second frame, padding, garbage) is Malformed, not a valid
+            // frame with trailing junk (F13).
+            Ok((frame, rest)) => {
+                if rest.is_empty() {
+                    Ok(frame)
+                } else {
+                    Err(WireError::Malformed)
+                }
+            }
             Err(_) => Err(WireError::Malformed),
         }
     }
@@ -469,6 +479,27 @@ mod tests {
         let mut buf = [0u8; consts::MAX_FRAME];
         let n = f.encode(&mut buf).unwrap();
         assert!(Frame::decode(&buf[..n / 2]).is_err());
+    }
+
+    #[test]
+    fn trailing_bytes_are_malformed() {
+        // A complete frame with extra bytes after it is NOT canonical: the
+        // version byte matches and postcard decodes the frame, but the
+        // remainder is non-empty. Per F13 the decode must require a CANONICAL
+        // frame — reject trailing bytes as `Malformed` rather than the lenient
+        // `from_bytes` behavior that silently ignores them.
+        let f = obs_frame();
+        let mut buf = [0u8; consts::MAX_FRAME];
+        let n = f.encode(&mut buf).unwrap();
+        let mut with_trailer = std::vec![0u8; n + 3];
+        with_trailer[..n].copy_from_slice(&buf[..n]);
+        with_trailer[n] = 0x00;
+        with_trailer[n + 1] = 0x00;
+        with_trailer[n + 2] = 0x00;
+        assert_eq!(
+            Frame::decode(&with_trailer).err(),
+            Some(WireError::Malformed)
+        );
     }
 
     #[test]
