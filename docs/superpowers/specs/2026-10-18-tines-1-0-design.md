@@ -723,11 +723,13 @@ decides who is allowed to be a peer.
    - At most one received Summary per peer is acted on per
      `SUMMARY_INTERVAL_MS`. Extra ones are ignored; that's a policy, not a
      drop.
-   - The send-queue rebuild skips ids already sent to that peer this
-     contact, using the existing per-peer sent record. That record is
-     best-effort under its cap, and a miss only costs a resend.
-   - The worst-case output per received summary stays bounded by
-     `SEND_QUEUE_CAP`, but repeating the summary no longer re-sends.
+   - The send-queue rebuild skips ids the peer's summary says it already has
+     (`Bloom::might_contain`), and the worst-case output per received summary
+     stays bounded by `SEND_QUEUE_CAP`. The rate limit bounds replay, and a
+     peer that genuinely lost an id still gets it re-sent on its next summary,
+     so lossy convergence is preserved. (Amended 2026-10-20, Kyle: the earlier
+     "skip ids already sent this contact" clause was dropped — it broke lossy
+     convergence, since "dispatched" does not mean "received".)
 4. **F13 — smaller defects:**
    - **Event queue drops the oldest** when full, as its docs and the fleet
      spec say (today `push` silently drops the newest, exchange.rs:777).
