@@ -15,4 +15,7 @@ cargo test --locked -p tines-core --features conformance
 cargo test --locked -p tines-store --features conformance
 cargo test --locked -p tines-sim --features conformance
 cargo test --locked -p tines-core --no-default-features
+# The std-free conformance suite also runs with `--no-default-features`, so the
+# no_std + conformance combination is actually exercised (not just by inspection).
+cargo test --locked -p tines-core --no-default-features --features conformance
 sh scripts/check-no-std.sh

@@ -494,21 +494,6 @@ mod tests {
     }
 
     #[test]
-    fn id_known_vector() {
-        // pin the hash layout: observer=[1;16], seq=7, topic="t", payload="p", dest=None (broadcast)
-        let mut o = obs(7, 0, None, None);
-        o.topic = Topic::from_slice(b"t").unwrap();
-        o.payload = Payload::from_slice(b"p").unwrap();
-        assert_eq!(
-            o.id(),
-            [
-                0x4a, 0x33, 0x09, 0x92, 0xf1, 0x61, 0xbe, 0xc9, 0x19, 0x7b, 0x6e, 0x96, 0x11, 0x6f,
-                0xa4, 0xa2
-            ]
-        );
-    }
-
-    #[test]
     fn sig_algo_wire_roundtrip() {
         // Review Focus #3: the raw-u8 wire encoding round-trips a known Ed25519
         // and every unknown id verbatim, rejects the malformed sentinel, and

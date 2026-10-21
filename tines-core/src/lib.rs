@@ -27,7 +27,7 @@ pub use observation::{
 };
 pub use store::{Store, StoreError, TrimPolicy};
 pub use transport::{Event, FrameBuf, SendError, Transport};
-pub use wire::frame_sender;
+pub use wire::{frame_sender, Frame, WireError};
 
 #[cfg(feature = "alloc")]
 pub use mem_store::MemStore;

@@ -1,6 +1,7 @@
 [package]
 name = "tines-core"
 version.workspace = true
+rust-version = "1.82.0"
 edition.workspace = true
 license.workspace = true
 description = "Opportunistic shared memory for mostly-offline robots: a no_std core of content-addressed observations, gossip, and store-and-forward exchange."
