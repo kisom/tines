@@ -219,6 +219,15 @@ impl<S: Store, T: Transport> Node<S, T> {
         &self.store
     }
 
+    /// Mutable access to the backing store.
+    ///
+    /// Used by the host for the trusted-time state machine — peer-observation
+    /// time estimation (`LogStore::peer_time_estimate`) and, once trusted,
+    /// anchoring the wall clock (`LogStore::set_wall_clock`).
+    pub fn store_mut(&mut self) -> &mut S {
+        &mut self.store
+    }
+
     /// Best-effort durability flush, advancing each stored observation's age
     /// up to `now`.
     ///

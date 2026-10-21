@@ -1500,6 +1500,7 @@ version = "0.3.0"
 dependencies = [
  "rclrs",
  "ros-env",
+ "tines",
  "tines-bt",
  "tines-core",
  "tines-store",

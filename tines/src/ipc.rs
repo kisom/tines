@@ -134,7 +134,16 @@ pub enum Response {
 /// [`serve`](fn@serve) decodes frames, calls `handle`, and re-encodes the
 /// response. Kept generic over the store/transport so tests can drive it with a
 /// mock transport.
-pub fn handle<S, T>(node: &mut Node<S, T>, req: Request, now: u64) -> Response
+///
+/// `observed_at` is the host's trusted wall time (ms since the Unix epoch) at
+/// which the observation was made, or `None` if the host has no trusted wall
+/// clock yet (R4: an observation made while quarantined carries `None`).
+pub fn handle<S, T>(
+    node: &mut Node<S, T>,
+    req: Request,
+    observed_at: Option<u64>,
+    now: u64,
+) -> Response
 where
     S: Store + 'static,
     T: Transport,
@@ -149,7 +158,7 @@ where
                 Ok(t) => t,
                 Err(e) => return error(e),
             };
-            match node.observe(&topic, &payload, None, now) {
+            match node.observe(&topic, &payload, observed_at, now) {
                 Ok(id) => Response::Observe {
                     id: encode_hex(&id),
                 },
@@ -212,12 +221,28 @@ where
 // The node isn't `Send` (the real `BtTransport` carries a `dyn Radio` with no
 // `Send` bound), so this can't run on its own thread; it runs inline in
 // [`serve`], fed by the socket read timeouts.
-fn poll_exchange<T>(node: &mut Node<LogStore, T>, clock: &HostClock, rounds: &mut u64)
+fn poll_exchange<T>(node: &mut Node<LogStore, T>, clock: &mut HostClock, rounds: &mut u64)
 where
     T: Transport + 'static,
 {
     while node.poll(clock.now()) > 0 && *rounds < POLL_CAP {
         *rounds += 1;
+    }
+
+    // Peer-time trust scan. The brief resolves trusted time in order: a local
+    // (system-clock) source first, then a peer. The system-clock path anchors
+    // the wall at startup (see main); here, after the poll, we fall back to a
+    // peer: scan the observations stored *since this open* (quarantined data is
+    // invisible) for one carrying `observed_at`, estimate the true wall from the
+    // youngest, and anchor once. If nothing has been received we stay
+    // quarantined — the robot's own fail-safe is outside tines.
+    if !clock.is_trusted() {
+        let now = clock.now();
+        if let Some(est) = node.store_mut().peer_time_estimate(now) {
+            node.store_mut().set_wall_clock(est, now);
+            clock.anchor_wall(est, now);
+            eprintln!("tines: trusted wall clock from peer (estimate {est} ms)");
+        }
     }
 
     // On a schedule: trim stale observations and flush the store. Flush is
@@ -251,7 +276,7 @@ where
 pub fn serve<T>(
     mut node: Node<LogStore, T>,
     socket_path: impl AsRef<Path>,
-    clock: HostClock,
+    mut clock: HostClock,
     poll_interval_ms: u64,
 ) -> std::io::Result<()>
 where
@@ -291,11 +316,11 @@ where
                 stream
                     .set_read_timeout(Some(Duration::from_millis(poll_interval_ms.max(1))))
                     .expect("connection read timeout");
-                serve_stream(&mut node, &mut stream, &clock, &mut rounds)?;
+                serve_stream(&mut node, &mut stream, &mut clock, &mut rounds)?;
             }
             // Timeout: run the exchange poll loop instead of blocking.
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                poll_exchange(&mut node, &clock, &mut rounds);
+                poll_exchange(&mut node, &mut clock, &mut rounds);
             }
             // The accept thread is gone; stop serving.
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -310,7 +335,7 @@ where
 fn serve_stream<T>(
     node: &mut Node<LogStore, T>,
     stream: &mut UnixStream,
-    clock: &HostClock,
+    clock: &mut HostClock,
     rounds: &mut u64,
 ) -> io::Result<()>
 where
@@ -319,7 +344,11 @@ where
     loop {
         match read_request(stream) {
             Ok(request) => {
-                let response = handle(node, request, clock.now());
+                let now = clock.now();
+                // Stamp the observation with the trusted wall time if the host
+                // has one; `None` before the first trusted time (R4).
+                let observed_at = clock.wall_ms(now);
+                let response = handle(node, request, observed_at, now);
                 if write_response(stream, &response).is_err() {
                     // A client that vanished mid-connection shouldn't take
                     // down the whole service; just drop this socket.
@@ -416,241 +445,5 @@ fn hex_val(c: u8) -> Result<u8, String> {
         b'a'..=b'f' => Ok(c - b'a' + 10),
         b'A'..=b'F' => Ok(c - b'A' + 10),
         other => Err(format!("invalid hex char: {other:02x}")),
-    }
-}
-
-#[cfg(test)]
-mod f2_tests {
-    use super::*;
-    use std::collections::{HashMap, VecDeque};
-    use std::os::unix::net::UnixStream;
-    use std::path::PathBuf;
-    use std::process;
-    use std::sync::{Arc, Mutex};
-    use std::thread;
-    use std::time::Duration;
-
-    use tines_core::{consts, Event, FrameBuf, Node, NodeId, SendError, Transport};
-    use tines_store::LogStore;
-
-    fn topic() -> Vec<u8> {
-        b"tines/f2".to_vec()
-    }
-
-    fn payload() -> Vec<u8> {
-        b"hello".to_vec()
-    }
-
-    fn hex_encode(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
-    }
-
-    fn unique_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tines-f2-{}-{}", tag, process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn connect(path: &Path) -> UnixStream {
-        for _ in 0..500 {
-            if let Ok(s) = UnixStream::connect(path) {
-                return s;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        panic!("failed to connect to {}", path.display());
-    }
-
-    fn rpc<S: Read + Write>(stream: &mut S, req: &Request) {
-        let body = serde_json::to_vec(req).expect("serialize request");
-        let len = (body.len() as u32).to_le_bytes();
-        stream.write_all(&len).unwrap();
-        stream.write_all(&body).unwrap();
-        stream.flush().unwrap();
-    }
-
-    fn read_response<S: Read>(stream: &mut S) -> Response {
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).unwrap();
-        let len = u32::from_le_bytes(len_buf) as usize;
-        let mut buf = vec![0u8; len];
-        stream.read_exact(&mut buf).unwrap();
-        serde_json::from_slice(&buf).expect("valid response")
-    }
-
-    /// A minimal shared in-memory transport for the F2 propagation test: two
-    /// [`Node`]s bound to the same world share mailbox pairs, so a frame sent by
-    /// one is delivered to the other's [`Transport::poll`] — with no real BLE
-    /// radio. This is the only thing the spec means by "an in-memory transport"
-    /// when none exists in `tines`.
-    struct SharedInMemory {
-        me: NodeId,
-        their: NodeId,
-        world: Arc<Mutex<SharedInMemoryWorld>>,
-        /// Set to `true` once this endpoint's first `poll` has reported contact,
-        /// so the `Contact` event fires exactly once, per endpoint.
-        contacted: bool,
-    }
-
-    struct SharedInMemoryWorld {
-        /// Per-node mailboxes: `send` to `to` lands in that node's inbox and
-        /// `poll` drains the local node's inbox. A single shared mailbox would
-        /// let either endpoint consume a frame destined for the other.
-        inboxes: HashMap<NodeId, VecDeque<Event<NodeId>>>,
-    }
-
-    impl SharedInMemoryWorld {
-        fn new() -> Self {
-            Self {
-                inboxes: HashMap::new(),
-            }
-        }
-    }
-
-    impl Transport for SharedInMemory {
-        type Addr = NodeId;
-
-        fn poll(&mut self) -> Option<Event<NodeId>> {
-            if !self.contacted {
-                self.contacted = true;
-                return Some(Event::Contact(self.their));
-            }
-            self.world
-                .lock()
-                .unwrap()
-                .inboxes
-                .get_mut(&self.me)?
-                .pop_front()
-        }
-
-        fn send(&mut self, to: &NodeId, frame: &[u8]) -> Result<(), SendError> {
-            // Deliver only to our peer; a frame to an unknown Addr is dropped.
-            if *to != self.their {
-                return Ok(());
-            }
-            let payload = FrameBuf::from_slice(frame).map_err(|_| SendError::TooLarge)?;
-            self.world
-                .lock()
-                .unwrap()
-                .inboxes
-                .entry(*to)
-                .or_default()
-                .push_back(Event::Frame(self.me, payload));
-            Ok(())
-        }
-
-        fn mtu(&self) -> usize {
-            consts::MAX_FRAME
-        }
-    }
-
-    /// Build two [`Node`]s over a shared [`SharedInMemory`] world, each with its
-    /// own store, bound to the given ids.
-    fn build_pair(
-        dir: &Path,
-    ) -> (
-        Node<LogStore, SharedInMemory>,
-        Node<LogStore, SharedInMemory>,
-    ) {
-        let world = Arc::new(Mutex::new(SharedInMemoryWorld::new()));
-        let (a_id, b_id) = ([1; 16], [2; 16]);
-
-        let a_store = LogStore::open(&dir.join("a.store.log"), 0).expect("a store open");
-        let b_store = LogStore::open(&dir.join("b.store.log"), 0).expect("b store open");
-
-        let ta = SharedInMemory {
-            me: a_id,
-            their: b_id,
-            world: world.clone(),
-            contacted: false,
-        };
-        let tb = SharedInMemory {
-            me: b_id,
-            their: a_id,
-            world,
-            contacted: false,
-        };
-
-        (
-            Node::new(a_id, a_store.first_seq(), a_store, ta),
-            Node::new(b_id, b_store.first_seq(), b_store, tb),
-        )
-    }
-
-    #[test]
-    fn f2_direct_propagation() {
-        let dir = unique_dir("probe");
-        let (mut node_a, mut node_b) = build_pair(&dir);
-        // Observe FIRST so the broadcast is already in A's store when the
-        // summary exchange rebuilds the send queue (mirrors pair.rs).
-        let observed = node_a.observe(&topic(), &payload(), None, 0).unwrap();
-        let mut t = 0u64;
-        let mut ok = false;
-        for _ in 0..1000 {
-            let _ = node_a.poll(t);
-            let _ = node_b.poll(t);
-            t += 10;
-            if node_b.store().contains(&observed) {
-                ok = true;
-                break;
-            }
-        }
-        assert!(ok, "direct propagation failed after 1000 rounds");
-    }
-
-    /// F2 regression: two service instances over an in-memory transport — an
-    /// observation made through one instance's IPC becomes a belief readable
-    /// through the other's. Both instances drive their exchange inline in
-    /// [`serve`]'s poll loop (the node isn't `Send`, so there's no separate
-    /// exchange thread); the broadcast reaches the other instance over the
-    /// shared transport and is stored as a belief.
-    #[test]
-    fn f2_propagation_between_instances() {
-        let dir = unique_dir("propagate");
-        let (node_a, node_b) = build_pair(&dir);
-
-        let socket_a = dir.join("a.sock");
-        let socket_b = dir.join("b.sock");
-        let (clock_a, clock_b) = (HostClock::start(), HostClock::start());
-
-        let socket_a_thread = socket_a.clone();
-        let _a = thread::spawn(move || serve(node_a, socket_a_thread, clock_a, 20).unwrap());
-        let socket_b_thread = socket_b.clone();
-        let _b = thread::spawn(move || serve(node_b, socket_b_thread, clock_b, 20).unwrap());
-
-        // A observes on its socket.
-        let mut stream_a = connect(&socket_a);
-        rpc(
-            &mut stream_a,
-            &Request::Observe {
-                topic: hex_encode(&topic()),
-                payload: hex_encode(&payload()),
-            },
-        );
-        let obs = match read_response(&mut stream_a) {
-            Response::Observe { id } => id,
-            other => panic!("expected Observe, got {other:?}"),
-        };
-
-        // B queries the belief; retry until its inline exchange has polled A's
-        // broadcast off the shared transport and stored it.
-        for _ in 0..1000 {
-            let maybe = {
-                let mut stream_b = connect(&socket_b);
-                rpc(
-                    &mut stream_b,
-                    &Request::Belief {
-                        topic: hex_encode(&topic()),
-                    },
-                );
-                read_response(&mut stream_b)
-            };
-            if let Response::Belief { obs: Some(b) } = maybe {
-                assert_eq!(b.id, obs);
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        panic!("observation through A never became a belief through B");
     }
 }

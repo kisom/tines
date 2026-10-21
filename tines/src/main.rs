@@ -31,10 +31,37 @@ struct Config {
     /// builder; 20 ms keeps the link responsive without burning idle cycles.
     #[serde(default = "default_poll_interval_ms")]
     poll_interval_ms: u64,
+    /// Trust the system clock for the host's wall time, instead of deriving it
+    /// from a peer's observation. Set to `"system"` when the machine's clock is
+    /// reliable — an RTC, or a GPS/NTP-disciplined clock — the operator asserts
+    /// it rather than tines detecting it. Left unset, tines falls back to a
+    /// peer observation, and, with none available, stays quarantined.
+    #[serde(default)]
+    trusted_clock: Option<String>,
+    /// The `unknown_downtime_age_ms` broadcast floor passed to LogStore while
+    /// the wall clock is unknown (the fold's unknown-downtime branch). Optional;
+    /// leave the LogStore default (`24h`) when unset.
+    ///
+    /// The floor must stay below the host's trim `max_age_ms`. That bound waits
+    /// for host hardening — the trim defaults are still empty — so this check is
+    /// not validated until then.
+    #[serde(default)]
+    unknown_downtime_age_ms: Option<u64>,
 }
 
 fn default_poll_interval_ms() -> u64 {
     20
+}
+
+/// The current system time, since the Unix epoch, in milliseconds — the source
+/// of the wall clock when `trusted_clock = "system"`. Returns 0 if the system
+/// clock is unset (never, on any real machine).
+fn system_time_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -47,9 +74,34 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let peer = parse_node_id(&config.peer)?;
 
     // LogStore is the Store (S); BtTransport wraps it as the Transport (T).
-    let clock = HostClock::start();
-    let store = LogStore::open(Path::new(&config.log_path), clock.now())
+    // unknown_downtime_age_ms (the broadcast floor while the wall clock is
+    // unknown) is optional; leave the LogStore default when unset.
+    let builder = match config.unknown_downtime_age_ms {
+        Some(ms) => LogStore::builder(Path::new(&config.log_path)).set_unknown_downtime_age_ms(ms),
+        None => LogStore::builder(Path::new(&config.log_path)),
+    };
+    let mut clock = HostClock::start();
+    let mut store = builder
+        .open(clock.now())
         .map_err(|e| format!("failed to open log store: {e:?}"))?;
+
+    // Trusted wall clock, in order: (1) a system clock the operator trusts
+    // (`trusted_clock = "system"`), (2) a peer's observation handled by the
+    // exchange's poll loop, or (3) stay quarantined until one is observed. This
+    // is the system-clock branch: anchor the wall once to the current system
+    // (Unix) time, so every observation then carries an observed_at.
+    if config.trusted_clock.as_deref() == Some("system") {
+        let wall_now = system_time_ms();
+        let now = clock.now();
+        let report = store.set_wall_clock(wall_now, now);
+        clock.anchor_wall(wall_now, now);
+        match report.downtime_ms {
+            Some(ms) => println!("tines: trusted system clock, folded {ms} ms downtime"),
+            None => {
+                println!("tines: trusted system clock, downtime unknown, held data quarantined");
+            }
+        }
+    }
     let radio = BluerRadio::new(me, peer);
     let transport = BtTransport::new(me, peer, radio);
     // `serve` runs the exchange inline (a poll loop fed by the socket read

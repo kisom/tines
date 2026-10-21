@@ -29,6 +29,14 @@ use std::time::Instant;
 pub struct HostClock {
     /// The instant this clock measures elapsed time from (process start).
     start: Instant,
+    /// The tick at which the trusted wall clock was anchored. Only meaningful
+    /// alongside [`Self::wall_at_set`].
+    anchor_tick: u64,
+    /// The trusted wall time (ms since the Unix epoch), anchored at
+    /// [`Self::anchor_tick`]. `None` until the host establishes a trusted wall
+    /// clock (system clock config or a peer), after which [`Self::wall_ms`]
+    /// returns `Some(wall + (now - anchor_tick))` on every observe.
+    wall_at_set: Option<u64>,
 }
 
 impl HostClock {
@@ -38,6 +46,8 @@ impl HostClock {
     pub fn start() -> Self {
         Self {
             start: Instant::now(),
+            anchor_tick: 0,
+            wall_at_set: None,
         }
     }
 
@@ -46,6 +56,37 @@ impl HostClock {
     /// `0` right after [`HostClock::start`]; monotonic thereafter.
     pub fn now(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
+    }
+
+    /// Anchor the trusted wall clock, once.
+    ///
+    /// `wall` is the wall time (ms since the Unix epoch) the host trusted at
+    /// tick `now`. This is called once — the first time the host establishes a
+    /// trusted wall clock, either from its system clock
+    /// (`trusted_clock = "system"`) or by deriving it from a peer's
+    /// observation (`LogStore::peer_time_estimate`). From then on
+    /// [`Self::wall_ms`] returns `Some(wall + (now' − now))`.
+    ///
+    /// A second call is a no-op: the anchor is fixed at the first trusted time.
+    pub fn anchor_wall(&mut self, wall: u64, now: u64) {
+        if self.wall_at_set.is_none() {
+            self.wall_at_set = Some(wall);
+            self.anchor_tick = now;
+        }
+    }
+
+    /// The trusted wall time (ms since the Unix epoch) at tick `now`, if the
+    /// host has a trusted wall clock. `None` before the first trusted time
+    /// (R4: an observation made while quarantined carries `observed_at = None`).
+    pub fn wall_ms(&self, now: u64) -> Option<u64> {
+        self.wall_at_set
+            .map(|wall| wall + now.saturating_sub(self.anchor_tick))
+    }
+
+    /// Whether the host has a trusted wall clock (i.e. trust has been
+    /// established and `wall_ms` returns `Some`).
+    pub fn is_trusted(&self) -> bool {
+        self.wall_at_set.is_some()
     }
 }
 

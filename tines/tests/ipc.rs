@@ -4,11 +4,12 @@
 //! needed: the mock surfaces a single `Contact`, records outbound frames, and
 //! auto-acks any observation broadcast to it (simulating a well-behaved peer).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -16,7 +17,7 @@ use heapless::Vec as HeaplessVec;
 use std::fmt::Write as _;
 use tines::{handle, serve, HostClock, Request, Response};
 use tines_core::{
-    consts, Event, FrameBuf, Node, NodeEvent, NodeId, Observation, ObservationId, SendError,
+    consts, Event, FrameBuf, Node, NodeEvent, NodeId, Observation, ObservationId, SendError, Store,
     Transport,
 };
 use tines_store::LogStore;
@@ -197,7 +198,7 @@ fn handle_status_and_belief_direct() {
     let mut node = build_node([3; 16], &dir);
     let x = node.observe(&topic(), &payload(), None, 0).unwrap();
 
-    let status = handle(&mut node, Request::Status, 0);
+    let status = handle(&mut node, Request::Status, None, 0);
     match status {
         Response::Status {
             id,
@@ -218,6 +219,7 @@ fn handle_status_and_belief_direct() {
         Request::Belief {
             topic: hex_encode(&topic()),
         },
+        None,
         0,
     );
     match belief {
@@ -239,6 +241,7 @@ fn handle_unknown_obs_is_belief_none() {
         Request::Belief {
             topic: hex_encode(&topic()),
         },
+        None,
         0,
     );
     match resp {
@@ -325,6 +328,7 @@ fn handle_bad_hex_is_error() {
             topic: "z".into(),
             payload: "ff".into(),
         },
+        None,
         0,
     );
     match resp {
@@ -384,4 +388,388 @@ fn malformed_frame_gets_error_and_connection_survives() {
     }
 
     let _ = std::fs::remove_file(&socket);
+}
+
+// --- In-memory transport + propagation / trusted-time tests ------------------
+//
+// These drive two `Node`s over a shared in-memory transport (no real BLE
+// radio). `SharedInMemory` binds two Nodes to one world: a frame sent by one is
+// delivered to the other's `Transport::poll`.
+
+/// A minimal shared in-memory transport: two [`Node`]s bound to the same world
+/// share mailbox pairs, so a frame sent by one is delivered to the other's
+/// [`Transport::poll`] — with no real BLE radio. This is the "in-memory
+/// transport" the trusted-time tests run over.
+struct SharedInMemory {
+    me: NodeId,
+    their: NodeId,
+    world: Arc<Mutex<SharedInMemoryWorld>>,
+    /// Set to `true` once this endpoint's first `poll` reports contact, so the
+    /// `Contact` event fires exactly once, per endpoint.
+    contacted: bool,
+}
+
+struct SharedInMemoryWorld {
+    /// Per-node mailboxes: a frame sent to `to` lands in that node's inbox and
+    /// `poll` drains the local node's inbox. A single shared mailbox would let
+    /// either endpoint consume a frame destined for the other.
+    inboxes: HashMap<NodeId, VecDeque<Event<NodeId>>>,
+}
+
+impl SharedInMemoryWorld {
+    fn new() -> Self {
+        Self {
+            inboxes: HashMap::new(),
+        }
+    }
+}
+
+impl Transport for SharedInMemory {
+    type Addr = NodeId;
+
+    fn poll(&mut self) -> Option<Event<NodeId>> {
+        if !self.contacted {
+            self.contacted = true;
+            return Some(Event::Contact(self.their));
+        }
+        self.world
+            .lock()
+            .unwrap()
+            .inboxes
+            .get_mut(&self.me)?
+            .pop_front()
+    }
+
+    fn send(&mut self, to: &NodeId, frame: &[u8]) -> Result<(), SendError> {
+        // Deliver only to our peer; a frame to an unknown Addr is dropped.
+        if *to != self.their {
+            return Ok(());
+        }
+        let payload = FrameBuf::from_slice(frame).map_err(|_| SendError::TooLarge)?;
+        self.world
+            .lock()
+            .unwrap()
+            .inboxes
+            .entry(*to)
+            .or_default()
+            .push_back(Event::Frame(self.me, payload));
+        Ok(())
+    }
+
+    fn mtu(&self) -> usize {
+        consts::MAX_FRAME
+    }
+}
+
+/// Two [`Node`]s over a shared [`SharedInMemory`] world, each with its own
+/// store, bound to ids `[1;16]` (A) and `[2;16]` (B).
+fn build_pair(
+    dir: &Path,
+) -> (
+    Node<LogStore, SharedInMemory>,
+    Node<LogStore, SharedInMemory>,
+) {
+    let world = Arc::new(Mutex::new(SharedInMemoryWorld::new()));
+    let (a_id, b_id) = ([1; 16], [2; 16]);
+    let a_store = LogStore::open(&dir.join("a.store.log"), 0).expect("a store open");
+    let b_store = LogStore::open(&dir.join("b.store.log"), 0).expect("b store open");
+    let ta = SharedInMemory {
+        me: a_id,
+        their: b_id,
+        world: world.clone(),
+        contacted: false,
+    };
+    let tb = SharedInMemory {
+        me: b_id,
+        their: a_id,
+        world,
+        contacted: false,
+    };
+    (
+        Node::new(a_id, a_store.first_seq(), a_store, ta),
+        Node::new(b_id, b_store.first_seq(), b_store, tb),
+    )
+}
+
+/// Same as [`build_pair`], but B's store opens with one already-held
+/// (addressed) observation behind the unknown-wall-clock quarantine — as if B
+/// had resumed with held data. The first open inserts the held observation and
+/// is dropped so the record lands on disk; reopening loads it quarantined.
+fn build_pair_with_held(
+    dir: &Path,
+) -> (
+    Node<LogStore, SharedInMemory>,
+    Node<LogStore, SharedInMemory>,
+) {
+    let world = Arc::new(Mutex::new(SharedInMemoryWorld::new()));
+    let (a_id, b_id) = ([1; 16], [2; 16]);
+    let held_store0 = LogStore::open(&dir.join("b.store.log"), 0).expect("b store open0");
+    {
+        let held_ta = SharedInMemory {
+            me: b_id,
+            their: a_id,
+            world: world.clone(),
+            contacted: false,
+        };
+        let mut held_node = Node::new(b_id, held_store0.first_seq(), held_store0, held_ta);
+        held_node
+            .observe_to(a_id, 3_600_000, &topic(), b"held", None, 0)
+            .unwrap();
+    }
+    let b_store = LogStore::open(&dir.join("b.store.log"), 0).expect("b store open1");
+    let a_store = LogStore::open(&dir.join("a.store.log"), 0).expect("a store open");
+    let ta = SharedInMemory {
+        me: a_id,
+        their: b_id,
+        world: world.clone(),
+        contacted: false,
+    };
+    let tb = SharedInMemory {
+        me: b_id,
+        their: a_id,
+        world,
+        contacted: false,
+    };
+    (
+        Node::new(a_id, a_store.first_seq(), a_store, ta),
+        Node::new(b_id, b_store.first_seq(), b_store, tb),
+    )
+}
+
+/// F2 propagation over a shared in-memory transport.
+#[test]
+fn f2_direct_propagation() {
+    let dir = unique_dir("probe");
+    let (mut node_a, mut node_b) = build_pair(&dir);
+    // Observe FIRST so the broadcast is already in A's store when the summary
+    // exchange rebuilds the send queue (mirrors pair.rs).
+    let observed = node_a.observe(&topic(), &payload(), None, 0).unwrap();
+    let mut t = 0u64;
+    let mut ok = false;
+    for _ in 0..1000 {
+        let _ = node_a.poll(t);
+        let _ = node_b.poll(t);
+        t += 10;
+        if node_b.store().contains(&observed) {
+            ok = true;
+            break;
+        }
+    }
+    assert!(ok, "direct propagation failed after 1000 rounds");
+}
+
+/// F2 regression: two service instances over an in-memory transport — an
+/// observation made through one instance's IPC becomes a belief readable through
+/// the other's. Both instances drive their exchange inline in [`serve`]'s poll
+/// loop (the node isn't `Send`, so there's no separate exchange thread).
+#[test]
+fn f2_propagation_between_instances() {
+    let dir = unique_dir("propagate");
+    let (node_a, node_b) = build_pair(&dir);
+
+    let socket_a = dir.join("a.sock");
+    let socket_b = dir.join("b.sock");
+    let (clock_a, clock_b) = (HostClock::start(), HostClock::start());
+
+    let socket_a_thread = socket_a.clone();
+    let _a = thread::spawn(move || serve(node_a, socket_a_thread, clock_a, 20).unwrap());
+    let socket_b_thread = socket_b.clone();
+    let _b = thread::spawn(move || serve(node_b, socket_b_thread, clock_b, 20).unwrap());
+
+    // A observes on its socket.
+    let mut stream_a = connect(&socket_a);
+    rpc(
+        &mut stream_a,
+        &Request::Observe {
+            topic: hex_encode(&topic()),
+            payload: hex_encode(&payload()),
+        },
+    );
+    let obs = match read_response(&mut stream_a) {
+        Response::Observe { id } => id,
+        other => panic!("expected Observe, got {other:?}"),
+    };
+
+    // B queries the belief; retry until its inline exchange has polled A's
+    // broadcast off the shared transport and stored it.
+    for _ in 0..1000 {
+        let maybe = {
+            let mut stream_b = connect(&socket_b);
+            rpc(
+                &mut stream_b,
+                &Request::Belief {
+                    topic: hex_encode(&topic()),
+                },
+            );
+            read_response(&mut stream_b)
+        };
+        if let Response::Belief { obs: Some(b) } = maybe {
+            assert_eq!(b.id, obs);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("observation through A never became a belief through B");
+}
+
+// Trusted wall time (Task 10b): each test pins the brief's requirement verbatim.
+
+/// With a trusted clock, an IPC `Observe` produces an observation carrying
+/// `observed_at = Some(_)` (R4: once trusted, every observation is stamped).
+#[test]
+fn observe_has_observed_at_after_trusted_time() {
+    let dir = unique_dir("after");
+    let (mut node_a, _) = build_pair(&dir);
+
+    // A is trusted (a "system clock"); wall_ms is Some once anchored.
+    let mut clock_a = HostClock::start();
+    let wall = 1_700_000_000_000u64;
+    clock_a.anchor_wall(wall, 0);
+    let observed_at = clock_a.wall_ms(0).expect("trusted");
+
+    let id = node_a
+        .observe(&topic(), &payload(), Some(observed_at), 0)
+        .unwrap();
+    let stored = node_a.store().get(&id, 0).expect("stored");
+    assert_eq!(stored.observed_at, Some(wall));
+}
+
+/// Without a trusted clock, an IPC `Observe` carries `observed_at = None` (R4:
+/// a observation made while quarantined is un-stamped).
+#[test]
+fn observe_has_no_observed_at_before_trusted_time() {
+    let dir = unique_dir("before");
+    let (mut node_a, _) = build_pair(&dir);
+
+    // A has no trusted clock yet: wall_ms is None, so observed_at is None.
+    let clock_a = HostClock::start();
+    let observed_at = clock_a.wall_ms(0);
+    assert_eq!(observed_at, None);
+
+    let id = node_a
+        .observe(&topic(), &payload(), observed_at, 0)
+        .unwrap();
+    let stored = node_a.store().get(&id, 0).expect("stored");
+    assert_eq!(stored.observed_at, None);
+}
+
+/// Of two received observations with `observed_at`, the peer estimate comes from
+/// the one with the smallest `age_ms` (the youngest), so the wall is pulled
+/// toward the newest broadcast.
+#[test]
+fn smallest_age_wins() {
+    let dir = unique_dir("young");
+    let (mut node_a, mut node_b) = build_pair(&dir);
+
+    // A observes two broadcasts on the same topic: an old one and one 5000 ms
+    // newer. The younger one has the smaller age_ms, so the peer estimate must
+    // be drawn from it.
+    let mut clock_a = HostClock::start();
+    let wall = 1_700_000_000_000u64;
+    clock_a.anchor_wall(wall, 0);
+
+    let old = node_a
+        .observe(&topic(), b"old", clock_a.wall_ms(0), 0)
+        .unwrap();
+    let young = node_a
+        .observe(&topic(), b"young", clock_a.wall_ms(5000), 5000)
+        .unwrap();
+
+    let poll_interval = 10u64;
+    let mut t = 0u64;
+    let mut both = false;
+    for _ in 0..1000 {
+        let _ = node_a.poll(t);
+        let _ = node_b.poll(t);
+        t += poll_interval;
+        if node_b.store().contains(&old) && node_b.store().contains(&young) {
+            both = true;
+            break;
+        }
+    }
+    assert!(both, "both broadcasts never reached B after 1000 rounds");
+
+    let now = t;
+    let est = node_b
+        .store_mut()
+        .peer_time_estimate(now)
+        .expect("peer_time_estimate should find both observations");
+    // The young observation's observed_at (wall + 5000) is newer, so the
+    // estimate must sit near it -- well ahead of the old observation's wall.
+    assert!(
+        est > wall + 4000,
+        "estimate must come from the younger observation: got {est}, expected > {}",
+        wall + 4000
+    );
+}
+
+/// Instance A has trusted time and observes; instance B has none and a log that
+/// already holds one quarantined (held) observation. After an exchange B's
+/// `set_wall_clock` has run with an estimate within one poll interval of A's
+/// wall time, and B's held observation becomes visible.
+#[test]
+fn time_from_peer() {
+    let dir = unique_dir("peer");
+    let (mut node_a, mut node_b) = build_pair_with_held(&dir);
+
+    // A is trusted (system-clock equivalent); anchor the wall at tick 0.
+    let mut clock_a = HostClock::start();
+    let wall = 1_700_000_000_000u64;
+    clock_a.anchor_wall(wall, 0);
+
+    // A observes a broadcast (carrying trusted wall time) at tick 0.
+    let observed_at = clock_a.wall_ms(0);
+    let held = node_a
+        .observe(&topic(), &payload(), observed_at, 0)
+        .unwrap();
+
+    // Drive the exchange until A's broadcast lands in B's store. B's first poll
+    // returns Contact, so it receives on the next round.
+    let poll_interval = 10u64;
+    let mut t = 0u64;
+    let mut received = false;
+    for _ in 0..1000 {
+        let _ = node_a.poll(t);
+        let _ = node_b.poll(t);
+        if node_b.store().contains(&held) {
+            received = true;
+            break;
+        }
+        t += poll_interval;
+    }
+    assert!(received, "A's broadcast never reached B");
+
+    // Estimate the true wall from the youngest non-quarantined observed_at-
+    // bearing observation this boot (B's held obs is quarantined -> invisible),
+    // which is A's broadcast.
+    let now_b = t;
+    let est = node_b
+        .store_mut()
+        .peer_time_estimate(now_b)
+        .expect("peer_time_estimate should find A's broadcast");
+
+    let a_wall_now = clock_a.wall_ms(now_b).expect("A trusted");
+    assert!(
+        est <= a_wall_now,
+        "estimate never later than true time: {est} > {a_wall_now}"
+    );
+    assert!(
+        a_wall_now.saturating_sub(est) <= poll_interval,
+        "estimate within one poll interval: diff {} ms",
+        a_wall_now - est
+    );
+
+    // The first trusted time anchors the wall once and runs the fold. Under the
+    // (unknown) downtime B is in, the fold ages its held observation past
+    // lifetime and lifts its quarantine (the "becomes visible" event): the fold
+    // report counts exactly that one addressed observation expiring.
+    let report = node_b.store_mut().set_wall_clock(est, now_b);
+    assert_eq!(
+        report.downtime_ms, None,
+        "unknown downtime for a fresh store"
+    );
+    assert_eq!(
+        report.expired_addressed, 1,
+        "the held observation is aged past lifetime on trust"
+    );
 }

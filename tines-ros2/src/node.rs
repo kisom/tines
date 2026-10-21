@@ -44,6 +44,7 @@ use std::sync::mpsc::channel;
 use rclrs::{Context, CreateBasicExecutor, Node as RclNode, Publisher, RclrsError, Subscription};
 use ros_env::std_msgs::msg::{MultiArrayLayout, UInt8MultiArray};
 
+use tines::HostClock;
 use tines_bt::{BtTransport, Radio};
 use tines_core::{
     Node as TinesNodeCore, NodeEvent, NodeId, Observation, ObservationId, Store, Tick,
@@ -116,6 +117,11 @@ pub struct TinesNode {
     inbound_tx: std::sync::mpsc::Sender<InboundMsg>,
     /// Upper bound on the number of managed ROS2 topics.
     topic_cap: usize,
+    /// The host's wall clock, anchored once the host establishes a trusted wall
+    /// clock (`HostClock`). Observations made once trusted carry their wall time
+    /// as `observed_at` (see [`Self::drain_inbound`]); before that they carry
+    /// `None`.
+    clock: HostClock,
 }
 
 impl TinesNode {
@@ -132,6 +138,12 @@ impl TinesNode {
     /// [`rclrs::Context::default_from_env`]; the store's anchor tick is `0`;
     /// ages then advance under the `Tick` values passed to
     /// [`TinesNode::poll`].
+    ///
+    /// Wall time starts untrusted: the store quarantines the held observations
+    /// it loaded until the host establishes a trusted wall clock. That happens
+    /// in order (see [`TinesNode::apply_trusted_time`]) — a peer's observation
+    /// (the youngest stored observation carrying an `observed_at`) — after which
+    /// observations made by this node carry that wall time as `observed_at`.
     pub fn new(
         me: NodeId,
         log_path: &std::path::Path,
@@ -162,6 +174,7 @@ impl TinesNode {
             inbound_rx,
             inbound_tx,
             topic_cap,
+            clock: HostClock::start(),
         })
     }
 
@@ -187,6 +200,7 @@ impl TinesNode {
     /// Returns the number of *new* observations stored this round (from
     /// [`TinesNodeCore::poll`]).
     pub fn poll(&mut self, now: Tick) -> Result<usize, TinesNodeError> {
+        self.apply_trusted_time(now);
         self.drain_inbound(now);
         let stored = self.tines.poll(now);
         self.publish_live_topics(now)?;
@@ -194,16 +208,49 @@ impl TinesNode {
         Ok(stored)
     }
 
+    /// Trusted wall-time state machine, run at the head of each [`poll`].
+    ///
+    /// If the host is not yet trusted, derive a wall-clock estimate from a
+    /// peer's observation: scan the observations stored since this open (the
+    /// store's held data is quarantined, hence invisible to the scan) for one
+    /// carrying an `observed_at`, taking the youngest (smallest `age_ms`) as
+    /// the best estimate, which is never later than true time. Anchor the
+    /// clock once on the first trusted time; thereafter the clock returns
+    /// `Some` and observations made here carry an `observed_at`. If no peer
+    /// time is available, the host stays quarantined — observations keep
+    /// carrying `None` — the robot's own fail-safe is outside tines.
+    fn apply_trusted_time(&mut self, now: Tick) {
+        if self.clock.is_trusted() {
+            return;
+        }
+        let Some(est) = self.tines.store_mut().peer_time_estimate(now) else {
+            return;
+        };
+        let report = self.tines.store_mut().set_wall_clock(est, now);
+        self.clock.anchor_wall(est, now);
+        match report.downtime_ms {
+            Some(ms) => println!("tines: trusted wall clock from peer (folded {ms} ms downtime)"),
+            None => {
+                println!("tines: trusted wall clock from peer, downtime unknown");
+            }
+        }
+    }
+
     /// Consume inbound ROS2 observations into the tines node, skipping anything
     /// oversized for tines to reject.
+    ///
+    /// Each observation carries the host's current wall time as `observed_at`
+    /// once the clock is trusted (see [`Self::apply_trusted_time`]); `None`
+    /// before then (R4).
     fn drain_inbound(&mut self, now: Tick) {
+        let observed_at = self.clock.wall_ms(now);
         while let Ok((topic, payload)) = self.inbound_rx.try_recv() {
             if payload.len() > tines_core::consts::MAX_PAYLOAD
                 || topic.len() > tines_core::consts::MAX_TOPIC
             {
                 continue; // oversized; tines would reject it anyway
             }
-            let _ = self.tines.observe(&topic, &payload, None, now);
+            let _ = self.tines.observe(&topic, &payload, observed_at, now);
         }
     }
 

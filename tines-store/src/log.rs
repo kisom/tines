@@ -299,6 +299,17 @@ pub struct LogStoreBuilder {
 }
 
 impl LogStoreBuilder {
+    /// Set the `unknown_downtime_age_ms` broadcast floor (the floor applied to
+    /// held broadcasts under the fold's unknown-downtime branch). The floor
+    /// should stay below the host's trim `max_age_ms`; the host config carries
+    /// this value (see `Config::unknown_downtime_age_ms`).
+    pub fn set_unknown_downtime_age_ms(self, unknown_downtime_age_ms: u64) -> Self {
+        Self {
+            unknown_downtime_age_ms,
+            ..self
+        }
+    }
+
     /// Open the store, creating it if necessary, with the configured broadcast
     /// floor. See [`LogStore::open`].
     pub fn open(self, now: Tick) -> Result<LogStore, StoreError> {
@@ -746,6 +757,42 @@ impl LogStore {
             report.expired_addressed, report.floored_broadcasts,
         );
         report
+    }
+
+    /// Estimate the true wall time from the observations stored since this
+    /// open — the peer-observation fallback in the trusted-time state machine
+    /// (`HostClock::anchor_wall`).
+    ///
+    /// Scans the entries stored *since this open*: the non-quarantined ones
+    /// (quarantined ones are invisible to the scan, being pre-open data whose
+    /// age cannot be verified). Among those carrying an `observed_at`, the
+    /// youngest (smallest `age_ms`) gives the best estimate, because a younger
+    /// observation's age has been trusted longest. The estimate is
+    ///
+    /// ```text
+    /// observed_at + age_ms + (now - stored_at)
+    /// ```
+    ///
+    /// i.e. the peer's wall time when it made the observation, aged by its
+    /// current age plus the ticks elapsed since we stored it. `age_ms` is a
+    /// lower bound on the age at send time, so the estimate is never later than
+    /// the true current wall time — a peer cannot report a younger age than its
+    /// own clock implies.
+    ///
+    /// Returns `None` when no stored observation carries an `observed_at` yet:
+    /// there is nothing to derive time from.
+    pub fn peer_time_estimate(&self, now: Tick) -> Option<u64> {
+        self.index
+            .values()
+            .filter(|entry| !entry.quarantined && entry.obs.observed_at.is_some())
+            .min_by_key(|entry| entry.obs.age_ms)
+            .and_then(|entry| {
+                entry.obs.observed_at.map(|observed_at| {
+                    observed_at
+                        .saturating_add(entry.obs.age_ms)
+                        .saturating_add(now.saturating_sub(entry.stored_at))
+                })
+            })
     }
 
     /// The [`FoldReport`] from the (single) `set_wall_clock`, before it runs or
