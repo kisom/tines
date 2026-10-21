@@ -212,6 +212,15 @@ enum Record {
         count: u64,
     },
     Clock {
+        /// The wall-clock value stamped at write time: derived as
+        /// `wall_at_set + (tick - tick_at_set)`. `Some` only for markers written
+        /// after a trusted wall clock is established (see
+        /// [`LogStore::set_wall_clock`]); `None` for any marker written before
+        /// that point, or while the wall clock is still unknown. A `None` here is
+        /// what makes the reopen fold treat that marker's downtime as unknown.
+        wall: Option<u64>,
+        /// The caller's `now` at the point this marker was written (the tick
+        /// value passed to `flush`).
         tick: Tick,
     },
 }
@@ -221,6 +230,12 @@ struct Entry {
     obs: Observation,
     stored_at: Tick,
     released: bool,
+    /// Set at load if this observation was held while the wall clock was
+    /// unknown. While set, the observation is withheld from broadcast delivery
+    /// (see [`LogStore::for_each_broadcast_id`] and
+    /// [`LogStore::for_each_addressed_id`]) but still contained so dedupe
+    /// works. Cleared by [`LogStore::set_wall_clock`]; not persisted.
+    quarantined: bool,
 }
 
 /// A persistent, append-only [`Store`] backed by a single observation log.
@@ -235,9 +250,99 @@ pub struct LogStore {
     /// Number of corrupt records skipped while rebuilding the index on the last
     /// [`Self::open`] (0 if the log was clean). Exposed for hosts to report.
     skipped_records: usize,
+    /// The last clock marker seen while rebuilding the index, if any: the
+    /// `(marker_tick, marker_wall)` pair. The reopen fold anchors to the later
+    /// of this and the boot record; the downtime fold anchors to it.
+    last_marker: Option<(Tick, Option<u64>)>,
+    /// Caller ticks of downtime already folded during [`Self::open`].
+    counted_ticks: u64,
+    /// The `unknown_downtime_age_ms` broadcast floor configured on open.
+    unknown_downtime_age_ms: u64,
+    /// Wall-clock value captured by [`Self::set_wall_clock`]; `Some` once the
+    /// wall clock has been trusted.
+    wall_at_set: Option<u64>,
+    /// The caller's `now` when [`Self::set_wall_clock`] captured the wall clock.
+    tick_at_set: Option<u64>,
+    /// The [`FoldReport`] produced by the first [`Self::set_wall_clock`], cached
+    /// so a second call is a no-op and the report stays readable.
+    fold_report: Option<FoldReport>,
+}
+
+/// The outcome of [`LogStore::set_wall_clock`]: how much wall-clock downtime was
+/// folded into held ages, and how many held observations expired or were floored
+/// by it.
+///
+/// Printed once on stderr by the host at the moment of the fold, then read back
+/// (see [`LogStore::fold_report`]) for any record. A `None`
+/// [`Self::downtime_ms`] signals unknown downtime; the host is expected to
+/// surface that (e.g. log a warning) rather than the fold hiding it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FoldReport {
+    /// The wall-clock milliseconds of downtime folded in, `Some` only when the
+    /// downtime was known; `None` for unknown downtime.
+    pub downtime_ms: Option<u64>,
+    /// Number of held observations addressed to others that were aged past their
+    /// lifetime (and will not be delivered/forwarded while held).
+    pub expired_addressed: usize,
+    /// Number of held broadcast observations whose age was floored to
+    /// `unknown_downtime_age_ms`.
+    pub floored_broadcasts: usize,
+}
+
+/// A partially-built [`LogStore`] carrying the `unknown_downtime_age_ms`
+/// broadcast floor. Obtain one from [`LogStore::builder`] and finish with
+/// [`LogStoreBuilder::open`].
+#[derive(Clone)]
+pub struct LogStoreBuilder {
+    path: PathBuf,
+    unknown_downtime_age_ms: u64,
+}
+
+impl LogStoreBuilder {
+    /// Open the store, creating it if necessary, with the configured broadcast
+    /// floor. See [`LogStore::open`].
+    pub fn open(self, now: Tick) -> Result<LogStore, StoreError> {
+        LogStore::open_with(self.path.as_ref(), now, self.unknown_downtime_age_ms)
+    }
 }
 
 impl LogStore {
+    /// The `unknown_downtime_age_ms` a host gets when it opens the store via
+    /// [`LogStore::open`] instead of configuring it with the builder.
+    ///
+    /// A host that *can* tell the downtime is up should prefer
+    /// [`LogStore::set_wall_clock`] with a known wall clock so ages advance
+    /// exactly; this floor is a conservative stand-in when the downtime is
+    /// unknown. A day is a reasonable minimum age for a broadcast whose true
+    /// age we cannot establish: old data is better delivered than silently
+    /// trusted.
+    const DEFAULT_UNKNOWN_DOWNTIME_MS: u64 = 24 * 60 * 60 * 1000;
+
+    /// Open (creating if necessary) the log at `path` and rebuild the index,
+    /// holding every observation already on disk in quarantine.
+    ///
+    /// This is the host's entry point and deliberately takes *no* wall time: it
+    /// cannot know whether the machine was down since the last marker, so it
+    /// quarantines every loaded observation until the host calls
+    /// [`LogStore::set_wall_clock`]. Use [`LogStore::builder`] to configure the
+    /// `unknown_downtime_age_ms` broadcast floor (otherwise
+    /// the default `DEFAULT_UNKNOWN_DOWNTIME_MS` floor applies).
+    ///
+    /// See [`LogStore::open_with`] for the load semantics; the difference here is
+    /// only that the broadcast-floor option defaults rather than being explicit.
+    pub fn open(path: &Path, now: Tick) -> Result<Self, StoreError> {
+        Self::builder(path).open(now)
+    }
+
+    /// Start building a [`LogStore`] with the `unknown_downtime_age_ms`
+    /// broadcast floor configured. See [`LogStore::open`] and
+    /// [`LogStore::set_wall_clock`].
+    pub fn builder(path: &Path) -> LogStoreBuilder {
+        LogStoreBuilder {
+            path: path.to_path_buf(),
+            unknown_downtime_age_ms: LogStore::DEFAULT_UNKNOWN_DOWNTIME_MS,
+        }
+    }
     /// Open (creating if necessary) the log at `path` and rebuild the index.
     ///
     /// `now` is the current tick: it is the base for rebasing ages and the
@@ -258,7 +363,11 @@ impl LogStore {
     ///
     /// An exclusive lock is taken on the file, so a second `open` while this
     /// one is alive fails with [`StoreError::Backend`].
-    pub fn open(path: &Path, now: Tick) -> Result<Self, StoreError> {
+    pub fn open_with(
+        path: &Path,
+        now: Tick,
+        unknown_downtime_age_ms: u64,
+    ) -> Result<Self, StoreError> {
         // Ensure the parent directory exists (mode 0700 if we create it).
         ensure_parent_dir(path)?;
 
@@ -313,9 +422,12 @@ impl LogStore {
         let mut skipped = 0usize;
 
         // The boot counter read off the last `Record::Boot` on disk, and the
-        // tick of the last `Record::Clock` (the load-time age fold's anchor).
+        // last `Record::Clock` (load-time age fold anchor, and the anchor for
+        // the downtime fold). `last_marker` is `(tick, wall)`; a `None` wall
+        // means no trusted wall clock exists yet, so the reopen fold treats any
+        // gap since this marker as unknown-downtime.
         let mut last_boot_count: Option<u64> = None;
-        let mut last_clock_tick: Option<Tick> = None;
+        let mut last_marker: Option<(Tick, Option<u64>)> = None;
 
         loop {
             // Clean end-of-file: nothing left to read.
@@ -345,6 +457,7 @@ impl LogStore {
                                 obs: *obs,
                                 stored_at,
                                 released: false,
+                                quarantined: true,
                             });
                         }
                         Record::Trim { id } => {
@@ -361,8 +474,8 @@ impl LogStore {
                         Record::Boot { count } => {
                             last_boot_count = Some(count);
                         }
-                        Record::Clock { tick } => {
-                            last_clock_tick = Some(tick);
+                        Record::Clock { tick, wall } => {
+                            last_marker = Some((tick, wall));
                         }
                     }
                     records_loaded += 1;
@@ -420,10 +533,12 @@ impl LogStore {
         // Fold each live observation's age up to the last clock marker and then
         // to load time. Anchoring to each entry's insert tick keeps the fold
         // exact even for observations inserted before the last flush (see the
-        // module docs).
+        // module docs). At reopen the wall clock is still unknown, so every
+        // loaded observation is quarantined (set at construction) and the fold
+        // is a plain advance to load time.
         for entry in index.values_mut() {
-            entry.obs.age_ms = match last_clock_tick {
-                Some(marker) if marker >= entry.stored_at => entry
+            entry.obs.age_ms = match last_marker {
+                Some((marker, _)) if marker >= entry.stored_at => entry
                     .obs
                     .age_ms
                     .saturating_add(marker.saturating_sub(entry.stored_at))
@@ -441,6 +556,12 @@ impl LogStore {
             index,
             boot_count,
             skipped_records: skipped,
+            last_marker,
+            counted_ticks: last_marker.map_or(0, |(tick, _)| now.saturating_sub(tick)),
+            unknown_downtime_age_ms,
+            wall_at_set: None,
+            tick_at_set: None,
+            fold_report: None,
         })
     }
 
@@ -492,7 +613,18 @@ impl LogStore {
         // Record a clock marker stamped with the caller's `now` so the load-time
         // age fold anchors to when the host actually flushed — not the last
         // insert tick (that stale-marker bug was F18).
-        let record = Record::Clock { tick: now };
+        //
+        // The wall value is *derived*: if a trusted wall clock has been
+        // established (see [`LogStore::set_wall_clock`]) the marker carries
+        // `wall_at_set + (now - tick_at_set)`; before that it is `None`, which
+        // is what makes the reopen fold treat this marker's downtime as unknown.
+        let wall = match (self.wall_at_set, self.tick_at_set) {
+            (Some(wall_at_set), Some(tick_at_set)) => {
+                Some(wall_at_set + now.saturating_sub(tick_at_set))
+            }
+            _ => None,
+        };
+        let record = Record::Clock { tick: now, wall };
         write_record(&mut self.file, &record)?;
         self.file.sync_all().map_err(|_| StoreError::Backend)?;
         Ok(())
@@ -501,6 +633,125 @@ impl LogStore {
     /// Append a single record to the log.
     fn append(&mut self, record: &Record) -> Result<(), StoreError> {
         write_record(&mut self.file, record)
+    }
+
+    /// Fold the downtime (if any) out of every quarantined observation's age
+    /// and lift the quarantine, then start wall-clock time for clock markers.
+    ///
+    /// Until this runs the store cannot tell whether the machine was down since
+    /// the last clock marker (see [`LogStore::open`]), so every loaded
+    /// observation is quarantined. This is the moment the host reports a
+    /// *trusted* wall clock.
+    ///
+    /// **Known downtime**: the last marker on disk carries a wall time and
+    /// `wall_now` is not behind it. Every quarantined observation gains the wall
+    /// elapsed since that marker (`wall_now - marker_wall`), minus the ticks
+    /// already counted during this open (saturating to zero).
+    ///
+    /// **Unknown downtime**: no marker, a marker without a wall time, or a
+    /// marker whose wall time is ahead of `wall_now`. Quarantined addressed
+    /// observations are aged past their lifetime (never delivered/forwarded);
+    /// quarantined broadcasts are floored to `max(age, unknown_downtime_age_ms)`.
+    ///
+    /// This runs exactly once; a second call returns the first report unchanged
+    /// (see the `set_wall_clock_runs_once` test).
+    ///
+    /// Returns a [`FoldReport`]. The host prints it to stderr once and keeps it
+    /// for records. A `downtime_ms` of `None` means the host could not
+    /// establish the downtime and should warn rather than hide it.
+    pub fn set_wall_clock(&mut self, wall_now: u64, now: Tick) -> FoldReport {
+        // Runs once. The second call is a no-op and returns the first report.
+        if let Some(report) = self.fold_report {
+            return report;
+        }
+
+        let mut expired_addressed = 0usize;
+        let mut floored_broadcasts = 0usize;
+        let mut known_downtime_ms: Option<u64> = None;
+
+        match self.last_marker {
+            // There is a marker with a usable wall time. Downtime is known.
+            Some((_marker_tick, Some(marker_wall))) if marker_wall <= wall_now => {
+                let downtime_ms = wall_now.saturating_sub(marker_wall);
+                // Ticks already folded in during the reopen (load) fold.
+                let counted = self.counted_ticks;
+                let extra_ticks = downtime_ms.saturating_sub(counted) as Tick;
+                for entry in self.index.values_mut() {
+                    if !entry.quarantined {
+                        continue;
+                    }
+                    // Advance by the wall elapsed since the marker, minus the
+                    // ticks already counted during this open.
+                    let added = extra_ticks.saturating_sub(now.saturating_sub(entry.stored_at));
+                    entry.obs.age_ms = entry.obs.age_ms.saturating_add(added);
+                    entry.quarantined = false;
+                }
+                known_downtime_ms = Some(downtime_ms);
+            }
+            _ => {
+                // Unknown downtime: aged addressed observations expire; broadcasts
+                // are floored to the unknown-downtime age floor.
+                for entry in self.index.values_mut() {
+                    if !entry.quarantined {
+                        continue;
+                    }
+                    if entry.obs.dest.is_some() {
+                        // Past its lifetime: never delivered/forwarded. Under
+                        // unknown downtime the age of a held addressed
+                        // observation cannot be verified against its recipients,
+                        // so every held addressed observation is aged past its
+                        // lifetime and released (withheld from delivery), exactly
+                        // as if it had been delivered and acknowledged.
+                        let lifetime = entry.obs.dest.as_ref().map(|d| d.lifetime_ms).unwrap_or(0);
+                        if entry.obs.age_ms <= lifetime {
+                            entry.obs.age_ms = lifetime + 1;
+                            expired_addressed += 1;
+                        }
+                        entry.released = true;
+                    } else {
+                        if entry.obs.age_ms < self.unknown_downtime_age_ms {
+                            entry.obs.age_ms = self.unknown_downtime_age_ms;
+                            floored_broadcasts += 1;
+                        }
+                    }
+                    entry.quarantined = false;
+                }
+            }
+        }
+
+        // Start wall-clock time for markers: future flushes write a derived
+        // `wall_at_set + (now - tick_at_set)` and the marker records it. This
+        // runs once, the first time set_wall_clock is called, *regardless* of
+        // whether the downtime turned out to be known or unknown — the host has
+        // a wall clock (that is why it called set_wall_clock), so future
+        // markers carry it and a later reopen can establish a *known* downtime
+        // (a marker only carries a wall once a wall has been set).
+        self.wall_at_set = Some(wall_now);
+        self.tick_at_set = Some(now);
+
+        let report = FoldReport {
+            downtime_ms: known_downtime_ms,
+            expired_addressed,
+            floored_broadcasts,
+        };
+        self.fold_report = Some(report);
+        let downtime = match report.downtime_ms {
+            Some(ms) => format!("known, {ms} ms"),
+            None => "unknown — broadcasts floored to the unknown-downtime age floor".into(),
+        };
+        eprintln!(
+            "tines-store: wall-clock downtime folded ({downtime}): {} addressed \
+             observation(s) expired past lifetime, {} broadcast(s) floored; \
+             quarantine lifted on held observations.",
+            report.expired_addressed, report.floored_broadcasts,
+        );
+        report
+    }
+
+    /// The [`FoldReport`] from the (single) `set_wall_clock`, before it runs or
+    /// otherwise (mirrors [`LogStore::fold_report`]).
+    pub fn fold_report(&self) -> Option<FoldReport> {
+        self.fold_report
     }
 }
 
@@ -717,6 +968,9 @@ impl Store for LogStore {
                 obs,
                 stored_at: now,
                 released: false,
+                // A fresh insert is live, not held. Only observations loaded
+                // from disk while the wall clock was unknown start quarantined.
+                quarantined: false,
             },
         );
         Ok(true)
@@ -744,7 +998,9 @@ impl Store for LogStore {
 
     fn for_each_broadcast_id(&self, f: &mut dyn FnMut(&ObservationId)) {
         for (id, entry) in self.index.iter() {
-            if entry.obs.dest.is_none() {
+            // A quarantined broadcast (held while the wall clock was unknown) is
+            // withheld until [`LogStore::set_wall_clock`] lifts the quarantine.
+            if entry.obs.dest.is_none() && !entry.quarantined {
                 f(id);
             }
         }
@@ -756,10 +1012,12 @@ impl Store for LogStore {
     /// This is stricter than the [`Store`] trait's documented contract
     /// (`addressed` == `dest` is `Some`): a released addressed observation has
     /// already been sent to its recipient, so it is intentionally skipped and
-    /// not offered for exchange again until (and if) it is re-inserted.
+    /// not offered for exchange again until (and if) it is re-inserted. A
+    /// quarantined addressed observation is likewise withheld until the wall
+    /// clock is trusted.
     fn for_each_addressed_id(&self, f: &mut dyn FnMut(&ObservationId)) {
         for (id, entry) in self.index.iter() {
-            if entry.obs.dest.is_some() && !entry.released {
+            if entry.obs.dest.is_some() && !entry.released && !entry.quarantined {
                 f(id);
             }
         }
@@ -786,15 +1044,25 @@ impl Store for LogStore {
     }
 
     fn is_released(&self, id: &ObservationId) -> bool {
-        self.index
-            .get(id)
-            .map(|entry| entry.released)
-            .unwrap_or(false)
+        match self.index.get(id) {
+            Some(entry) => {
+                // A held (quarantined) observation is treated as released for
+                // exchange purposes: it must not be delivered, forwarded or
+                // acked again until the wall clock is trusted, exactly like a
+                // released one (this is what stops a held addressed observation
+                // from being re-offered and acked by a relay/peer).
+                let addressed = entry.obs.dest.is_some();
+                entry.released || (addressed && entry.quarantined)
+            }
+            None => false,
+        }
     }
 
     fn for_each_topic(&self, prefix: &[u8], now: Tick, f: &mut dyn FnMut(&Observation)) {
         for entry in self.index.values() {
-            if entry.obs.topic.starts_with(prefix) {
+            // A quarantined observation is withheld until the wall clock is
+            // trusted (see [`LogStore::set_wall_clock`]).
+            if entry.obs.topic.starts_with(prefix) && !entry.quarantined {
                 let elapsed = now.saturating_sub(entry.stored_at);
                 f(&entry.obs.aged(elapsed));
             }
@@ -816,7 +1084,7 @@ impl Store for LogStore {
         if let Some(keep) = policy.keep_per_topic {
             let mut groups: BTreeMap<&[u8], Vec<ObservationId>> = BTreeMap::new();
             for (id, entry) in self.index.iter() {
-                if !removed.contains(id) {
+                if !removed.contains(id) && !entry.quarantined {
                     groups
                         .entry(entry.obs.topic.as_slice())
                         .or_default()
@@ -839,7 +1107,9 @@ impl Store for LogStore {
         // (b) max_age_ms: drop anything whose current age exceeds the cutoff.
         if let Some(max_age) = policy.max_age_ms {
             for (id, entry) in self.index.iter() {
-                if !removed.contains(id) && current_age(&entry.obs, entry.stored_at, now) > max_age
+                if !removed.contains(id)
+                    && !entry.quarantined
+                    && current_age(&entry.obs, entry.stored_at, now) > max_age
                 {
                     removed.insert(*id);
                 }
@@ -851,9 +1121,9 @@ impl Store for LogStore {
         if let Some(max_count) = policy.max_count {
             let mut remaining: Vec<ObservationId> = self
                 .index
-                .keys()
-                .copied()
-                .filter(|id| !removed.contains(id))
+                .iter()
+                .filter(|(id, entry)| !removed.contains(*id) && !entry.quarantined)
+                .map(|(id, _)| *id)
                 .collect();
             if remaining.len() > max_count {
                 remaining.sort_by(|&a, &b| self.age_cmp(&a, &b, now));
