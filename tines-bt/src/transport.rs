@@ -53,7 +53,7 @@ use bluer::{
     Adapter, Address, AddressType, Session, Uuid, UuidExt,
 };
 
-use tines_core::consts::{MAX_FRAME, MAX_PEERS};
+use tines_core::consts::MAX_FRAME;
 use tines_core::frame_sender;
 use tines_core::observation::NodeId;
 use tines_core::transport::{Event, FrameBuf, SendError, Transport};
@@ -229,6 +229,12 @@ impl Transport for BtTransport {
 
 /// Smallest MTU we are willing to report (ATT's default minimum is 23).
 const MIN_MTU: usize = 23;
+
+/// Most live connections at once. Kept equal to tines-core's peer-table
+/// capacity (8, a crate-private local constant since tines-core 1.0, decision
+/// K): a connection beyond it would carry frames core's exchange has no slot
+/// for. Both become configuration in a later release.
+const MAX_PEERS: usize = 8;
 
 /// L2CAP PSM the tines byte pipe runs on. Shared with the peer (agreed
 /// out-of-band): both sides connect/listen on this PSM.

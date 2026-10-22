@@ -23,11 +23,27 @@
 //!   addressed candidate a turn. Pins §6's overflow-safety guarantee.
 
 use proptest::prelude::*;
-use tines_core::{
-    consts::{MAX_PEERS, SEND_QUEUE_CAP},
-    FrameBuf, Store,
-};
+use tines_core::{FrameBuf, Store};
 use tines_sim::{CappedStore, Contact, ContactTrace, Sim, WorldConfig};
+
+/// Mirrors tines-core's peer-table capacity, a crate-private local constant
+/// since 1.0 (decision K). `local_caps_match_core` checks the mirror.
+const MAX_PEERS: usize = 8;
+
+/// Mirrors tines-core's send-queue / bounce-table capacity, a crate-private
+/// local constant since 1.0 (decision K). `local_caps_match_core` checks the
+/// mirror.
+const SEND_QUEUE_CAP: usize = 256;
+
+/// The mirrored local caps still equal core's. Runs with the `conformance`
+/// feature (as `scripts/ci.sh` does), which exposes core's values through its
+/// hidden `conformance` module.
+#[cfg(feature = "conformance")]
+#[test]
+fn local_caps_match_core() {
+    assert_eq!(MAX_PEERS, tines_core::conformance::MAX_PEERS);
+    assert_eq!(SEND_QUEUE_CAP, tines_core::conformance::SEND_QUEUE_CAP);
+}
 
 /// A fixed set of short observation topics the tests reuse so the generated
 /// observations round-trip cleanly through the core (`MAX_TOPIC` is 64 bytes).
@@ -166,7 +182,7 @@ fn addressed_scenario() -> impl Strategy<Value = (usize, usize, ContactTrace)> {
 /// graph plus a flood of distinct addressed observations past [`SEND_QUEUE_CAP`].
 #[derive(Debug)]
 struct BounceScenario {
-    /// Node count (fixed at [`consts::MAX_PEERS`]).
+    /// Node count (fixed at [`MAX_PEERS`]).
     nodes: usize,
     /// Fully-connected trace: every pair in contact during one long window.
     trace: ContactTrace,

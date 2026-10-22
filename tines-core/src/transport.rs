@@ -50,6 +50,17 @@ pub trait Transport {
     fn send(&mut self, to: &Self::Addr, frame: &[u8]) -> Result<(), SendError>;
 
     /// Maximum frame size in bytes this transport can send (must be `<= MAX_FRAME`).
+    ///
+    /// The smallest MTU core can fully use is **85 bytes**: at 85 every valid
+    /// observation, up to a maximum-size, signed, addressed one, fits in the
+    /// 64 fragments a peer will reassemble. Below that core never emits an
+    /// oversized frame, but it sends less:
+    /// - below 85, the largest observations can't be sent;
+    /// - below 66, nothing is fragmented, so only observations that fit
+    ///   whole in one frame go out;
+    /// - below 35, no receipt fits, so none is sent and every sender keeps
+    ///   custody of what it sent;
+    /// - below 26, no summary fits.
     fn mtu(&self) -> usize;
 }
 

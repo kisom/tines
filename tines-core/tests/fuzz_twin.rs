@@ -22,7 +22,8 @@
 mod fuzz;
 
 use proptest::prelude::*;
-use tines_core::consts::{MAX_FRAME, MAX_PAYLOAD, MAX_PEERS, MAX_TOPIC, SUMMARY_BYTES};
+use tines_core::conformance::MAX_PEERS;
+use tines_core::consts::{MAX_FRAME, MAX_PAYLOAD, MAX_TOPIC, SUMMARY_BYTES};
 use tines_core::Store;
 
 // A single bounded case count keeps the twin fast under `cargo test` while

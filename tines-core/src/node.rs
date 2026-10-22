@@ -171,8 +171,8 @@ impl<S: Store, T: Transport> Node<S, T> {
     /// counted drop.
     ///
     /// The returned [`heapless::Vec`] is capped at
-    /// [`consts::EVENT_QUEUE_CAP`] confirmed deliveries plus the entire
-    /// [`consts::DROP_TABLE_CAP`]-entry drop table and its overflow slot. Index
+    /// `EVENT_QUEUE_CAP` (64) confirmed deliveries plus the entire
+    /// `DROP_TABLE_CAP` (32)-entry drop table and its overflow slot. Index
     /// it directly — a [`NodeEvent::Delivered`] names the peer that held our
     /// broadcast and the broadcast's content-ID; a [`NodeEvent::Dropped`] names
     /// the peer and reason a dropped frame was rejected with.
