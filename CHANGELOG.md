@@ -6,9 +6,9 @@ compatibility promise in README's "Stability" section. The host crates
 (`tines`, `tines-store`, `tines-bt`, `tines-ros2`, `tines-sim`) stay 0.x,
 where a minor bump may break the API.
 
-## tines-core 1.0.0 — Unreleased
+## tines-core 1.0.0 — 2026-10-22
 
-Implemented on `feat/tines-core-1-0`; not yet tagged or published. The wire
+Implemented on `feat/tines-core-1-0`. The wire
 format is frozen as wire v1, the public API is narrowed and documented
 (`#![deny(missing_docs)]`), and the core hardening from the 1.0 spec
 (`docs/superpowers/specs/2026-10-18-tines-1-0-design.md` §10) is in. It also
