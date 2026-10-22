@@ -175,8 +175,12 @@ pub(crate) struct Peer<A> {
     pub addr: A,
     /// Node id learned from the first frame received from this peer.
     pub id: Option<NodeId>,
-    /// Tick of the last inbound frame this peer sent; used to evict a peer
-    /// idle beyond [`consts::PEER_IDLE_MS`] as if Lost.
+    /// Tick this contact started (its `Contact`, or the implicit contact of
+    /// its first frame). A peer that never sends ages out from here.
+    added_at: Tick,
+    /// Tick of the last inbound frame this peer sent. A peer idle (since this,
+    /// or since `added_at` if it never sent) beyond [`consts::PEER_IDLE_MS`]
+    /// is evicted as if Lost (F8).
     last_inbound: Option<Tick>,
     /// Tick of the last summary we acted on from this peer; enforces the
     /// one-summary-per-[`consts::SUMMARY_INTERVAL_MS`] replay limit (F9).
@@ -204,11 +208,12 @@ pub(crate) struct Peer<A> {
 impl<A> Peer<A> {
     /// Creates a peer with no known id, no summary, empty queue, and a fresh
     /// reassembler — `last_summary_sent` is `None` so a summary is emitted on
-    /// the next [`Exchange::next_frame`].
-    fn new(addr: A) -> Self {
+    /// the next [`Exchange::next_frame`]. The contact starts at `now`.
+    fn new(addr: A, now: Tick) -> Self {
         Peer {
             addr,
             id: None,
+            added_at: now,
             last_inbound: None,
             last_summary_received: None,
             their_summary: None,
@@ -367,7 +372,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
     ) -> Option<Observation> {
         match ev {
             Event::Contact(addr) => {
-                self.add_peer(addr);
+                self.add_peer(addr, now);
                 None
             }
             Event::Lost(addr) => {
@@ -398,6 +403,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
     ) -> Option<(A, usize)> {
         self.undo = None;
         self.ack_undo = None;
+        self.evict_idle(now);
         let me = self.me;
         // Priority 1: a summary is due for some peer.
         for peer in self.peers.iter_mut() {
@@ -854,14 +860,36 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
     /// Starts a contact with `addr`. A repeat `Contact` for a known peer
     /// starts a new contact too: the F6 pin and the per-contact records
     /// (bounces, broadcast receipts) reset.
-    fn add_peer(&mut self, addr: A) {
+    /// A repeat `Contact` also restarts the peer's idle clock.
+    fn add_peer(&mut self, addr: A, now: Tick) {
+        self.evict_idle(now);
         self.forget_contact(&addr);
         if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == addr) {
             peer.id = None;
+            peer.added_at = now;
+            peer.last_inbound = None;
             return;
         }
         if self.peers.len() < consts::MAX_PEERS {
-            let _ = self.peers.push(Peer::new(addr));
+            let _ = self.peers.push(Peer::new(addr, now));
+        }
+    }
+
+    /// F8: removes, as if Lost, every peer with no inbound frame (or, if it
+    /// never sent one, no contact start) for more than
+    /// [`consts::PEER_IDLE_MS`]. Run before a peer is added and at the top of
+    /// [`Exchange::next_frame`], so silent or spoofed addresses can't hold
+    /// the table and lock out newcomers.
+    fn evict_idle(&mut self, now: Tick) {
+        let mut idle: Vec<A, { consts::MAX_PEERS }> = Vec::new();
+        for peer in self.peers.iter() {
+            let since = peer.last_inbound.unwrap_or(peer.added_at);
+            if now.saturating_sub(since) > consts::PEER_IDLE_MS {
+                let _ = idle.push(peer.addr.clone());
+            }
+        }
+        for addr in idle.iter() {
+            self.remove_peer(addr);
         }
     }
 
@@ -887,14 +915,17 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
     }
 
     /// Returns the index of the peer at `addr`, adding it as an implicit
-    /// contact if unknown and the table is not full.
-    fn peer_index(&mut self, addr: &A) -> Option<usize> {
+    /// contact if unknown and the table is not full. Idle peers are evicted
+    /// first, so a peer that resumes after its idle window is an implicit new
+    /// contact.
+    fn peer_index(&mut self, addr: &A, now: Tick) -> Option<usize> {
+        self.evict_idle(now);
         if let Some(idx) = self.peers.iter().position(|p| &p.addr == addr) {
             return Some(idx);
         }
         if self.peers.len() < consts::MAX_PEERS {
             self.forget_contact(addr);
-            let _ = self.peers.push(Peer::new(addr.clone()));
+            let _ = self.peers.push(Peer::new(addr.clone(), now));
             return Some(self.peers.len() - 1);
         }
         None
@@ -922,20 +953,18 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                 return None;
             }
         };
-        let idx = self.peer_index(&addr)?;
+        // F8: `peer_index` evicts idle peers first. A peer that went silent
+        // past the idle window was removed as if Lost, so its frame now starts
+        // an implicit new contact and is processed, not dropped. (Bounce and
+        // receipt records from the old contact are gone with it: an Ack for an
+        // id sent then is ignored, keeping custody — a duplicate custodian at
+        // worst.)
+        let idx = self.peer_index(&addr, now)?;
         let peer = &mut self.peers[idx];
-        // F8: a peer silent past the idle window is removed as if Lost — no
-        // further inbound frame is stored for it under this contact.
-        if let Some(last) = peer.last_inbound {
-            if now.saturating_sub(last) > consts::PEER_IDLE_MS {
-                self.remove_peer(&addr);
-                return None;
-            }
-        }
         // F6: the first frame pins the peer's node id; a later frame whose
         // sender no longer matches is dropped and counted as IdentityChanged and
         // the pinned id is NOT upgraded to the newcomer. The pin resets on
-        // Contact/Lost via `peer_index`'s implicit-contact peer.
+        // Contact/Lost (and idle eviction), which start a new contact.
         let sender = frame.sender();
         if let Some(pinned) = peer.id {
             if pinned != sender {
@@ -3422,31 +3451,33 @@ mod tests {
     }
 
     /// F8: a peer with no inbound frame for longer than `PEER_IDLE_MS` is
-    /// removed as if Lost.
+    /// removed as if Lost. If it then resumes, it is an implicit new contact:
+    /// its frame is processed, not dropped, and its F6 pin starts afresh.
     #[test]
-    fn idle_peer_is_evicted() {
+    fn idle_peer_is_evicted_and_resumes_as_new_contact() {
         let a: NodeId = [2; 16];
+        let b: NodeId = [9; 16];
         let mut ex = Exchange::new(ME);
         let mut store = MemStore::new();
         ex.on_event(Event::Contact(1), &mut store, 0);
-        assert_eq!(ex.peers().len(), 1);
+        ex.on_event(Event::Frame(1, hello(a, 1)), &mut store, 0);
+        assert_eq!(ex.peers()[0].id, Some(a));
 
-        // First frame at now=0 establishes last_inbound.
-        let f1 = Frame::Obs {
-            from: a,
-            obs: obs(a, 1, 0, None, b"t", b"x"),
-        };
-        ex.on_event(Event::Frame(1, frame_bytes(&f1)), &mut store, 0);
-        assert_eq!(ex.peers().len(), 1);
-
-        // A second frame arriving past the idle window evicts the peer.
+        // Past the idle window the peer resumes (under a new id): the old
+        // contact was evicted, so the frame is a new contact's first frame.
         let idle = consts::PEER_IDLE_MS + 1;
         assert!(
-            ex.on_event(Event::Frame(1, frame_bytes(&f1)), &mut store, idle)
-                .is_none(),
-            "a frame past the idle window is not stored"
+            ex.on_event(Event::Frame(1, hello(b, 1)), &mut store, idle)
+                .is_some(),
+            "a resuming peer's frame is processed"
         );
-        assert_eq!(ex.peers().len(), 0, "an idle peer is removed as if Lost");
+        assert_eq!(ex.peers().len(), 1);
+        assert_eq!(
+            ex.peers()[0].id,
+            Some(b),
+            "the resumed contact is pinned afresh"
+        );
+        assert!(ex.drain_events().is_empty(), "nothing is counted as a drop");
     }
 
     /// F9: two summaries from one peer within `SUMMARY_INTERVAL_MS` — the
@@ -3946,5 +3977,126 @@ mod tests {
             !is_sourced(&ex.bounce, x_id, &1u8),
             "a repeat Contact forgets the previous contact's bounce records"
         );
+    }
+
+    /// A fresh broadcast frame from `from`, unique per `seq`.
+    fn hello(from: NodeId, seq: u64) -> FrameBufT {
+        frame_bytes(&Frame::Obs {
+            from,
+            obs: obs(from, seq, 0, None, b"t", b"hello"),
+        })
+    }
+
+    /// S1 (F8): a table full of peers that each sent one frame and went
+    /// silent doesn't lock out a newcomer: past `PEER_IDLE_MS` they're
+    /// evicted and the new address gets a slot.
+    #[test]
+    fn silent_peers_are_evicted_for_a_newcomer() {
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        for addr in 0..consts::MAX_PEERS as u8 {
+            ex.on_event(Event::Frame(addr, hello([addr; 16], 1)), &mut store, 0);
+        }
+        assert_eq!(ex.peers().len(), consts::MAX_PEERS);
+        let newcomer: u8 = 100;
+        assert!(
+            ex.on_event(
+                Event::Frame(newcomer, hello([newcomer; 16], 1)),
+                &mut store,
+                0
+            )
+            .is_none(),
+            "a full table refuses a newcomer while its peers are live"
+        );
+
+        let later = consts::PEER_IDLE_MS + 1;
+        assert!(
+            ex.on_event(
+                Event::Frame(newcomer, hello([newcomer; 16], 2)),
+                &mut store,
+                later
+            )
+            .is_some(),
+            "past the idle window the newcomer's frame is processed"
+        );
+        assert!(ex.peers().iter().any(|p| p.addr == newcomer));
+    }
+
+    /// S1 (F8): a table full of contact-only peers (no frame ever) ages out
+    /// too, so a new `Contact` gets a slot.
+    #[test]
+    fn contact_only_peers_are_evicted_for_a_newcomer() {
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        for addr in 0..consts::MAX_PEERS as u8 {
+            ex.on_event(Event::Contact(addr), &mut store, 0);
+        }
+        let later = consts::PEER_IDLE_MS + 1;
+        ex.on_event(Event::Contact(100), &mut store, later);
+        assert_eq!(ex.peers().len(), 1);
+        assert_eq!(ex.peers()[0].addr, 100);
+    }
+
+    /// S1 (F8): a contact-only peer ages out on its own at the top of
+    /// `next_frame`, exactly once it has been idle for more than
+    /// `PEER_IDLE_MS`.
+    #[test]
+    fn contact_only_peer_ages_out() {
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        let mut buf = [0u8; consts::MAX_FRAME];
+        ex.next_frame(&store, consts::MAX_FRAME, consts::PEER_IDLE_MS, &mut buf);
+        assert_eq!(ex.peers().len(), 1, "not idle at exactly PEER_IDLE_MS");
+        assert!(ex
+            .next_frame(
+                &store,
+                consts::MAX_FRAME,
+                consts::PEER_IDLE_MS + 1,
+                &mut buf
+            )
+            .is_none());
+        assert!(
+            ex.peers().is_empty(),
+            "an idle contact-only peer is evicted"
+        );
+    }
+
+    /// S1 (F8): a repeat `Contact` counts as activity and restarts the idle
+    /// clock.
+    #[test]
+    fn repeat_contact_restarts_idle_clock() {
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        ex.on_event(Event::Contact(1), &mut store, consts::PEER_IDLE_MS);
+        let mut buf = [0u8; consts::MAX_FRAME];
+        ex.next_frame(
+            &store,
+            consts::MAX_FRAME,
+            consts::PEER_IDLE_MS + 1,
+            &mut buf,
+        );
+        assert_eq!(ex.peers().len(), 1);
+    }
+
+    /// S1 (F8): an idle peer is evicted as if Lost, which purges its pending
+    /// acks.
+    #[test]
+    fn idle_eviction_purges_pending_acks() {
+        let a: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        ex.on_event(Event::Frame(1, hello(a, 1)), &mut store, 0);
+        assert_eq!(ex.bcast_acks.len(), 1);
+        let mut buf = [0u8; consts::MAX_FRAME];
+        ex.next_frame(
+            &store,
+            consts::MAX_FRAME,
+            consts::PEER_IDLE_MS + 1,
+            &mut buf,
+        );
+        assert!(ex.peers().is_empty());
+        assert_eq!(ex.bcast_acks.len(), 0, "an evicted peer's acks are purged");
     }
 }
