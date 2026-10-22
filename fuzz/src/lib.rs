@@ -597,7 +597,7 @@ impl Harness {
                         DropReason::VersionMismatch { .. } | DropReason::Malformed => {
                             book.seen_decode_drops += count
                         }
-                        DropReason::IdentityChanged { .. } => book.seen_identity_drops += count,
+                        DropReason::IdentityChanged => book.seen_identity_drops += count,
                         _ => book.seen_other_drops += count,
                     }
                 }

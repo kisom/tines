@@ -258,7 +258,6 @@ proptest! {
 /// frame (filling the table), then everyone goes quiet. After
 /// `PEER_IDLE_MS`, a never-seen address must get a slot.
 #[test]
-#[ignore = "needs S1 (idle sweep): silent peers are never evicted yet"]
 fn peer_table_recovers_after_flood() {
     let mut h = Harness::new(Mode::Adversarial, MAX_FRAME);
     for addr in 0..(MAX_PEERS as u64 + 16) {
@@ -275,7 +274,6 @@ fn peer_table_recovers_after_flood() {
 /// Same flood, but contact-only peers: `Contact` events with no frames must
 /// age out too.
 #[test]
-#[ignore = "needs S1 (idle sweep): contact-only peers are never evicted yet"]
 fn peer_table_recovers_after_contact_flood() {
     let mut h = Harness::new(Mode::Adversarial, MAX_FRAME);
     for addr in 0..(MAX_PEERS as u64) {
