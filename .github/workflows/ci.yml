@@ -57,11 +57,18 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.82.0
+          targets: thumbv7em-none-eabihf
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - name: Build + test tines-core on MSRV
+      # Build only: the MSRV promise covers building tines-core, not its
+      # dev-dependencies. proptest pulls in crates that need edition 2024,
+      # which 1.82 can't parse, so `cargo test` can't run here. The tests run
+      # on the pinned toolchain in the `ci` job. `+1.82.0` overrides
+      # rust-toolchain.toml.
+      - name: Build tines-core on MSRV
         run: |
-          cargo test --locked -p tines-core
-          cargo test --locked -p tines-core --no-default-features
+          cargo +1.82.0 build --locked -p tines-core
+          cargo +1.82.0 build --locked -p tines-core --no-default-features
+          cargo +1.82.0 build --locked -p tines-core --no-default-features --target thumbv7em-none-eabihf
