@@ -42,6 +42,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
 
+      # The semver gate in scripts/ci.sh compares tines-core against the
+      # published 1.0.0; a prebuilt binary keeps this fast (a from-source
+      # install would dominate the job).
+      - name: Install cargo-semver-checks
+        run: |
+          curl -LsSf https://github.com/cargo-bins/cargo-binstall/releases/latest/download/cargo-binstall-x86_64-unknown-linux-musl.tgz | tar xzf - -C "$HOME/.cargo/bin"
+          cargo binstall --no-confirm cargo-semver-checks
+
       - name: Run CI gate
         run: sh scripts/ci.sh
 
