@@ -19,3 +19,8 @@ cargo test --locked -p tines-core --no-default-features
 # no_std + conformance combination is actually exercised (not just by inspection).
 cargo test --locked -p tines-core --no-default-features --features conformance
 sh scripts/check-no-std.sh
+# The fuzz crate sits outside the workspace and only *runs* on nightly
+# (cargo-fuzz, see .github/workflows/fuzz.yml), but it must keep resolving and
+# compiling on the pinned stable toolchain, or the scheduled job rots unseen.
+cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings

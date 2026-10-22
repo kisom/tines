@@ -277,7 +277,7 @@ dependencies = [
 
 [[package]]
 name = "tines-core"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "blake2",
  "heapless",
