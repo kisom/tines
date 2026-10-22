@@ -318,6 +318,9 @@ pub struct Harness {
     mtu: usize,
     q: Rc<Queues>,
     now: Tick,
+    /// The latest tick the node has been given. Steps can move `now`
+    /// backwards, but the node's idle clock counts from the latest tick.
+    max_now: Tick,
     peers: BTreeMap<Addr, PeerBook>,
     /// Drops counted in the overflow slot (`addr: None`).
     overflow_drops: u64,
@@ -350,6 +353,7 @@ impl Harness {
             mtu,
             q,
             now: 0,
+            max_now: 0,
             peers: BTreeMap::new(),
             overflow_drops: 0,
             stored: BTreeMap::new(),
@@ -511,6 +515,7 @@ impl Harness {
                 } else {
                     self.now.saturating_sub(delta.unsigned_abs())
                 };
+                self.max_now = self.max_now.max(self.now);
             }
             Step::Ourselves { size } => {
                 let payload = vec![0x5A; *size as usize % (MAX_PAYLOAD + 1)];
@@ -773,7 +778,16 @@ impl Harness {
     /// every peer, a frame from a never-seen address still gets a slot, so
     /// the node stores the observation it carries.
     pub fn check_peer_table_recovers(&mut self) {
-        self.now = self.now.saturating_add(conformance::PEER_IDLE_MS + 1);
+        // Idle time counts from each peer's last frame, so measure from the
+        // latest tick, not the current one (a step may have moved `now`
+        // backwards; ages saturate rather than go negative). Ticks this close
+        // to u64::MAX can't advance by PEER_IDLE_MS, so there's nothing to
+        // probe.
+        let Some(now) = self.max_now.checked_add(conformance::PEER_IDLE_MS + 1) else {
+            return;
+        };
+        self.now = now;
+        self.max_now = now;
         self.pump();
         let addr = Addr::MAX;
         let obs = Observation::broadcast([0xEE; 16], u64::MAX, b"recovery", b"probe");
