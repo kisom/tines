@@ -8,7 +8,7 @@ authors.workspace = true
 repository.workspace = true
 readme.workspace = true
 documentation = "https://docs.rs/tines-ros2"
-keywords = ["robotics", "ros2", "gossip", "delay-tolerant", "science::robotics"]
+keywords = ["robotics", "ros2", "gossip", "delay-tolerant"]
 categories = ["science::robotics", "network-programming"]
 
 [features]
