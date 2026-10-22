@@ -112,6 +112,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -298,6 +299,8 @@ pub struct LogStore {
     anchor: Tick,
     /// The `unknown_downtime_age_ms` broadcast floor configured on open.
     unknown_downtime_age_ms: u64,
+    /// Wall times a peer estimate must fall in to count (decision J).
+    plausible_wall_ms: RangeInclusive<u64>,
     /// Wall-clock value captured by [`Self::set_wall_clock`]; `Some` once the
     /// wall clock has been trusted.
     wall_at_set: Option<u64>,
@@ -336,6 +339,7 @@ pub struct FoldReport {
 pub struct LogStoreBuilder {
     path: PathBuf,
     unknown_downtime_age_ms: u64,
+    plausible_wall_ms: RangeInclusive<u64>,
 }
 
 impl LogStoreBuilder {
@@ -350,10 +354,25 @@ impl LogStoreBuilder {
         }
     }
 
-    /// Open the store, creating it if necessary, with the configured broadcast
-    /// floor. See [`LogStore::open`].
+    /// Set the range of wall times (ms since the Unix epoch) a peer estimate
+    /// must fall in to count (spec §9, decision J). [`LogStore::peer_time_estimate`]
+    /// ignores any candidate whose estimate is outside it, so a forged
+    /// `observed_at` far ahead (or behind) can't hide the honest estimates.
+    ///
+    /// The default is unbounded (`0..=u64::MAX`).
+    pub fn plausible_wall_ms(self, plausible_wall_ms: RangeInclusive<u64>) -> Self {
+        Self {
+            plausible_wall_ms,
+            ..self
+        }
+    }
+
+    /// Open the store, creating it if necessary, with the configured options.
+    /// See [`LogStore::open`].
     pub fn open(self, now: Tick) -> Result<LogStore, StoreError> {
-        LogStore::open_with(self.path.as_ref(), now, self.unknown_downtime_age_ms)
+        let mut store = LogStore::open_with(self.path.as_ref(), now, self.unknown_downtime_age_ms)?;
+        store.plausible_wall_ms = self.plausible_wall_ms;
+        Ok(store)
     }
 }
 
@@ -392,6 +411,7 @@ impl LogStore {
         LogStoreBuilder {
             path: path.to_path_buf(),
             unknown_downtime_age_ms: LogStore::DEFAULT_UNKNOWN_DOWNTIME_MS,
+            plausible_wall_ms: 0..=u64::MAX,
         }
     }
     /// Open (creating if necessary) the log at `path` and rebuild the index.
@@ -602,6 +622,7 @@ impl LogStore {
             open_tick: now,
             anchor: now,
             unknown_downtime_age_ms,
+            plausible_wall_ms: 0..=u64::MAX,
             wall_at_set: None,
             tick_at_set: None,
             fold_report: None,
@@ -895,7 +916,12 @@ impl LogStore {
     /// estimate and collects estimates for a short window before adopting
     /// the latest one with [`Self::set_wall_clock`] (spec §9).
     ///
-    /// Returns `None` when no candidate carries an `observed_at` yet.
+    /// Estimates outside the range set with
+    /// [`LogStoreBuilder::plausible_wall_ms`] don't count (unbounded by
+    /// default), so one forged `observed_at = u64::MAX` can't win the max and
+    /// hide the honest estimates.
+    ///
+    /// Returns `None` when no candidate carries an `observed_at` in range yet.
     pub fn peer_time_estimate(&self, now: Tick) -> Option<u64> {
         self.index
             .values()
@@ -907,6 +933,7 @@ impl LogStore {
                         .saturating_add(now.saturating_sub(entry.stored_at))
                 })
             })
+            .filter(|estimate| self.plausible_wall_ms.contains(estimate))
             .max()
     }
 

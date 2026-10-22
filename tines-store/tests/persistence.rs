@@ -1298,6 +1298,41 @@ mod snapshots_and_flush {
         assert_eq!(s.peer_time_estimate(200), Some(u64::MAX));
     }
 
+    /// Decision J / B3: an estimate outside the plausible range doesn't count,
+    /// so a forged `observed_at = u64::MAX` can't hide the honest estimates.
+    #[test]
+    fn implausible_peer_time_does_not_count() {
+        const FLOOR: u64 = 1_767_225_600_000; // 2026-01-01Z
+        const CEILING: u64 = FLOOR + 36_525 * 86_400_000;
+        let path = store_path("j_plausible");
+        let mut s = LogStore::builder(&path)
+            .plausible_wall_ms(FLOOR..=CEILING)
+            .open(0)
+            .unwrap();
+        s.insert(obs([1; 16], 1, 0, Some(u64::MAX)), 0).unwrap();
+        assert_eq!(
+            s.peer_time_estimate(0),
+            None,
+            "the forgery alone counts for nothing"
+        );
+        s.insert(obs([2; 16], 1, 0, Some(FLOOR - 1)), 0).unwrap();
+        assert_eq!(
+            s.peer_time_estimate(0),
+            None,
+            "below the floor doesn't count"
+        );
+        s.insert(obs([3; 16], 1, 100, Some(FLOOR + 5_000)), 0)
+            .unwrap();
+        assert_eq!(s.peer_time_estimate(50), Some(FLOOR + 5_150));
+        drop(s);
+
+        // Unset, the range is unbounded: the forgery wins, saturated.
+        let path = store_path("j_unbounded");
+        let mut s = LogStore::builder(&path).open(0).unwrap();
+        s.insert(obs([1; 16], 1, 0, Some(u64::MAX)), 0).unwrap();
+        assert_eq!(s.peer_time_estimate(0), Some(u64::MAX));
+    }
+
     /// Decision L: quarantined entries are exempt from every trim rule, not
     /// just the age trim.
     #[test]
