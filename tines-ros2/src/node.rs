@@ -44,6 +44,7 @@ use std::sync::mpsc::channel;
 use rclrs::{Context, CreateBasicExecutor, Node as RclNode, Publisher, RclrsError, Subscription};
 use ros_env::std_msgs::msg::{MultiArrayLayout, UInt8MultiArray};
 
+use tines::trust::{adopt_wall_clock, system_wall_ms, PeerTimeWindow};
 use tines::HostClock;
 use tines_bt::{BtTransport, Radio};
 use tines_core::{
@@ -122,6 +123,9 @@ pub struct TinesNode {
     /// as `observed_at` (see [`Self::drain_inbound`]); before that they carry
     /// `None`.
     clock: HostClock,
+    /// Decision J's peer-time window: collects peer estimates from the first
+    /// plausible one and yields the latest, once.
+    window: PeerTimeWindow,
 }
 
 impl TinesNode {
@@ -140,10 +144,19 @@ impl TinesNode {
     /// [`TinesNode::poll`].
     ///
     /// Wall time starts untrusted: the store quarantines the held observations
-    /// it loaded until the host establishes a trusted wall clock. That happens
-    /// in order (see [`TinesNode::apply_trusted_time`]) — a peer's observation
-    /// (the youngest stored observation carrying an `observed_at`) — after which
-    /// observations made by this node carry that wall time as `observed_at`.
+    /// it loaded until the host establishes a trusted wall clock. It comes, in
+    /// order, from:
+    ///
+    /// 1. a local source the application trusts: call
+    ///    [`TinesNode::trust_system_clock`] (or [`TinesNode::trust_wall_clock`]
+    ///    with an RTC or GPS reading) right after construction;
+    /// 2. otherwise peers: [`TinesNode::poll`] collects their estimates for a
+    ///    window (default 10 s, see [`TinesNode::set_peer_time_window_ms`])
+    ///    and adopts the latest (spec decision J).
+    ///
+    /// Either way the time is adopted once per run, and only if it's plausible
+    /// ([`tines::trust::is_plausible_wall_ms`]). After that, observations made
+    /// by this node carry the wall time as `observed_at`.
     pub fn new(
         me: NodeId,
         log_path: &std::path::Path,
@@ -175,7 +188,65 @@ impl TinesNode {
             inbound_tx,
             topic_cap,
             clock: HostClock::start(),
+            window: PeerTimeWindow::default(),
         })
+    }
+
+    /// Set the peer-time window: how long, from the first plausible peer
+    /// estimate, [`TinesNode::poll`] keeps collecting estimates before
+    /// adopting the latest (spec decision J). Defaults to
+    /// [`tines::trust::DEFAULT_PEER_TIME_WINDOW_MS`]. Call it before the first
+    /// poll; a call restarts any window already open.
+    pub fn set_peer_time_window_ms(&mut self, window_ms: u64) {
+        self.window = PeerTimeWindow::new(window_ms);
+    }
+
+    /// Trust the system clock: adopt its current reading as the wall time at
+    /// tick `now` (the same monotonic tick passed to [`TinesNode::poll`]).
+    ///
+    /// The ROS2 counterpart of the service's `trusted_clock = "system"`. Call
+    /// it right after construction when the machine's clock is reliable (an
+    /// RTC, or an NTP- or GPS-disciplined clock), ideally once the clock has
+    /// synced. Returns `false`, changing nothing, if the system clock is
+    /// implausible (a board that booted before NTP synced, reading 1970) —
+    /// logged to stderr; the node then takes its time from peers — or if the
+    /// node already has a trusted wall time.
+    pub fn trust_system_clock(&mut self, now: Tick) -> bool {
+        match system_wall_ms() {
+            Some(wall) => self.trust_wall_clock(wall, now),
+            None => {
+                eprintln!(
+                    "tines: WARNING: the system clock is not plausible (before 2026 or \
+                     after 2126); NOT trusting it. Falling back to peer time."
+                );
+                false
+            }
+        }
+    }
+
+    /// Adopt `wall_ms` (ms since the Unix epoch) from a local trusted source,
+    /// such as an RTC or a GPS fix, as the wall time at tick `now`.
+    ///
+    /// Runs the store's fold, anchors the host clock, and flushes the store.
+    /// Returns `false`, changing nothing, if `wall_ms` is implausible
+    /// ([`tines::trust::is_plausible_wall_ms`]) or the node already has a
+    /// trusted wall time (adopted once per run).
+    pub fn trust_wall_clock(&mut self, wall_ms: u64, now: Tick) -> bool {
+        match adopt_wall_clock(&mut self.tines, &mut self.clock, wall_ms, now) {
+            Some(report) => {
+                match report.downtime_ms {
+                    Some(ms) => println!("tines: trusted local clock, folded {ms} ms downtime"),
+                    None => println!("tines: trusted local clock, downtime unknown"),
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether the node has adopted a trusted wall time.
+    pub fn has_trusted_time(&self) -> bool {
+        self.clock.is_trusted()
     }
 
     /// The local tines node id this node was built with.
@@ -210,29 +281,35 @@ impl TinesNode {
 
     /// Trusted wall-time state machine, run at the head of each [`poll`].
     ///
-    /// If the host is not yet trusted, derive a wall-clock estimate from a
-    /// peer's observation: scan the observations stored since this open (the
-    /// store's held data is quarantined, hence invisible to the scan) for one
-    /// carrying an `observed_at`, taking the youngest (smallest `age_ms`) as
-    /// the best estimate, which is never later than true time. Anchor the
-    /// clock once on the first trusted time; thereafter the clock returns
-    /// `Some` and observations made here carry an `observed_at`. If no peer
-    /// time is available, the host stays quarantined — observations keep
-    /// carrying `None` — the robot's own fail-safe is outside tines.
+    /// While the node has no trusted wall time, re-query the store's peer
+    /// estimate (drawn only from observations stored since this open; held
+    /// data is quarantined, hence invisible) and feed it to the peer-time
+    /// window (spec decision J). The first plausible estimate opens the
+    /// window; when it closes, the latest estimate is adopted once: the store
+    /// folds, the clock is anchored, and the store is flushed. With no peer
+    /// time the host stays quarantined — observations keep carrying `None` —
+    /// and the robot's own fail-safe is outside tines.
+    ///
+    /// The estimate scans the store, O(n) per poll; it stops for good once
+    /// the node is trusted.
+    ///
+    /// [`poll`]: TinesNode::poll
     fn apply_trusted_time(&mut self, now: Tick) {
         if self.clock.is_trusted() {
             return;
         }
-        let Some(est) = self.tines.peer_time_estimate(now) else {
+        let estimate = self.tines.peer_time_estimate(now);
+        let Some(est) = self.window.offer(estimate, now) else {
             return;
         };
-        let report = self.tines.set_wall_clock(est, now);
-        self.clock.anchor_wall(est, now);
-        match report.downtime_ms {
-            Some(ms) => println!("tines: trusted wall clock from peer (folded {ms} ms downtime)"),
-            None => {
-                println!("tines: trusted wall clock from peer, downtime unknown");
-            }
+        match adopt_wall_clock(&mut self.tines, &mut self.clock, est, now) {
+            Some(report) => match report.downtime_ms {
+                Some(ms) => {
+                    println!("tines: trusted wall clock from peer (folded {ms} ms downtime)")
+                }
+                None => println!("tines: trusted wall clock from peer, downtime unknown"),
+            },
+            None => eprintln!("tines: peer wall time {est} ms rejected"),
         }
     }
 
