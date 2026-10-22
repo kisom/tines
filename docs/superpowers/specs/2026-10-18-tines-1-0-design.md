@@ -6,8 +6,9 @@ Status: approved by Kyle (2026-10-20). Kyle decided D1–D5 and Q1–Q3
 definition (2026-10-19); review fixes applied. v6 added §10 (core hardening
 from `THREAT_MODEL.md`) and the adversarial fuzz mode; Kyle reviewed and
 approved both (2026-10-20). Decisions F (`flush`) and G (age across downtime) added 2026-10-20;
-G amended the same day (quarantine on open, time from peers). Decision H
-(`WallClockStore`) added 2026-10-21.
+G amended the same day (quarantine on open, time from peers). Decisions H
+(`WallClockStore`), I (`LogStore` snapshots), J (choosing peer time),
+K (local constants private) and L (review clarifications) added 2026-10-21.
 Builds on: `2026-10-16-tines-design.md`, `2026-10-18-tines-addressed-delivery.md`,
 `2026-10-18-tines-fleet-deployment-design.md` (assumed fully implemented)
 
@@ -202,8 +203,11 @@ pub struct Dest { pub to: NodeId, pub lifetime_ms: u64 }
   `Observation::broadcast(observer, seq, topic, payload)` and
   `Observation::addressed(observer, seq, topic, payload, to, lifetime_ms)`,
   plus `with_observed_at`. Applications normally never build one —
-  `Node::observe`/`observe_to` do. 1.0 has no public way to set `sig`; 1.1
-  adds it.
+  `Node::observe`/`observe_to` do. 1.0 offers no constructor or `Node`
+  method that sets `sig`; 1.1 adds one. The field itself is public, like
+  every `Observation` field, so code can assign it. Nothing in 1.0 signs or
+  verifies, and `sig` is outside the identity hash (decision L,
+  2026-10-21).
 - **The observation's wire encoding changes in v1; only its identity is
   preserved.** `dest` replaces `to` + `lifetime_ms`, and `sig` is appended,
   so postcard encodes an `Observation` differently from 0.x. That's fine
@@ -399,7 +403,7 @@ Public in 1.0 (everything else becomes `pub(crate)`):
 | `WallClockStore` (opt-in supertrait of `Store`: associated `FoldReport`, `set_wall_clock`, `peer_time_estimate`) | lets a host feed trusted wall time to a backend that holds data across power-off, through the `Node`, without a `&mut Store` backdoor (§9; decision H) |
 | `Transport`, `Event`, `SendError`, `FrameBuf` | transport adapters |
 | `BeliefPolicy`, `LatestWins`, `SelfFirst` | the memory layer |
-| `consts` (wire constants + local caps, §5), `WIRE_VERSION` | sizing |
+| `consts` (wire constants only, §5; local caps are `pub(crate)`, decision K), `WIRE_VERSION` | sizing |
 | `frame_sender(bytes) -> Option<NodeId>` | lets a transport check a frame's claimed sender against the identity it bound to the connection without core's private `Frame` layout (fleet fixes spec §3; `THREAT_MODEL.md` F3) |
 
 Made private: `Exchange`, `Peer`, `InFlight`, `Bloom` (including the
@@ -514,6 +518,19 @@ both sides must agree on to read a field. Everything else is local.
   drop-counter table (§1). `EVENT_QUEUE_CAP` is local, even though
   `ACK_IDS_CAP` is wire: the event queue never leaves the node, while an
   `Ack` frame's id list is decoded by the peer.
+  - **Local constants are `pub(crate)` in 1.0 (decision K, 2026-10-21).**
+    That covers the ones above, plus `MIN_MTU`, `PEER_IDLE_MS` and
+    `DROP_TABLE_CAP`.
+    - They are defaults. A later 1.x release makes the actual values
+      configurable, and adding that configuration is a minor change.
+    - Only wire constants stay public.
+    - A crate outside core that needs a matching number keeps its own
+      constant, as `tines-bt` already does for `MIN_MTU`. `tines-bt` caps
+      its live connections with its own constant, equal to core's peer
+      cap, until configuration replaces both.
+    - Tests outside core either use their own values or a `#[doc(hidden)]`
+      export behind the `conformance` feature.
+    - `Transport::mtu`'s rustdoc states the smallest MTU core can use.
 
 AGENTS.md's constant list is updated to show the split.
 
@@ -634,7 +651,10 @@ the new `Observation` encoding. There is no migration:
     - Every observation already in the log is quarantined until the fold
       runs. It's left out of summaries, custody offers and
       `for_each_topic` (so beliefs don't see it). It isn't trimmed on its
-      untrusted age.
+      untrusted age. It's also exempt from `max_count` and
+      `keep_per_topic`, which rank by that same untrusted age, so a store
+      in quarantine can briefly hold more than `max_count` (decision L,
+      2026-10-21).
     - For a quarantined addressed observation, `is_released` reports
       `true`, so core neither forwards it nor acks a duplicate of it (it
       won't take custody back of something it may be about to expire).
@@ -678,19 +698,77 @@ the new `Observation` encoding. There is no migration:
     stays `Tick`-only (decision F). A flush before trusted time writes a
     marker with no wall time. If the robot then restarts, the next fold
     finds no wall time and takes the unknown path, which is the safe one.
+  - **Snapshots make each fold durable (decision I, 2026-10-21).** An
+    `Obs` record's `stored_at` is a tick from the boot that wrote it, so a
+    log that only ever appends mixes tick domains across boots. Its folds
+    would also last only in memory. `LogStore` rewrites the log as a
+    snapshot at two points:
+    1. at the end of `open`, after the tick fold;
+    2. at the end of the `set_wall_clock` fold.
+
+    A snapshot holds:
+    - the header and the current `Boot` record;
+    - every live observation, with its current `age_ms` and
+      `stored_at = now`;
+    - a `Release` record for every released id still held, including
+      those the fold just expired;
+    - a closing clock marker at `now`. It carries the derived wall time if
+      the store has one, and none otherwise.
+
+    It holds no trimmed records. The snapshot is written to a temporary
+    file in the same directory, fsynced, renamed over the log, and then
+    the directory is fsynced.
+    - **Every `stored_at` on disk then belongs to the current boot.** The
+      next open folds them against that boot's own markers, so age lineage
+      survives any number of reboots.
+    - **The fold's results are durable.** An addressed observation it
+      expired stays released after a later reboot. A floored broadcast
+      keeps its floor.
+    - **The open snapshot's marker has no wall time.** The store can't
+      know the wall time at open, and writing the old marker's wall time
+      would claim zero downtime, the dangerous direction. So a robot that
+      restarts before it gets trusted time takes the unknown path next
+      boot, the same as a flush before trusted time.
+    - **The fold counts this boot's ticks once.** It adds the wall-clock
+      downtime minus the ticks elapsed since open, not since each entry's
+      `stored_at`. A `flush` between open and `set_wall_clock` has
+      already counted its share.
+    - **A crash is safe at any point.** Before the rename, the old log is
+      intact, and the next open repeats the same fold. After the rename,
+      the snapshot is the log.
+    - **The cost is at most two rewrites per boot.** `flush` stays one
+      marker and an fsync. The snapshot also compacts the log, which
+      otherwise only grows.
+    - The record kinds don't change, so the format stays at the
+      version-2 bump.
   - **Where trusted time comes from.** In order:
     1. the robot's own trusted source (an RTC it trusts, or a GPS fix);
     2. otherwise, **another robot**, through any received observation that
        carries `observed_at`. The estimate is `observed_at + age_ms`, plus
        local ticks elapsed since that observation arrived. Because age is a
-       lower bound, this estimate is never later than the true time. The
-       estimate uses the observation with the smallest `age_ms` (the least
-       accumulated error), and only one inserted after this open: anything
-       older is quarantined. The backend computes this estimate
+       lower bound, this estimate is never later than the true time. Only
+       observations inserted after this open count, because anything older
+       is quarantined. The backend computes each estimate
        (`WallClockStore::peer_time_estimate`, reached through
        `Node::peer_time_estimate`), because only it knows which
        observations are quarantined and when each one arrived (decision
        H).
+       - **Choosing the time (decision J, 2026-10-21).**
+         `peer_time_estimate` returns the *latest* estimate among those
+         candidates.
+       - **The window.** The host doesn't adopt the first estimate it
+         sees. From the first candidate onward, it collects estimates for
+         a short window: about 10 s by default, a host config option.
+         Then it adopts the latest one and calls `set_wall_clock` with it.
+         Every honest estimate is at or behind the true time, so the
+         latest is the closest. The cost is staying in quarantine for the
+         window, a few seconds at the start of the first contact.
+       - **Bounds.** An estimate below a compile-time floor, or absurdly
+         far ahead, doesn't count (B3 of the 1.0 review).
+       - **One adoption per run.** Once adopted, the time isn't corrected
+         while the host runs. A later, better estimate isn't applied. The
+         time is corrected at the next start, or when the host's own clock
+         becomes trusted.
     3. otherwise, the robot's own fail-safe applies. That's outside tines.
        The quarantine simply stays until trusted time arrives.
   - **Peer time is unauthenticated until 1.1.** A peer can claim any
@@ -700,9 +778,15 @@ the new `Observation` encoding. There is no migration:
       direction.
     - A time *behind* the marker is "clock went backwards", which takes the
       unknown path. That's also safe.
-    - The cost is the robot's own `observed_at` stamps, which are wrong
-      until a trusted local source corrects them. `THREAT_MODEL.md` records
-      this.
+    - A time behind the truth but still ahead of the marker under-counts
+      the downtime, so ages come out too young. That's the dangerous
+      direction (§2). Honest estimates can land here, which is why the
+      host takes the latest estimate in a window (decision J). A forger
+      gains nothing from the window: smallest-age selection already let a
+      forger win by sending `age_ms = 0`.
+    - The cost is the robot's own `observed_at` stamps. They're wrong
+      until the next start, or until the host's own clock becomes
+      trusted, and peers can adopt them. `THREAT_MODEL.md` records this.
   - Hosts set `observed_at` on every observation they make once they have
     trusted time, and leave it `None` before (R4).
 - Hosts wipe pre-1.0 logs on upgrade. That's acceptable because no robot
@@ -736,7 +820,10 @@ decides who is allowed to be a peer.
 3. **F9 — a summary can't be replayed for amplification.**
    - At most one received Summary per peer is acted on per
      `SUMMARY_INTERVAL_MS`. Extra ones are ignored; that's a policy, not a
-     drop.
+     drop. The receive-side check allows slack for poll jitter: a summary
+     arriving at least `SUMMARY_INTERVAL_MS / 2` after the last one acted
+     on is accepted, so an honest peer's on-time summary measured at
+     1999 ms isn't ignored (decision L, 2026-10-21).
    - The send-queue rebuild skips ids the peer's summary says it already has
      (`Bloom::might_contain`), and the worst-case output per received summary
      stays bounded by `SEND_QUEUE_CAP`. The rate limit bounds replay, and a
@@ -841,7 +928,7 @@ The review's other fixes are applied too:
     the log in quarantine until `LogStore::set_wall_clock(wall_now, now)`
     runs the fold. Trusted time comes from the robot's own RTC or GPS, or
     else from a peer's observation (`observed_at + age_ms`, smallest age
-    wins). The robot's own fail-safe covers the case where neither arrives.
+    wins; superseded by decision J, latest estimate in a window). The robot's own fail-safe covers the case where neither arrives.
     The marker's wall time is derived from the wall time and tick at
     `set_wall_clock`, so `Store::flush(now)` stays `Tick`-only. (Amended
     twice on 2026-10-20; this supersedes "don't open the store until
@@ -878,6 +965,76 @@ The review's other fixes are applied too:
     the host's value to the backend, and the backend's estimate back to the
     host. This replaces §9's earlier "a `LogStore` method, not a `Store`
     trait method: core never deals with wall time".
+
+- **I. `LogStore` snapshots the log after each fold** (§9).
+  - The 1.0 review found two problems with an append-only log:
+    - the fold's results lived only in memory, so a message the store
+      expired came back after the next reboot;
+    - `stored_at` ticks from different boots got folded against one
+      marker, so ages reset across a third boot.
+  - Three options were weighed:
+    1. re-append every observation, or a per-id age record, on each flush;
+    2. replay boot by boot on load;
+    3. rewrite a snapshot at open and after `set_wall_clock`.
+  - Kyle chose snapshots:
+    - they're very cheap on Linux-grade hardware;
+    - on an MCU they likely wear flash less than re-appending on every
+      flush;
+    - they avoid the complexity of replaying each boot.
+  - `flush` keeps its cost. The `Store` trait and the record kinds don't
+    change.
+
+- **J. Hosts adopt the latest peer estimate within a short window** (§9).
+  - The review found two problems with the old rule:
+    - Hosts adopted the first estimate they saw, picking the smallest
+      `age_ms` within one poll.
+    - Honest estimates are lower bounds, so an undershoot that's still
+      ahead of the marker under-counts the downtime. Ages then come out
+      too young, which is the dangerous direction.
+  - The new rule:
+    - `peer_time_estimate` returns the latest estimate among this open's
+      observations.
+    - The host collects estimates for a window, about 10 s by default and
+      set in config, then adopts the latest.
+    - The review's B3 plausibility bounds apply first.
+  - What it costs and protects:
+    - A forger gains nothing over smallest-age selection.
+    - The cost is a few seconds more in quarantine.
+  - The adopted time isn't corrected while the host runs. In-process
+    correction, which advances ages by the difference, was considered and
+    left out of 1.0. The time is corrected at the next start, or when the
+    host's own clock becomes trusted.
+  - Nothing here is frozen in tines-core 1.0. The trait signature fits any
+    selection rule, and the rule itself lives in `LogStore` and the hosts,
+    which are still 0.x.
+
+- **K. Local constants become `pub(crate)`** (§3, §5).
+  - The local capacities and timings are defaults. Kyle intends to make
+    the actual values configurable eventually.
+  - Making them private now loses nothing:
+    - nothing outside the workspace depends on them;
+    - adding configuration later, with these values as its defaults, is a
+      minor release;
+    - publishing them would freeze a set of names that configuration is
+      meant to replace.
+  - The wire constants stay public. They are part of the wire contract,
+    and changing one bumps `WIRE_VERSION`.
+
+- **L. Three smaller clarifications from the 1.0 review** (§2, §9, §10).
+  - **Quarantine and the count trims (§9).** Quarantined observations are
+    exempt from `max_count` and `keep_per_topic`, not just the age trim.
+    Those trims rank by age, and that age isn't trusted yet. The store can
+    briefly exceed `max_count`, until the fold.
+  - **Summary rate-limit slack (§10, F9).** A summary is acted on if it
+    arrives at least `SUMMARY_INTERVAL_MS / 2` after the last one acted on.
+    The strict `< SUMMARY_INTERVAL_MS` check ignored on-time summaries that
+    poll jitter made look a millisecond early. The limit still bounds
+    replay to two summaries per interval.
+  - **`Observation.sig` (§2).** The field stays public, like the struct's
+    other fields. The §2 wording now says 1.0 has no constructor or `Node`
+    method that sets it, not that there is no way at all. No security
+    effect: nothing signs or verifies in 1.0, and `sig` is outside the
+    identity hash.
 
 ## Left to the builder
 
