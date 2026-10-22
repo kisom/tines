@@ -399,8 +399,14 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
             let Some(bytes) = summary_bytes(mtu) else {
                 break;
             };
+            // Core never trusts the backend's filtering (spec §4): an addressed
+            // id must never appear in a summary, whatever the iterator yields.
             let mut bloom = Bloom::new(self.salt);
-            store.for_each_broadcast_id(&mut |id| bloom.insert(id));
+            store.for_each_broadcast_id(&mut |id| {
+                if store.get(id, now).is_some_and(|o| o.dest.is_none()) {
+                    bloom.insert(id);
+                }
+            });
             let bloom = bloom.fold(bytes)?;
             let bits = Vec::<u8, { consts::SUMMARY_BYTES }>::from_slice(bloom.bits()).ok()?;
             let frame = Frame::Summary {
@@ -673,7 +679,8 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         let addr = self.peers[idx].addr.clone();
         loop {
             let front = *self.peers[idx].send_queue.first()?;
-            if let Some(obs) = store.get(&front, now) {
+            // Broadcasts only: an addressed id goes through custody, never here.
+            if let Some(obs) = store.get(&front, now).filter(|o| o.dest.is_none()) {
                 if let Some(res) = self.emit(idx, front, &obs, None, mtu, out) {
                     self.record_bcast_sent(front, addr.clone());
                     return Some(res);
@@ -1276,15 +1283,16 @@ fn rebuild_send_queue<A, S: Store>(peer: &mut Peer<A>, store: &S, now: Tick) {
     // (last element) is admitted, dropping that oldest.
     let mut heap: Vec<(ObservationId, u64), { consts::SEND_QUEUE_CAP }> = Vec::new();
     // Broadcasts only (`to == None`): addressed messages are delivered through
-    // `forward_addressed` and must never leak into the broadcast diff, mirroring
-    // the bloom-summary path in `next_frame` which also iterates broadcast ids.
+    // `forward_addressed` and must never leak into the broadcast diff. The
+    // backend's iterator is not trusted to skip them (spec §4), so `dest` is
+    // re-checked, as in the bloom-summary path in `next_frame`.
     store.for_each_broadcast_id(&mut |id| {
         if their.might_contain(id) {
             return;
         }
         let obs = match store.get(id, now) {
-            Some(obs) => obs,
-            None => return,
+            Some(obs) if obs.dest.is_none() => obs,
+            _ => return,
         };
         insert_youngest(&mut heap, *id, obs.age_ms);
     });
@@ -2388,7 +2396,7 @@ mod tests {
 
     /// Feeds an empty full-size summary from `from` at `addr`, so the peer is
     /// known by id and appears to lack every broadcast observation.
-    fn empty_summary(ex: &mut Exchange<u8>, store: &mut MemStore, addr: u8, from: NodeId) {
+    fn empty_summary<S: Store>(ex: &mut Exchange<u8>, store: &mut S, addr: u8, from: NodeId) {
         let bits = heapless::Vec::from_slice(&[0u8; consts::SUMMARY_BYTES]).unwrap();
         let sum = Frame::Summary {
             from,
@@ -2399,9 +2407,9 @@ mod tests {
     }
 
     /// Polls `ex` once at `now`/`mtu` and decodes the frame, if any.
-    fn poll_frame(
+    fn poll_frame<S: Store>(
         ex: &mut Exchange<u8>,
-        store: &MemStore,
+        store: &S,
         mtu: usize,
         now: Tick,
     ) -> Option<(u8, Frame, FrameBufT)> {
@@ -3527,5 +3535,199 @@ mod tests {
             "Lost purges pending broadcast acks"
         );
         assert!(ex.acks.entries.is_empty(), "Lost purges pending acks");
+    }
+
+    /// A `Store` that overrides nothing it is allowed to skip (spec §4): its
+    /// `for_each_broadcast_id` yields EVERY held id — addressed and released
+    /// ones included — and it keeps the default `for_each_addressed_id`, which
+    /// yields every id too, broadcasts and released ids included. Core must
+    /// not rely on either iterator's filtering.
+    struct UnfilteredStore {
+        inner: MemStore,
+    }
+
+    impl UnfilteredStore {
+        fn new() -> Self {
+            Self {
+                inner: MemStore::new(),
+            }
+        }
+    }
+
+    impl Store for UnfilteredStore {
+        fn insert(&mut self, obs: Observation, now: Tick) -> Result<bool, StoreError> {
+            self.inner.insert(obs, now)
+        }
+
+        fn contains(&self, id: &ObservationId) -> bool {
+            self.inner.contains(id)
+        }
+
+        fn get(&self, id: &ObservationId, now: Tick) -> Option<Observation> {
+            self.inner.get(id, now)
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn for_each_id(&self, f: &mut dyn FnMut(&ObservationId)) {
+            self.inner.for_each_id(f)
+        }
+
+        fn for_each_broadcast_id(&self, f: &mut dyn FnMut(&ObservationId)) {
+            self.inner.for_each_id(f)
+        }
+
+        fn release(&mut self, id: &ObservationId) {
+            self.inner.release(id)
+        }
+
+        fn is_released(&self, id: &ObservationId) -> bool {
+            self.inner.is_released(id)
+        }
+
+        fn for_each_topic(&self, prefix: &[u8], now: Tick, f: &mut dyn FnMut(&Observation)) {
+            self.inner.for_each_topic(prefix, now, f)
+        }
+
+        fn trim(&mut self, policy: &TrimPolicy, now: Tick) -> usize {
+            self.inner.trim(policy, now)
+        }
+    }
+
+    /// Polls `ex` until it has nothing to send (bounded), returning every
+    /// decoded frame.
+    fn drain_frames<S: Store>(ex: &mut Exchange<u8>, store: &S, now: Tick) -> Vec<(u8, Frame)> {
+        let mut frames = Vec::new();
+        for _ in 0..consts::MAX_FRAME {
+            match poll_frame(ex, store, consts::MAX_FRAME, now) {
+                Some((addr, frame, _)) => frames.push((addr, frame)),
+                None => break,
+            }
+        }
+        frames
+    }
+
+    /// Whether any of `frames` carries the observation `id` (whole or as a
+    /// fragment).
+    fn carries(frames: &[(u8, Frame)], id: ObservationId) -> bool {
+        frames.iter().any(|(_, f)| match f {
+            Frame::Obs { obs, .. } => obs.id() == id,
+            Frame::Frag { id: fid, .. } => *fid == id,
+            _ => false,
+        })
+    }
+
+    /// B8 (spec §4): with a store whose iterators yield released ids, core
+    /// still never forwards a released addressed id — not by custody and not
+    /// through the broadcast diff — and never acks a released duplicate.
+    #[test]
+    fn unfiltered_store_released_id_is_never_forwarded_or_acked() {
+        let peer: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = UnfilteredStore::new();
+        let x = addressed([3; 16], 1, peer, b"hi");
+        let x_id = x.id();
+        store.insert(x.clone(), 0).unwrap();
+        store.release(&x_id);
+
+        // The peer lacks everything, so both paths are open to it.
+        empty_summary(&mut ex, &mut store, 1, peer);
+        let frames = drain_frames(&mut ex, &store, 0);
+        assert!(
+            !carries(&frames, x_id),
+            "a released id must never be forwarded, even if the store yields it"
+        );
+
+        // The peer re-offers it: a released duplicate is never acked.
+        let frame = Frame::Obs { from: peer, obs: x };
+        ex.on_event(Event::Frame(1, frame_bytes(&frame)), &mut store, 0);
+        let frames = drain_frames(&mut ex, &store, 0);
+        assert!(
+            !frames
+                .iter()
+                .any(|(_, f)| matches!(f, Frame::Ack { ids, .. } if ids.contains(&x_id))),
+            "a released duplicate must not be acked"
+        );
+    }
+
+    /// B8 (spec §4): a store whose addressed iterator yields broadcast ids
+    /// does not make core forward a broadcast through the custody path.
+    #[test]
+    fn unfiltered_store_broadcast_is_not_forwarded_as_addressed() {
+        let peer: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = UnfilteredStore::new();
+        let b = obs([3; 16], 1, 0, None, b"t", b"bc");
+        let b_id = b.id();
+        store.insert(b, 0).unwrap();
+
+        // Pin the peer's id with an Obs, not a Summary: there is no broadcast
+        // diff, so only the custody path could emit `b`.
+        let hello = Frame::Obs {
+            from: peer,
+            obs: obs(peer, 1, 0, None, b"t", b"hello"),
+        };
+        ex.on_event(Event::Frame(1, frame_bytes(&hello)), &mut store, 0);
+        let frames = drain_frames(&mut ex, &store, 0);
+        assert!(
+            !carries(&frames, b_id),
+            "a broadcast must never be forwarded as an addressed observation"
+        );
+    }
+
+    /// S11: addressed ids never enter the summary Bloom filter, even when the
+    /// store's broadcast iterator yields them.
+    #[test]
+    fn unfiltered_store_addressed_id_not_in_summary() {
+        let mut ex = Exchange::new(ME);
+        let mut store = UnfilteredStore::new();
+        store
+            .insert(addressed([3; 16], 1, [4; 16], b"a"), 0)
+            .unwrap();
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        match poll_frame(&mut ex, &store, consts::MAX_FRAME, 0) {
+            Some((_, Frame::Summary { bits, .. }, _)) => assert!(
+                bits.iter().all(|&b| b == 0),
+                "an addressed id must not be set in the summary Bloom filter"
+            ),
+            other => panic!("expected a Summary, got {other:?}"),
+        }
+    }
+
+    /// S11: an addressed id the store's broadcast iterator yields is never
+    /// queued in the broadcast diff, so it is not sent once expired.
+    #[test]
+    fn unfiltered_store_expired_addressed_not_sent_as_broadcast() {
+        let peer: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = UnfilteredStore::new();
+        let mut x = addressed([3; 16], 1, [4; 16], b"x");
+        x.dest = Some(Dest {
+            to: [4; 16],
+            lifetime_ms: 100,
+        });
+        let x_id = x.id();
+        store.insert(x, 0).unwrap();
+
+        // Past its lifetime, the peer asks for everything.
+        let now = 1_000;
+        let bits = heapless::Vec::from_slice(&[0u8; consts::SUMMARY_BYTES]).unwrap();
+        let sum = Frame::Summary {
+            from: peer,
+            salt: 0,
+            bits,
+        };
+        ex.on_event(Event::Frame(1, frame_bytes(&sum)), &mut store, now);
+        assert!(
+            !ex.peers()[0].send_queue.contains(&x_id),
+            "an addressed id must not enter the broadcast send queue"
+        );
+        let frames = drain_frames(&mut ex, &store, now);
+        assert!(
+            !carries(&frames, x_id),
+            "an expired addressed id must never be sent"
+        );
     }
 }
