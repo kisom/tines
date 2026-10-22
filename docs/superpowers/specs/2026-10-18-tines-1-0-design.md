@@ -6,7 +6,8 @@ Status: approved by Kyle (2026-10-20). Kyle decided D1–D5 and Q1–Q3
 definition (2026-10-19); review fixes applied. v6 added §10 (core hardening
 from `THREAT_MODEL.md`) and the adversarial fuzz mode; Kyle reviewed and
 approved both (2026-10-20). Decisions F (`flush`) and G (age across downtime) added 2026-10-20;
-G amended the same day (quarantine on open, time from peers).
+G amended the same day (quarantine on open, time from peers). Decision H
+(`WallClockStore`) added 2026-10-21.
 Builds on: `2026-10-16-tines-design.md`, `2026-10-18-tines-addressed-delivery.md`,
 `2026-10-18-tines-fleet-deployment-design.md` (assumed fully implemented)
 
@@ -395,6 +396,7 @@ Public in 1.0 (everything else becomes `pub(crate)`):
 | `NodeEvent<A>` (non-exhaustive enum, generic over the transport `Addr`; replaces `ConfidenceEvent`), `DropReason` | `Delivered { peer, id }`, `Dropped { addr: Option<A>, reason, count }` (`addr` is `None` only for the overflow counter, §1); room for more |
 | `Observation`, `Dest`, `Signature`, `SigAlgo`, `NodeId`, `ObservationId`, `Tick`, `Topic`, `Payload` | the data model |
 | `Store`, `StoreError`, `TrimPolicy`, `MemStore` (`alloc`) | backends and their reference impl |
+| `WallClockStore` (opt-in supertrait of `Store`: associated `FoldReport`, `set_wall_clock`, `peer_time_estimate`) | lets a host feed trusted wall time to a backend that holds data across power-off, through the `Node`, without a `&mut Store` backdoor (§9; decision H) |
 | `Transport`, `Event`, `SendError`, `FrameBuf` | transport adapters |
 | `BeliefPolicy`, `LatestWins`, `SelfFirst` | the memory layer |
 | `consts` (wire constants + local caps, §5), `WIRE_VERSION` | sizing |
@@ -419,8 +421,12 @@ is a doc-comment link in `tines-sim/src/world.rs`, which is updated.
   - It gains `flush(now) -> Result<(), StoreError>`, which delegates to
     `Store::flush` (§4; decision F).
   - `store_mut`, added by the fleet fixes so the service could reach
-    `LogStore::flush`, is removed. Read access through `store()` stays. `drain_events` returns `NodeEvent<T::Addr>`s: queued
-  `Delivered` events, then one `Dropped` per nonzero drop counter (§1).
+    `LogStore::flush`, is removed. Read access through `store()` stays.
+  - It gains `set_wall_clock(wall_now, now) -> S::FoldReport` and
+    `peer_time_estimate(now) -> Option<u64>`, which exist only when
+    `S: WallClockStore` and delegate to it (§9; decision H).
+  - `drain_events` returns `NodeEvent<T::Addr>`s: queued `Delivered`
+    events, then one `Dropped` per nonzero drop counter (§1).
 - Every remaining public item is documented; `#![deny(missing_docs)]` goes in
   `tines-core/src/lib.rs` (26 items are missing docs as of the fleet
   milestone; most of them are the fields of the now-private types).
@@ -636,8 +642,12 @@ the new `Observation` encoding. There is no migration:
     - Observations inserted after open are normal: their ages are this
       boot's ticks, and they need no fold.
   - **`LogStore::set_wall_clock(wall_now: u64, now: Tick)`** runs the fold,
-    once, when the host first has trusted time. It's a `LogStore` method,
-    not a `Store` trait method: core never deals with wall time.
+    once, when the host first has trusted time. It isn't a `Store` trait
+    method. `LogStore` implements it through the opt-in `WallClockStore`
+    trait, and hosts reach it through `Node::set_wall_clock` (decision H,
+    2026-10-21). Core defines the trait and forwards the call, but never
+    reads or interprets a wall time itself. A second call is a no-op that
+    returns the first fold's report.
     - **Downtime known:** the log's last clock marker has a wall time, and
       `wall_now` ≥ it. Every quarantined observation's age gains the
       downtime: the wall time elapsed since that marker, minus the ticks
@@ -674,9 +684,13 @@ the new `Observation` encoding. There is no migration:
        carries `observed_at`. The estimate is `observed_at + age_ms`, plus
        local ticks elapsed since that observation arrived. Because age is a
        lower bound, this estimate is never later than the true time. The
-       host uses the observation with the smallest `age_ms` (the least
+       estimate uses the observation with the smallest `age_ms` (the least
        accumulated error), and only one inserted after this open: anything
-       older is quarantined.
+       older is quarantined. The backend computes this estimate
+       (`WallClockStore::peer_time_estimate`, reached through
+       `Node::peer_time_estimate`), because only it knows which
+       observations are quarantined and when each one arrived (decision
+       H).
     3. otherwise, the robot's own fail-safe applies. That's outside tines.
        The quarantine simply stays until trusted time arrives.
   - **Peer time is unauthenticated until 1.1.** A peer can claim any
@@ -839,6 +853,31 @@ The review's other fixes are applied too:
   - When downtime can't be known, held broadcasts are kept but their age
     is floored at `unknown_downtime_age_ms` (Kyle, 2026-10-20): assume the
     worst about freshness without discarding data.
+
+## Decisions (Kyle, 2026-10-21)
+
+- **H. `WallClockStore`, `Node::set_wall_clock` and
+  `Node::peer_time_estimate` are public 1.0 API** (§3, §9).
+  - During implementation, Task 10b reached `LogStore::set_wall_clock`
+    through a revived `Node::store_mut`. Decision F removed that backdoor,
+    so Kyle had it replaced with a narrow accessor (commit `941a7ce`).
+    This decision records that change.
+  - `WallClockStore: Store` is a separate, opt-in trait with:
+    - an associated `FoldReport` type, defined by the backend;
+    - `set_wall_clock(&mut self, wall_now: u64, now: Tick) -> Self::FoldReport`;
+    - `peer_time_estimate(&self, now: Tick) -> Option<u64>`.
+
+    Only backends that hold data across power-off implement it. `LogStore`
+    does; `MemStore` doesn't.
+  - The two `Node` methods have an `S: WallClockStore` bound and delegate to
+    it, so no `&mut Store` escapes the facade.
+  - It's not a `Store` method, so the 1.0 trait-extension rule doesn't
+    apply to adding it. Any method later added to `WallClockStore` itself
+    falls under that rule and needs a safe default.
+  - Core still never reads or interprets wall time. The trait only carries
+    the host's value to the backend, and the backend's estimate back to the
+    host. This replaces §9's earlier "a `LogStore` method, not a `Store`
+    trait method: core never deals with wall time".
 
 ## Left to the builder
 
