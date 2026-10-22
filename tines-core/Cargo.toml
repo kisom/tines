@@ -15,6 +15,9 @@ categories = ["no-std", "embedded", "network-programming", "science::robotics"]
 # the wire format against the crate-private `Frame`, so `src/lib.rs` compiles
 # it into the unit tests instead (`#[path = "../tests/vectors.rs"]`).
 autotests = false
+# The fuzz twin includes `../../fuzz/src/lib.rs`, which isn't in this package,
+# so the published source would carry a test that can't build.
+exclude = ["tests/fuzz_twin.rs"]
 
 [features]
 default = ["alloc"]
