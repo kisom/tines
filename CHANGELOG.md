@@ -4,11 +4,49 @@ All notable changes to the tines crates. Versions follow
 [Semantic Versioning](https://semver.org/); before 1.0, a minor bump may break
 the API.
 
-## Unreleased
+## 1.0.0 — 2026-10-21
 
-The fleet-deployment milestone and the fleet fixes (security assessment
-findings F1–F5 and F17; see `THREAT_MODEL.md`). The workspace version is
-still 0.3.0.
+tines-core 1.0: the wire format is frozen (wire v1), the public API is
+narrowed and documented, and the core hardening from the 1.0 spec is in.
+This release ships the fleet-deployment milestone (handoff receipts) and the
+remaining fleet fixes (F1–F5, F6, F8, F9, F13, F17; see `THREAT_MODEL.md`).
+
+### Breaking (from 0.3.0)
+
+- **Wire v1** (tines-core). Every frame now leads with a `WIRE_VERSION` byte
+  (4). 0.x-shaped frames are rejected as `WireError::VersionMismatch`.
+- **`Dest` replaces `to`/`lifetime_ms`** (tines-core). Addressed delivery now
+  takes `dest: Option<Dest>` where `Dest { to, lifetime_ms }`; the lifetime is
+  excluded from observation identity.
+- **Signature slot** (tines-core). `Observation` carries a reserved
+  `sig: Option<Signature>` (algorithm + up to 64 bytes). 1.0 enforces the
+  wire shape but does not sign or verify (1.1).
+- **Public API narrowing** (tines-core). Nine items moved `pub(crate)`,
+  eleven types are `#[non_exhaustive]` (build via constructors, not struct
+  literals). `Frame` and `WireError` are now *public*: the wire format is the
+  1.x compatibility contract.
+- **`Store` trait settled** (tines-core). `flush(&mut self, now)` and
+  `is_empty` joined the trait; `Node::store_mut` is gone. A new opt-in
+  `WallClockStore` trait carries the trusted-time operations
+  (`set_wall_clock`, `peer_time_estimate`) that only `LogStore` implements.
+- **`NodeEvent` + counted drops** (tines-core). Exchange outcomes surface as
+  `NodeEvent` (`Delivered`, `Dropped { reason, count }`) through
+  `Node::drain_events`; `DropReason` is `VersionMismatch`, `Malformed`, or
+  `IdentityChanged`.
+- **`Node::poll` is the only pump** (tines-core). The separate custody
+  re-offer pass folded into `poll`.
+- **Log format v2** (tines-store). `FORMAT_VERSION` bumped for the new
+  `Observation` encoding; opening an older log is a hard error that names
+  the fix (delete the log).
+- **Quarantine + wall-clock fold** (tines-store). `LogStore::open(path, now)`
+  takes no wall time; observations held across a power-off are quarantined
+  until the host feeds trusted time via `set_wall_clock`.
+- **Trusted wall time in the hosts** (tines). A `trusted_clock = "system"`
+  config flag or a peer-derived estimate (smallest `observed_at + age_ms`)
+  anchors the wall clock once; observations carry `observed_at: None` until
+  then.
+- **MSRV** (tines-core). `rust-version = "1.82"`; CI builds and tests
+  tines-core alone on it.
 
 ### Added
 

@@ -42,7 +42,9 @@ pub struct Dest {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Observation {
+    /// The node that published this observation.
     pub observer: NodeId,
+    /// The observer's per-observation sequence number.
     pub seq: u64,
     /// The observer's elapsed time for this observation, in ms.
     ///
@@ -56,7 +58,9 @@ pub struct Observation {
     /// this observation was published, or `None` if the observer has no
     /// trusted clock. Set once at construction and never changed by a relay.
     pub observed_at: Option<u64>,
+    /// The topic this observation is published under.
     pub topic: Topic,
+    /// The observation's content.
     pub payload: Payload,
     /// Addressing: `None` is a broadcast, `Some(dest)` is addressed to
     /// `dest.to` and expires per `dest.lifetime_ms`.

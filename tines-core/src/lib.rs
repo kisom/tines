@@ -1,5 +1,6 @@
 //! tines-core: content-defined Observation identity and shared-memory core.
 #![no_std]
+#![deny(missing_docs)]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;

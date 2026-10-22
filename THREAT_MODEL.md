@@ -57,11 +57,22 @@ threat questions (§8) before designing signing.
 | F5 | Fixed | `4718b6f`, `24b5a78` |
 | F17 | Fixed | `6e2dc6f` |
 
+**1.0 fixes, 2026-10-21** (through `941a7ce`):
+
+| # | Status | Commit |
+|---|---|---|
+| F6 | Fixed | `fb71810` |
+| F8 | Fixed | `fb71810` |
+| F9 | Fixed | `fb71810`, `a180ec2` |
+| F13 | Fixed | `fb71810` |
+| F18 | **Partly fixed**: the stale clock-marker tick is fixed (`Store::flush(now)` takes the caller's `now`); hosts still don't flush on a schedule | `c42f5de` |
+| F19 | **Open** (new, 2026-10-21): peer-derived trusted time is unauthenticated | — |
+
 Still open:
-- F6, F8, F9 and F13: the 1.0 spec §10.
 - F10–F12: the host-hardening spec.
 - F7 and F14: 1.1.
-- F18 (new) and the rest of F3: host work, not yet specced (§10).
+- F18 (remaining): scheduled flushes, host work (§10).
+- F19: 1.1 (signatures), or a local clock source before peers (§6).
 
 ## 2. System and trust boundaries
 
@@ -482,10 +493,12 @@ inserts and trims (log.rs module docs, "Durability contract").
   advances only while observations arrive, so a robot that is mostly
   offline, the normal case, may never flush.
 - tines-ros2 never calls `flush` or `trim`.
-- Even when it runs, `flush` writes `LogStore`'s own tick as the clock
-  marker, and that tick advances only when something new is inserted
-  (tines-store/src/log.rs:698). On a quiet robot the marker is stale, and
-  the time since the last insert is lost.
+- Even when it runs, `flush` wrote `LogStore`'s own tick as the clock
+  marker, and that tick advanced only when something new was inserted
+  (tines-store/src/log.rs:698). On a quiet robot the marker was stale, and
+  the time since the last insert was lost. **Fixed in 1.0** (`c42f5de`):
+  `Store::flush(now)` takes the caller's tick, so the marker is the true
+  current time at every flush.
 - **Effect:**
   - After a restart, every stored observation's age is folded only up to the
     last clock marker. Time since that marker is lost, so facts look fresher
@@ -501,6 +514,30 @@ inserts and trims (log.rs module docs, "Durability contract").
   `flush_interval_ms`, from the host's monotonic clock) in both hosts, and
   on clean shutdown. The fleet-fixes spec asked for "a scheduled flush". The
   trim defaults belong to host hardening (F10).
+
+### F19 — Peer-derived trusted time is unauthenticated (Medium, A0)
+
+*Added 2026-10-21, when the hosts gained the peer-time path (Task 10b).*
+When a host has no `trusted_clock = "system"` source, it estimates wall time
+from a peer's observation: `observed_at + age_ms` from the youngest such
+observation, then folds it into the store once. Nothing authenticates that
+estimate.
+
+- **Effect:**
+  - A forged time **ahead** of the true time only makes observations expire
+    early: the fold ages everything faster, addressed messages die sooner,
+    and `observed_at` stamps run fast. Availability loss, not integrity loss.
+  - A forged time **behind** the true time takes the "downtime unknown"
+    path (or under-folds), leaving the store quarantined longer or ages
+    younger — the same effect as F17/F18 by another route.
+  - Worst case: the robot's own `observed_at` stamps are wrong until a
+    local source corrects them, so every observation it publishes between
+    the forged fold and the correction carries a bad wall time.
+- **Mitigation:** prefer a local source whenever one exists (the config
+  flag is exactly that); otherwise accept that a peer's time is a
+  lower-bound hint, not a trusted clock. Signing and verification (1.1)
+  closes it; a monotonic-host sanity check (reject a wall time behind the
+  last fold) would contain the "behind" case today.
 
 ## 7. Threats by STRIDE, mapped to findings
 

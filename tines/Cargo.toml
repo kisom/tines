@@ -11,7 +11,7 @@ keywords = ["robotics", "delay-tolerant", "science::robotics", "ipc", "ble"]
 categories = ["science::robotics", "network-programming"]
 
 [dependencies]
-tines-core = { path = "../tines-core", version = "0.3.0" }
+tines-core = { path = "../tines-core", version = "1" }
 tines-store = { path = "../tines-store", version = "0.3.0" }
 tines-bt = { path = "../tines-bt", version = "0.3.0" }
 serde = { version = "1", features = ["derive"] }

@@ -351,14 +351,11 @@ for event in node.drain_events() {
 }
 
 // Keep the store bounded.
-node.trim(
-    &TrimPolicy {
-        keep_per_topic: Some(4),
-        max_age_ms: Some(3_600_000),
-        max_count: Some(10_000),
-    },
-    500,
-);
+let mut policy = TrimPolicy::default();
+policy.keep_per_topic = Some(4);
+policy.max_age_ms = Some(3_600_000);
+policy.max_count = Some(10_000);
+node.trim(&policy, 500);
 ```
 
 `observe` rejects an oversized topic or payload with `ObserveError::TooLarge`;
@@ -597,6 +594,27 @@ sh scripts/ci.sh
 
 GitHub Actions runs the same script on every push to `master` and on every
 pull request.
+
+## Stability
+
+tines-core 1.0 guarantees, within the 1.x line:
+
+- **Wire:** every 1.x release speaks wire v1. Only new optional `Frame`
+  variants may be added, plus new `SigAlgo` ids and signature versions within
+  the 64-byte `MAX_SIG` budget. A wire-v2 change, including any post-quantum
+  signature or a `MAX_FRAME` above 1500, ships as tines-core 2.0.
+- **Identity:** `Observation::id` never changes within a major version, and
+  should not change across majors unless the hash itself is broken.
+- **API:** standard semver; MSRV bumps are minor. Public types are
+  `#[non_exhaustive]` where new fields are plausible; a public trait may only
+  gain methods with a default implementation (or a new opt-in trait — e.g.
+  `WallClockStore` for wall-clock folds, which `Store` itself never carries).
+- **Local behaviour** (capacities, timings, scheduling order, which candidate
+  goes first) can change in a minor release as long as the protocol
+  properties hold: custody always keeps ≥ 1 holder, receipts never shorten
+  world state, and every frame fits `mtu()`.
+- **Signatures:** 1.0 carries them; 1.1 signs and verifies them, without
+  breaking the wire or the API.
 
 ## Security
 

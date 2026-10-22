@@ -20,7 +20,7 @@ default = []
 ros2 = ["dep:rclrs", "dep:ros-env", "dep:tines"]
 
 [dependencies]
-tines-core = { path = "../tines-core", version = "0.3.0" }
+tines-core = { path = "../tines-core", version = "1" }
 tines-store = { path = "../tines-store", version = "0.3.0" }
 tines-bt = { path = "../tines-bt", version = "0.3.0" }
 # The host's wall-clock abstraction (`HostClock`) and the trusted-time state

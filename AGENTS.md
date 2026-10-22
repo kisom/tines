@@ -19,7 +19,7 @@ architecture in the **spec first**:
 - **Addressed delivery (authoritative):** `docs/superpowers/specs/2026-10-18-tines-addressed-delivery.md`
 - **Fleet deployment v1 (authoritative):** `docs/superpowers/specs/2026-10-18-tines-fleet-deployment-design.md` — supersedes the addressed-delivery spec's epidemic forwarding (custody chain with handoff receipts).
 - **Fleet fixes (done):** `docs/superpowers/specs/2026-10-19-tines-fleet-fixes.md` — security-assessment findings F1–F5 and F17.
-- **tines-core 1.0 (next, core):** `docs/superpowers/specs/2026-10-18-tines-1-0-design.md` — wire version, public API, signature slot, core hardening (§10).
+- **tines-core 1.0 (done — shipped as tines-core 1.0.0, 2026-10-21):** `docs/superpowers/specs/2026-10-18-tines-1-0-design.md` — wire version, public API, signature slot, core hardening (§10).
 - **Host hardening (next, hosts):** `docs/superpowers/specs/2026-10-19-tines-host-hardening.md` — findings F10–F12.
 - **Implementation plans:** `docs/superpowers/plans/`
 

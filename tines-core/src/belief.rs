@@ -10,6 +10,7 @@ use crate::observation::{NodeId, Observation};
 
 /// Reduces an ordered stream of observations to a single accumulated belief.
 pub trait BeliefPolicy {
+    /// The accumulated belief this policy folds into.
     type Belief;
     /// Streaming fold: called once per matching observation (already
     /// age-adjusted to `now`), in no particular order. `acc` is `None` before

@@ -21,24 +21,40 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum Frame {
+    /// A broadcast bloom summary of a node's observation-id set.
     Summary {
+        /// The sending node.
         from: NodeId,
+        /// The bloom salt the bits were hashed with.
         salt: u32,
+        /// The broadcast bloom bits (the summary body).
         bits: Vec<u8, { consts::SUMMARY_BYTES }>,
     },
+    /// A single observation, broadcast or addressed (see [`Observation::dest`]).
     Obs {
+        /// The sending (relaying or originating) node.
         from: NodeId,
+        /// The carried observation.
         obs: Observation,
     },
+    /// One fragment of a large addressed observation (reassembly by `id`).
     Frag {
+        /// The sending node.
         from: NodeId,
+        /// The observation this fragment belongs to.
         id: ObservationId,
+        /// This fragment's 0-based position in the reassembly.
         index: u8,
+        /// The total number of fragments for `id`.
         count: u8,
+        /// The fragment payload bytes.
         data: Vec<u8, { consts::MAX_FRAME }>,
     },
+    /// An acknowledgement of stored observation ids (custody-chain release).
     Ack {
+        /// The acknowledging node.
         from: NodeId,
+        /// The observation ids being acknowledged.
         ids: Vec<ObservationId, { consts::ACK_IDS_CAP }>,
     },
 }
@@ -139,7 +155,10 @@ pub enum WireError {
     /// The input bytes were malformed, truncated, or not a valid `Frame`.
     Malformed,
     /// The frame's leading `WIRE_VERSION` byte did not match `consts::WIRE_VERSION`.
-    VersionMismatch { version: u8 },
+    VersionMismatch {
+        /// The version byte read off the wire.
+        version: u8,
+    },
 }
 
 #[cfg(test)]

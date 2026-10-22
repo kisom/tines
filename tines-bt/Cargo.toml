@@ -12,7 +12,7 @@ keywords = ["robotics", "gossip", "delay-tolerant", "ble", "bluer"]
 categories = ["science::robotics", "network-programming"]
 
 [dependencies]
-tines-core = { path = "../tines-core", version = "0.3.0" }
+tines-core = { path = "../tines-core", version = "1" }
 bluer = { version = "0.17", features = ["bluetoothd", "l2cap"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "sync", "net", "time", "signal"] }
 futures = "0.3"
