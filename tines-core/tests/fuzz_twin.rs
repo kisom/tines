@@ -1,227 +1,299 @@
-//! Proptest twin of the `fuzz/` harness (Task 12).
+//! Proptest twin of the `fuzz/` harness (spec §7 "Stable twin").
 //!
-//! The cargo-fuzz crate at `fuzz/` drives this very same module through a
-//! scripted [`Node`]/[`MemStore`] transport, decoding arbitrary fuzzed bytes
-//! into ordered steps and asserting no-panic / MTU-bounded output / drop-count
-//! reconciliation (§7) plus the §10 adversarial-peer properties. The twin
-//! reuses that *exact* harness via a `#[path]` include so any bug fixed in the
-//! oracle is caught here too — "same harness", two entry points, not two copies.
+//! The cargo-fuzz crate at `fuzz/` drives a scripted `Node` + `MemStore`
+//! through decoded steps and checks the §7 properties after each one. The
+//! twin compiles that *exact* harness in through a `#[path]` include, so it is
+//! one oracle with two entry points, not two copies:
 //!
-//! This is the bounded-case-count proptest half of Task 12: it runs under the
-//! normal suite (`cargo test -p tines-core`) and needs no nightly toolchain.
-//! When `tines-core` is built with the optional `conformance` feature, the
-//! harness's own signature round-trip also runs (see its source); otherwise the
-//! twin covers store lifecycle through the public `observe()` path instead.
+//! * `fuzz_inputs` feeds random bytes through `fuzz::run_input`, the fuzz
+//!   target's own entry point, in both modes;
+//! * `structured_*` feed generated steps straight to the harness, so every
+//!   case reaches well-formed frames;
+//! * the rest pin specific §10 properties as scenarios.
 //!
-//! The harness drives `MemStore`, which needs `alloc`; the twin is skipped in
-//! `--no-default-features` builds (like `pair.rs`).
-#![cfg(feature = "alloc")]
+//! It runs on the pinned stable toolchain in the normal gate. It needs the
+//! `conformance` feature (the harness builds frames through core's hidden
+//! `conformance` helpers) and `alloc` (`MemStore`); Cargo.toml's
+//! `required-features` skips it otherwise.
 #![allow(clippy::needless_range_loop)]
 
 #[path = "../../fuzz/src/lib.rs"]
 mod fuzz;
 
+use fuzz::{AckSpec, FragOrder, FragSpec, Harness, Mode, ObsSpec, SpecSummary, Step, Who};
 use proptest::prelude::*;
-use tines_core::conformance::MAX_PEERS;
+use tines_core::conformance::{MAX_PEERS, MIN_MTU, PEER_IDLE_MS, SUMMARY_INTERVAL_MS};
 use tines_core::consts::{MAX_FRAME, MAX_PAYLOAD, MAX_TOPIC, SUMMARY_BYTES};
 use tines_core::Store;
 
-// A single bounded case count keeps the twin fast under `cargo test` while
-// still exercising a meaningful surface of the harness.
-const CASES: u32 = 32;
+const CASES: u32 = 64;
 
-fn node_id() -> impl Strategy<Value = [u8; 16]> {
-    any::<[u8; 16]>()
+fn mtu() -> impl Strategy<Value = usize> {
+    MIN_MTU..=MAX_FRAME
 }
 
-fn topic() -> impl Strategy<Value = Vec<u8>> {
-    proptest::collection::vec(any::<u8>(), 0..=MAX_TOPIC)
+fn who() -> impl Strategy<Value = Who> {
+    prop_oneof![
+        6 => Just(Who::Peer),
+        1 => Just(Who::Me),
+        1 => any::<[u8; 16]>().prop_map(Who::Id),
+    ]
 }
 
-fn payload() -> impl Strategy<Value = Vec<u8>> {
-    proptest::collection::vec(any::<u8>(), 0..MAX_PAYLOAD)
+/// Addresses past `MAX_PEERS`, so the peer table overflows.
+fn addr() -> impl Strategy<Value = u64> {
+    0..(3 * MAX_PEERS as u64)
 }
 
-// A well-formed broadcast observation spec. `dest` stays broadcast (None): the
-// addressed path shares storage/exchange logic and is exercised by the raw
-// Frame step below, so broadcasting keeps the twin's invariants unambiguous.
-fn obs_spec() -> impl Strategy<Value = fuzz::ObsSpec> {
-    (
-        any::<u64>(), // addr
-        node_id(),    // from
-        any::<u64>(), // seq
-        any::<u32>(), // age_ms
-        topic(),
-        payload(),
+fn sig() -> impl Strategy<Value = Option<fuzz::SigSpec>> {
+    proptest::option::of(
+        (
+            prop_oneof![Just(1u8), any::<u8>()],
+            prop_oneof![Just(1u8), any::<u8>()],
+            prop_oneof![Just(64usize), 0usize..=64],
+        )
+            .prop_map(|(version, algo, len)| fuzz::SigSpec {
+                version,
+                algo,
+                bytes: vec![0x5A; len],
+            }),
     )
-        .prop_map(|(addr, from, seq, age_ms, topic, payload)| fuzz::ObsSpec {
-            addr,
-            from,
-            seq,
-            age_ms: age_ms as u64,
-            topic,
-            payload,
-            dest: None,
-        })
 }
 
-// A well-formed summary spec with a chosen bits pattern and salt.
-fn summary_spec() -> impl Strategy<Value = fuzz::SpecSummary> {
+fn obs_spec() -> impl Strategy<Value = ObsSpec> {
     (
-        any::<u64>(),
-        node_id(),
-        any::<u32>(),
-        proptest::collection::vec(any::<u8>(), 0..SUMMARY_BYTES),
+        (addr(), who(), who(), 0u64..64, any::<u32>()),
+        (
+            proptest::option::of(any::<u64>()),
+            prop_oneof![Just(MAX_TOPIC), 0..=MAX_TOPIC],
+            prop_oneof![Just(MAX_PAYLOAD), 0..=MAX_PAYLOAD],
+            proptest::option::of((who(), any::<u32>())),
+            sig(),
+        ),
     )
-        .prop_map(|(addr, from, salt, bits)| fuzz::SpecSummary {
-            addr,
-            from,
-            salt,
-            bits,
-        })
+        .prop_map(
+            |((addr, from, observer, seq, age), (observed_at, tl, pl, dest, sig))| ObsSpec {
+                addr,
+                from,
+                observer,
+                seq,
+                age_ms: u64::from(age),
+                observed_at,
+                topic: vec![b't'; tl],
+                payload: vec![b'p'; pl],
+                dest: dest.map(|(to, life)| (to, u64::from(life))),
+                sig,
+            },
+        )
 }
 
-// An Ack spec for 0..=4 ids (sent or unsent).
-fn ack_spec() -> impl Strategy<Value = fuzz::AckSpec> {
-    (any::<u64>(), proptest::collection::vec(node_id(), 0..=8)).prop_map(|(addr, ids)| {
-        fuzz::AckSpec {
-            addr,
-            from: [0u8; 16],
-            ids,
-        }
+fn structured_step() -> impl Strategy<Value = Step> {
+    prop_oneof![
+        obs_spec().prop_map(Step::Obs),
+        (
+            obs_spec(),
+            1usize..=MAX_FRAME,
+            prop_oneof![
+                Just(FragOrder::InOrder),
+                Just(FragOrder::Reverse),
+                proptest::collection::vec(any::<u8>(), 0..8).prop_map(FragOrder::Explicit),
+            ],
+            proptest::option::of(any::<[u8; 16]>()),
+            proptest::option::of(any::<u8>()),
+        )
+            .prop_map(|(obs, chunk, order, id, count)| Step::Frags(FragSpec {
+                obs,
+                chunk,
+                order,
+                id,
+                count,
+            })),
+        (
+            addr(),
+            who(),
+            any::<u32>(),
+            0..=SUMMARY_BYTES,
+            any::<u8>(),
+            1u8..=3
+        )
+            .prop_map(|(addr, from, salt, len, fill, repeat)| Step::Summarize(
+                SpecSummary {
+                    addr,
+                    from,
+                    salt,
+                    bits: vec![fill; len],
+                    repeat,
+                }
+            )),
+        (
+            addr(),
+            who(),
+            proptest::collection::vec(any::<u16>(), 0..8),
+            proptest::collection::vec(any::<[u8; 16]>(), 0..2),
+        )
+            .prop_map(|(addr, from, sent, raw)| Step::Ack(AckSpec {
+                addr,
+                from,
+                sent,
+                raw,
+            })),
+        addr().prop_map(Step::Contact),
+        addr().prop_map(Step::Lost),
+        prop_oneof![-5_000i64..=40_000, any::<i64>()].prop_map(Step::Advance),
+        any::<u16>().prop_map(|size| Step::Ourselves { size }),
+        (who(), any::<u32>(), any::<u16>()).prop_map(|(to, life, size)| Step::OurselvesTo {
+            to,
+            lifetime_ms: u64::from(life),
+            size,
+        }),
+        (addr(), proptest::collection::vec(any::<u8>(), 0..64))
+            .prop_map(|(a, bytes)| Step::Frame(a, bytes)),
+    ]
+}
+
+/// A broadcast observation from the peer at `addr`, distinct per `seq`.
+fn peer_obs(addr: u64, seq: u64) -> ObsSpec {
+    ObsSpec {
+        addr,
+        from: Who::Peer,
+        observer: Who::Peer,
+        seq,
+        age_ms: 0,
+        observed_at: None,
+        topic: b"t".to_vec(),
+        payload: b"p".to_vec(),
+        dest: None,
+        sig: None,
+    }
+}
+
+/// A summary from `addr` saying it holds nothing.
+fn empty_summary(addr: u64) -> Step {
+    Step::Summarize(SpecSummary {
+        addr,
+        from: Who::Peer,
+        salt: 7,
+        bits: vec![0; SUMMARY_BYTES],
+        repeat: 1,
     })
 }
 
-// Any valid Step of any kind — drives the Basic mode with real, well-formed
-// inputs rather than raw random bytes.
-fn any_step() -> impl Strategy<Value = fuzz::Step> {
-    prop_oneof![
-        // Addressed / broadcast observations (well-formed Obs frames).
-        obs_spec().prop_map(fuzz::Step::Obs),
-        // Summaries with chosen bits patterns and salts.
-        summary_spec().prop_map(fuzz::Step::Summarize),
-        // Acks for sent/unsent ids.
-        ack_spec().prop_map(fuzz::Step::Ack),
-        // Raw Frame: a peer (or our own) byte stream of up to MAX_FRAME bytes,
-        // including deliberately malformed content to exercise the drop path.
-        (
-            any::<u64>(),
-            proptest::collection::vec(any::<u8>(), 0..MAX_FRAME),
-        )
-            .prop_map(|(addr, bytes)| fuzz::Step::Frame(addr, bytes)),
-        // Contact / lost + clock advance (may go backwards).
-        any::<u64>().prop_map(fuzz::Step::Contact),
-        any::<u64>().prop_map(fuzz::Step::Lost),
-        any::<i64>().prop_map(fuzz::Step::Advance),
-        // Ourselves / ours-to (self observation).
-        (0u32..=0).prop_map(|_| fuzz::Step::Ourselves),
-    ]
+/// Poll the harness `n` times at the current tick.
+fn settle(h: &mut Harness, n: usize) {
+    for _ in 0..n {
+        h.pump();
+    }
 }
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: CASES, ..Default::default() })]
 
-    /// §7 core safety: an arbitrary sequence of well-formed steps run through a
-    /// randomised-MTU harness must never panic, must stay within the MTU on
-    /// every emitted frame, and must not overflow its drop counter. `run`
-    /// asserts all three; reaching it clean is the property. A single mixed
-    /// sequence may also exceed MAX_PEERS distinct addresses (addr is a full
-    /// u64), so this alone exercises the flood path without panic.
+    /// The fuzz target's own entry point on random bytes: both modes, a
+    /// random MTU, every §7 check after every step.
     #[test]
-    fn basic_run_no_panic_or_overflow(
-        steps in proptest::collection::vec(any_step(), 0..=128),
-        mtu in 32usize..=4096usize,
+    fn fuzz_inputs(data in proptest::collection::vec(any::<u8>(), 3..2048)) {
+        let _ = fuzz::run_input(&data);
+    }
+
+    /// Generated well-formed adversarial steps from more than `MAX_PEERS`
+    /// addresses, every §7 check after every step.
+    #[test]
+    fn structured_adversarial(
+        steps in proptest::collection::vec(structured_step(), 1..=64),
+        mtu in mtu(),
     ) {
-        if !steps.is_empty() {
-            let mut h = fuzz::Harness::new(mtu);
-            h.run(&steps);
-        }
+        Harness::new(Mode::Adversarial, mtu).run(&steps);
     }
 
-    /// §10 idempotency: repeating an identical summary must not emit MORE
-    /// frames than the first time it was seen.
+    /// §10 / F9: a summary replayed within the interval re-sends nothing,
+    /// while the next on-time summary re-offers everything the peer still
+    /// lacks (lossy convergence is preserved).
     #[test]
-    fn summary_repeat_does_not_resend(spec in summary_spec(), mtu in 32usize..=4096) {
-        let mut h = fuzz::Harness::new(mtu);
-
-        h.step(&fuzz::Step::Summarize(spec.clone()));
-        h.drain();
-        let first = h.sent_frames().len();
-
-        h.step(&fuzz::Step::Summarize(spec));
-        h.drain();
-        let second = h.sent_frames().len();
-
-        prop_assert!(second <= first, "repeating a summary must not re-send ({} vs {} frames)", second, first);
-    }
-
-    /// §10 flood recovery: feeding MORE than MAX_PEERS distinct-identity
-    /// summaries through the transport must never panic and output stays
-    /// bounded per received summary.
-    #[test]
-    fn flood_past_max_peers_does_not_panic(mtu in 32usize..=4096) {
-        let n = MAX_PEERS as u64 + 16; // deliberately beyond the cap
-        let mut steps = Vec::new();
-        for i in 1..=n {
-            steps.push(fuzz::Step::Summarize(fuzz::SpecSummary {
-                addr: i,
-                from: [i as u8; 16],
-                salt: (i as u32),
-                bits: (0..SUMMARY_BYTES).map(|_| i as u8).collect(),
-            }));
+    fn summary_repeat_does_not_resend(n in 1usize..=12, mtu in 600usize..=MAX_FRAME) {
+        let mut h = Harness::new(Mode::Adversarial, mtu);
+        for _ in 0..n {
+            h.run_step(&Step::Ourselves { size: 16 });
         }
-        let mut h = fuzz::Harness::new(mtu);
-        h.run(&steps);
-    }
+        prop_assert_eq!(h.store().len(), n);
 
-    /// §10 peer-table recovery after a beyond-MAX_PEERS flood: once the table
-    /// has been pushed past its cap, a fresh contact + our own observation must
-    /// still be stored (the node keeps working rather than wedging).
-    #[test]
-    fn peer_table_recovers_after_flood(mtu in 32usize..=4096) {
-        let mut h = fuzz::Harness::new(mtu);
-        for i in 1..=(MAX_PEERS as u64 + 16) {
-            let spec = fuzz::SpecSummary {
-                addr: i,
-                from: [i as u8; 16],
-                salt: (i as u32),
-                bits: (0..SUMMARY_BYTES).map(|_| i as u8).collect(),
-            };
-            h.step(&fuzz::Step::Summarize(spec));
-            h.drain();
-        }
-        // A fresh contact + our own observation after the flood.
-        h.step(&fuzz::Step::Contact(1));
-        h.step(&fuzz::Step::Ourselves);
-        h.drain();
-        prop_assert!(!h.store().is_empty(), "node must still store an observation after a beyond-MAX_PEERS flood");
+        // The peer says it holds nothing: every broadcast is offered once.
+        h.run_step(&empty_summary(1));
+        settle(&mut h, n + 4);
+        prop_assert_eq!(h.offered_since_summary(1), n);
+
+        // The same summary again, 1 ms later: ignored, nothing re-sent.
+        h.run_step(&Step::Advance(1));
+        h.run_step(&empty_summary(1));
+        settle(&mut h, n + 4);
+        prop_assert_eq!(h.offered_since_summary(1), 0, "a replayed summary re-sent ids");
+
+        // A full interval later the peer still lacks everything, so it gets
+        // everything again.
+        h.run_step(&Step::Advance(SUMMARY_INTERVAL_MS as i64));
+        h.run_step(&empty_summary(1));
+        settle(&mut h, n + 4);
+        prop_assert_eq!(h.offered_since_summary(1), n);
     }
 
     /// F1: acknowledging an unknown id must not evict a known, stored
-    /// observation. Seed a peer broadcast obs (guaranteed stored), then Ack an
-    /// id we did not observe and assert the seed is still present.
+    /// observation.
     #[test]
-    fn ack_unknown_does_not_evict_known(obs in obs_spec(), mtu in 32usize..=4096) {
-        let mut h = fuzz::Harness::new(mtu);
+    fn ack_unknown_does_not_evict_known(obs in obs_spec(), mtu in mtu()) {
+        let mut h = Harness::new(Mode::Adversarial, mtu);
+        let obs = ObsSpec { dest: None, sig: None, observer: Who::Peer, from: Who::Peer, ..obs };
+        let addr = obs.addr;
+        h.run_step(&Step::Obs(obs));
+        let mut known = Vec::new();
+        h.store().for_each_id(&mut |id| known.push(*id));
+        prop_assert_eq!(known.len(), 1, "the peer's broadcast must be stored");
 
-        // Seed a known broadcast observation from a peer.
-        h.step(&fuzz::Step::Obs(obs));
-        h.drain();
-
-        let known: Vec<[u8; 16]> = {
-            let mut out = Vec::new();
-            h.store().for_each_broadcast_id(&mut |id: &[u8; 16]| out.push(*id));
-            out
-        };
-        prop_assert!(!known.is_empty(), "expected a stored broadcast to ack against");
-
-        // An Ack referencing an id we never observed must not remove the seed.
-        let unknown = [0xFFu8; 16];
-        h.step(&fuzz::Step::Ack(fuzz::AckSpec { addr: 1, from: [0u8; 16], ids: vec![unknown] }));
-        h.drain();
-
+        h.run_step(&Step::Ack(AckSpec { addr, from: Who::Peer, sent: vec![], raw: vec![[0xFF; 16]] }));
         for id in &known {
-            prop_assert!(h.store().contains(id), "an Ack of an unknown id must not evict a known stored observation");
+            prop_assert!(h.store().contains(id) && !h.store().is_released(id));
         }
     }
+}
+
+/// §10 / F8 peer-table recovery: `MAX_PEERS + 16` addresses each send one
+/// frame (filling the table), then everyone goes quiet. After
+/// `PEER_IDLE_MS`, a never-seen address must get a slot.
+#[test]
+#[ignore = "needs S1 (idle sweep): silent peers are never evicted yet"]
+fn peer_table_recovers_after_flood() {
+    let mut h = Harness::new(Mode::Adversarial, MAX_FRAME);
+    for addr in 0..(MAX_PEERS as u64 + 16) {
+        h.run_step(&Step::Obs(peer_obs(addr, addr)));
+    }
+    // Sanity: the flood really filled the table, so the probe tests eviction.
+    let before = h.store().len();
+    h.run_step(&Step::Obs(peer_obs(1_000, 1_000)));
+    assert_eq!(h.store().len(), before, "the table should be full");
+
+    h.check_peer_table_recovers();
+}
+
+/// Same flood, but contact-only peers: `Contact` events with no frames must
+/// age out too.
+#[test]
+#[ignore = "needs S1 (idle sweep): contact-only peers are never evicted yet"]
+fn peer_table_recovers_after_contact_flood() {
+    let mut h = Harness::new(Mode::Adversarial, MAX_FRAME);
+    for addr in 0..(MAX_PEERS as u64) {
+        h.run_step(&Step::Contact(addr));
+    }
+    h.check_peer_table_recovers();
+}
+
+/// Before the idle window ends the table stays full: the flood isn't
+/// trivially recovered by any later frame.
+#[test]
+fn full_peer_table_refuses_a_newcomer_before_idle() {
+    let mut h = Harness::new(Mode::Adversarial, MAX_FRAME);
+    for addr in 0..(MAX_PEERS as u64) {
+        h.run_step(&Step::Obs(peer_obs(addr, addr)));
+    }
+    assert_eq!(h.store().len(), MAX_PEERS);
+    h.run_step(&Step::Advance(PEER_IDLE_MS as i64 / 2));
+    h.run_step(&Step::Obs(peer_obs(500, 500)));
+    assert_eq!(h.store().len(), MAX_PEERS);
 }
