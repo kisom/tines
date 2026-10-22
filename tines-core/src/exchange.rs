@@ -63,12 +63,11 @@ pub enum DropReason {
     Malformed,
     /// The frame's `from` no longer matches the node id this peer was pinned to
     /// on its first frame (F6). The pinned id is kept; the frame is not stored.
-    #[non_exhaustive]
     IdentityChanged,
 }
 
 /// Emitted by [`crate::Node::drain_events`] for either a broadcast a peer
-/// confirmed holding (a *confirmed delivery*) or an inbound frame the peer
+/// confirmed holding (a *confirmed delivery*) or inbound frames this node
 /// dropped and counted.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -83,14 +82,19 @@ pub enum NodeEvent<A> {
     },
     /// The peer at `addr` sent a frame we dropped and counted under `reason`.
     /// `count` is how many frames were counted for this `(addr, reason)` pair
-    /// since the last drain (always `>= 1`); `addr` is `None` when the
-    /// drop-counter table is full and the count lives in the single overflow
-    /// slot instead.
+    /// since the last drain (always `>= 1`).
+    ///
+    /// `addr` is `None` for the single overflow slot, which counts the drops
+    /// that arrived while the drop-counter table was full. Its `reason` is the
+    /// reason of the *first* drop that overflowed since the last drain; its
+    /// `count` covers every overflowed drop, whatever its reason. Draining
+    /// frees the whole table, so each drain window is labelled on its own.
     Dropped {
         /// The wire address of the peer that sent the dropped frame. `None`
         /// only for the overflow slot, which has no address to name.
         addr: Option<A>,
-        /// Why the frame was dropped.
+        /// Why the frame was dropped. For the overflow slot, the reason of
+        /// the first overflowed drop since the last drain.
         reason: DropReason,
         /// The number of frames folded into this counter since the last drain.
         count: u32,
@@ -99,14 +103,15 @@ pub enum NodeEvent<A> {
 
 /// The `Exchange`'s counted-drop table: up to [`consts::DROP_TABLE_CAP`]
 /// distinct `(addr, DropReason)` pairs, each with a saturating count, plus a
-/// single overflow counter. Counters are drained — and reset — through
-/// [`Exchange::drain_events`].
+/// single overflow counter. Draining through [`Exchange::drain_events`]
+/// reports every counter and empties the table, keys included.
 #[derive(Clone, Debug)]
 pub(crate) struct DropTable<A> {
     /// `(addr, reason, count)`, in insertion order; `count` saturates at `u32`.
     entries: Vec<(A, DropReason, u32), { consts::DROP_TABLE_CAP }>,
     /// A single slot for drops that arrive once the table is full: no address,
-    /// just the reason and a combined count. Reported with `addr: None`.
+    /// the reason of the first overflowed drop since the last drain, and a
+    /// combined count of all of them. Reported with `addr: None`.
     overflow: Option<(DropReason, u32)>,
 }
 
@@ -139,23 +144,21 @@ impl<A: Clone + PartialEq> DropTable<A> {
         }
     }
 
-    /// Emits one [`NodeEvent::Dropped`] per non-zero entry (resetting its count,
-    /// keeping the key) followed by the overflow counter, if any.
+    /// Emits one [`NodeEvent::Dropped`] per entry followed by the overflow
+    /// counter, if any, and empties the table — keys included, so the next
+    /// window's drops get attributed entries again.
     fn drain(&mut self) -> Vec<NodeEvent<A>, { consts::DROP_TABLE_CAP + 1 }> {
         let mut out: Vec<NodeEvent<A>, { consts::DROP_TABLE_CAP + 1 }> = Vec::new();
-        let mut i = 0;
-        while let Some(entry) = self.entries.get_mut(i) {
-            let (addr, reason, count) = (entry.0.clone(), entry.1, entry.2);
-            if count > 0 {
+        for (addr, reason, count) in self.entries.iter() {
+            if *count > 0 {
                 let _ = out.push(NodeEvent::Dropped {
-                    addr: Some(addr),
-                    reason,
-                    count,
+                    addr: Some(addr.clone()),
+                    reason: *reason,
+                    count: *count,
                 });
-                entry.2 = 0;
             }
-            i += 1;
         }
+        self.entries.clear();
         if let Some((reason, count)) = self.overflow.take() {
             if count > 0 {
                 let _ = out.push(NodeEvent::Dropped {
@@ -324,7 +327,7 @@ pub(crate) struct Exchange<A> {
     events: Vec<NodeEvent<A>, { consts::EVENT_QUEUE_CAP }>,
     /// Counted drops: distinct `(addr, DropReason)` pairs, each with a
     /// saturating count, plus a single overflow counter; reported through
-    /// [`Exchange::drain_events`] and reset on drain.
+    /// [`Exchange::drain_events`] and emptied on drain.
     drops: DropTable<A>,
     /// Pending addressed acks: ids awaiting an `Ack` for a peer that sent an
     /// addressed observation.
@@ -826,15 +829,13 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         &self.peers
     }
 
-    /// `Exchange`s emit [`NodeEvent`]s — confirmed deliveries plus counted
-    /// drops — through `Exchange::drain_events`; `tines` surfaces them to its
-    /// transport, so the drain method is unused inside `tines-core` itself.
+    /// Drains the [`NodeEvent`]s — confirmed deliveries plus counted drops —
+    /// for [`crate::Node::drain_events`].
     ///
     /// Returns confirmed deliveries first, oldest first, then one
-    /// [`NodeEvent::Dropped`] per non-zero counter (resetting each counter).
+    /// [`NodeEvent::Dropped`] per non-zero counter, emptying the drop table.
     /// Sized to hold the entire delivery queue plus the whole drop table and
     /// its overflow slot, so a full delivery queue never evicts a counted drop.
-    #[allow(dead_code)]
     pub(crate) fn drain_events(
         &mut self,
     ) -> Vec<NodeEvent<A>, { consts::EVENT_QUEUE_CAP + consts::DROP_TABLE_CAP + 1 }> {
@@ -979,9 +980,14 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
             Frame::Summary { salt, bits, .. } => {
                 // F9: act on at most one received Summary per peer per
                 // SUMMARY_INTERVAL_MS. A replayed summary within the interval is
-                // ignored — a policy, not a drop.
+                // ignored — a policy, not a drop. The check allows slack for
+                // poll jitter (decision L): a summary at least half an interval
+                // after the last one acted on is accepted, so an on-time
+                // summary measured at 1999 ms isn't ignored.
                 let recently = match peer.last_summary_received {
-                    Some(received) => now.saturating_sub(received) < consts::SUMMARY_INTERVAL_MS,
+                    Some(received) => {
+                        now.saturating_sub(received) < consts::SUMMARY_INTERVAL_MS / 2
+                    }
                     None => false,
                 };
                 if !recently {
@@ -4098,5 +4104,104 @@ mod tests {
         );
         assert!(ex.peers().is_empty());
         assert_eq!(ex.bcast_acks.len(), 0, "an evicted peer's acks are purged");
+    }
+
+    /// Feeds one version-mismatch frame (version byte `version`) from `addr`.
+    fn bad_frame(ex: &mut Exchange<u8>, store: &mut MemStore, addr: u8, version: u8) {
+        let bytes = heapless::Vec::<u8, { consts::MAX_FRAME }>::from_slice(&[version; 4]).unwrap();
+        ex.on_event(Event::Frame(addr, bytes), store, 0);
+    }
+
+    /// S7: draining frees the drop table's keys, so after a drain the next
+    /// distinct `(addr, reason)` pairs get their own attributed entries
+    /// instead of all landing in the overflow slot.
+    #[test]
+    fn drain_frees_drop_table_keys() {
+        let mut store = MemStore::new();
+        let mut ex = Exchange::<u8>::new(ME);
+        for addr in 0..consts::DROP_TABLE_CAP as u8 {
+            bad_frame(&mut ex, &mut store, addr, 0);
+        }
+        assert_eq!(ex.drain_events().len(), consts::DROP_TABLE_CAP);
+
+        // A whole new set of addresses: each is attributed, none overflows.
+        for addr in 0..consts::DROP_TABLE_CAP as u8 {
+            bad_frame(&mut ex, &mut store, addr + 100, 0);
+        }
+        let drained = ex.drain_events();
+        assert_eq!(drained.len(), consts::DROP_TABLE_CAP);
+        assert!(
+            drained
+                .iter()
+                .all(|e| matches!(e, NodeEvent::Dropped { addr: Some(a), .. } if *a >= 100)),
+            "every drop after a drain is attributed: {drained:?}"
+        );
+    }
+
+    /// S7: the overflow slot's reason is that of the first drop to overflow
+    /// since the last drain. A later window's overflow with a different
+    /// reason is reported under its own reason, not the first window's.
+    #[test]
+    fn overflow_reason_is_per_drain_window() {
+        let mut store = MemStore::new();
+        let mut ex = Exchange::<u8>::new(ME);
+        let overflow_reason = |ex: &mut Exchange<u8>| {
+            ex.drain_events().iter().find_map(|e| match e {
+                NodeEvent::Dropped {
+                    addr: None, reason, ..
+                } => Some(*reason),
+                _ => None,
+            })
+        };
+
+        for addr in 0..=consts::DROP_TABLE_CAP as u8 {
+            bad_frame(&mut ex, &mut store, addr, 0);
+        }
+        assert_eq!(
+            overflow_reason(&mut ex),
+            Some(DropReason::VersionMismatch { version: 0 })
+        );
+
+        for addr in 0..=consts::DROP_TABLE_CAP as u8 {
+            bad_frame(&mut ex, &mut store, addr + 100, 1);
+        }
+        assert_eq!(
+            overflow_reason(&mut ex),
+            Some(DropReason::VersionMismatch { version: 1 }),
+            "the second window's overflow is labelled with its own reason"
+        );
+    }
+
+    /// D-f (decision L): a summary arriving at least `SUMMARY_INTERVAL_MS / 2`
+    /// after the last one acted on is accepted, so an on-time summary
+    /// measured a millisecond early isn't ignored; one sooner is ignored.
+    #[test]
+    fn summary_rate_limit_allows_jitter() {
+        let a: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let summary_at = |ex: &mut Exchange<u8>, store: &mut MemStore, now: Tick| {
+            let bits = heapless::Vec::from_slice(&[0u8; consts::SUMMARY_BYTES]).unwrap();
+            let sum = Frame::Summary {
+                from: a,
+                salt: 0,
+                bits,
+            };
+            ex.on_event(Event::Frame(1, frame_bytes(&sum)), store, now);
+            ex.peers()[0].last_summary_received
+        };
+        assert_eq!(summary_at(&mut ex, &mut store, 0), Some(0));
+        let early = consts::SUMMARY_INTERVAL_MS / 2 - 1;
+        assert_eq!(
+            summary_at(&mut ex, &mut store, early),
+            Some(0),
+            "a summary sooner than half the interval is ignored"
+        );
+        let jittered = consts::SUMMARY_INTERVAL_MS - 1;
+        assert_eq!(
+            summary_at(&mut ex, &mut store, jittered),
+            Some(jittered),
+            "an on-time summary measured at 1999 ms is acted on"
+        );
     }
 }
