@@ -7,6 +7,9 @@ extern crate alloc;
 
 pub mod belief;
 mod bloom;
+#[cfg(feature = "conformance")]
+#[doc(hidden)]
+pub mod conformance;
 pub mod consts;
 mod exchange;
 mod frag;
@@ -28,10 +31,18 @@ pub use observation::{
 };
 pub use store::{Store, StoreError, TrimPolicy, WallClockStore};
 pub use transport::{Event, FrameBuf, SendError, Transport};
-pub use wire::{frame_sender, Frame, WireError};
+pub use wire::frame_sender;
 
 #[cfg(feature = "alloc")]
 pub use mem_store::MemStore;
 
 #[cfg(test)]
 extern crate std;
+
+// The pinned wire vectors (spec §7) need the crate-private `Frame` and
+// `WireError`, so they compile as a unit-test module rather than as an
+// integration test (`autotests = false` in Cargo.toml keeps Cargo from also
+// building them as one).
+#[cfg(test)]
+#[path = "../tests/vectors.rs"]
+mod vectors;

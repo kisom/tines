@@ -11,6 +11,10 @@ readme.workspace = true
 documentation = "https://docs.rs/tines-core"
 keywords = ["robotics", "gossip", "delay-tolerant", "no-std", "sync"]
 categories = ["no-std", "embedded", "network-programming", "science::robotics"]
+# Test targets are listed by hand below: `tests/vectors.rs` is not one. It pins
+# the wire format against the crate-private `Frame`, so `src/lib.rs` compiles
+# it into the unit tests instead (`#[path = "../tests/vectors.rs"]`).
+autotests = false
 
 [features]
 default = ["alloc"]
@@ -19,6 +23,8 @@ alloc = []
 # backends run against themselves to prove they honor the `Store` contract.
 # Std-free so it builds with `--no-default-features`; enabled only by the
 # backend crates that exercise the suite (MemStore, LogStore, CappedStore).
+# It also turns on the `#[doc(hidden)]` `conformance` module, which gives the
+# fuzz harness byte-level frame helpers and core's local limits.
 conformance = []
 
 [dependencies]
@@ -33,3 +39,16 @@ proptest = "1"
 # the test suite via a `#[path]` module include to keep it the SAME harness.
 # That source names `heapless` directly, so restate it here for the twin.
 heapless = { version = "0.8", features = ["serde"] }
+
+[[test]]
+name = "pair"
+
+[[test]]
+name = "public_api"
+
+# The proptest twin of the `fuzz/` harness builds frames through the hidden
+# `conformance` helpers, so it runs only with that feature (as `scripts/ci.sh`
+# does) and needs `MemStore` (`alloc`).
+[[test]]
+name = "fuzz_twin"
+required-features = ["alloc", "conformance"]

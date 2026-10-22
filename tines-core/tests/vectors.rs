@@ -1,7 +1,53 @@
 //! Pinned identity + wire vectors (spec §7 "Evidence"). A change to any byte
 //! or expected shape below is an identity- or wire-format change by definition.
+//!
+//! `Frame` and `WireError` are crate-private (spec §3), so this file is not a
+//! Cargo integration-test target: `tines-core/src/lib.rs` compiles it into the
+//! crate's own unit tests with `#[cfg(test)] #[path = "../tests/vectors.rs"]`.
+//! Each golden vector is checked both ways: the hand-built frame must
+//! `encode()` to exactly the pinned bytes, and the pinned bytes must
+//! `decode()` back to that frame.
 
-use tines_core::{consts, Frame, Observation, SigAlgo, WireError};
+use crate::consts;
+use crate::wire::{Frame, WireError};
+use crate::{Dest, Observation, Payload, SigAlgo, Signature, Topic};
+use heapless::Vec;
+
+/// Encodes `frame` and asserts the bytes equal `golden`, then decodes
+/// `golden` and asserts it equals `frame`.
+fn assert_golden(frame: &Frame, golden: &[u8]) {
+    let mut buf = [0u8; consts::MAX_FRAME];
+    let n = frame.encode(&mut buf).expect("golden frame encodes");
+    assert_eq!(
+        &buf[..n],
+        golden,
+        "encode() must reproduce the pinned bytes"
+    );
+    assert_eq!(
+        Frame::decode(golden).as_ref(),
+        Ok(frame),
+        "decode() of the pinned bytes must give the frame"
+    );
+}
+
+/// The `[1;16]` / seq 1 / `"door/3"` / `MAX_PAYLOAD` zero-byte broadcast both
+/// signed vectors carry, signed with 64 zero bytes under `algo`.
+fn signed_door_obs(algo: SigAlgo) -> Observation {
+    Observation {
+        observer: [1; 16],
+        seq: 1,
+        age_ms: 0,
+        observed_at: None,
+        topic: Topic::from_slice(b"door/3").unwrap(),
+        payload: Payload::from_slice(&[0u8; consts::MAX_PAYLOAD]).unwrap(),
+        dest: None,
+        sig: Some(Signature {
+            version: 1,
+            algo,
+            bytes: Vec::from_slice(&[0u8; 64]).unwrap(),
+        }),
+    }
+}
 
 #[test]
 fn id_known_vector() {
@@ -62,12 +108,12 @@ fn summary_golden_vector() {
         170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
         170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8, 170u8,
     ];
-    let Frame::Summary { from, salt, bits } = Frame::decode(&GOLDEN).unwrap() else {
-        panic!("expected a Summary frame")
+    let frame = Frame::Summary {
+        from: [3; 16],
+        salt: 0xdeadbeef,
+        bits: Vec::from_slice(&[0xAAu8; consts::SUMMARY_BYTES]).unwrap(),
     };
-    assert_eq!(from, [3; 16]);
-    assert_eq!(salt, 0xdeadbeef);
-    assert_eq!(&bits[..], &[0xAAu8; consts::SUMMARY_BYTES][..]);
+    assert_golden(&frame, &GOLDEN);
 }
 
 #[test]
@@ -150,22 +196,11 @@ fn obs_golden_vector_ed25519() {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
-    let Frame::Obs { from, obs } = Frame::decode(&GOLDEN).unwrap() else {
-        panic!("expected an Obs frame")
+    let frame = Frame::Obs {
+        from: [1; 16],
+        obs: signed_door_obs(SigAlgo::Ed25519),
     };
-    assert_eq!(from, [1; 16]);
-    assert_eq!(obs.observer, [1; 16]);
-    assert_eq!(obs.seq, 1);
-    assert_eq!(obs.age_ms, 0);
-    assert_eq!(obs.observed_at, None);
-    assert_eq!(&obs.topic[..], b"door/3");
-    assert_eq!(obs.payload.len(), consts::MAX_PAYLOAD);
-    assert_eq!(obs.dest, None);
-    let sig = obs.sig.expect("a signed obs carries a signature");
-    assert_eq!(sig.version, 1);
-    assert_eq!(sig.algo, SigAlgo::Ed25519);
-    assert_eq!(sig.bytes.len(), 64);
-    assert!(sig.bytes.iter().all(|b| *b == 0));
+    assert_golden(&frame, &GOLDEN);
 }
 
 #[test]
@@ -248,17 +283,11 @@ fn obs_golden_vector_unknown_algo() {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
-    let Frame::Obs { obs, .. } = Frame::decode(&GOLDEN).unwrap() else {
-        panic!("expected an Obs frame")
+    let frame = Frame::Obs {
+        from: [1; 16],
+        obs: signed_door_obs(SigAlgo::Unknown(7)),
     };
-    assert_eq!(obs.observer, [1; 16]);
-    assert_eq!(obs.seq, 1);
-    assert_eq!(obs.observed_at, None);
-    let sig = obs.sig.expect("a signed obs carries a signature");
-    assert_eq!(sig.version, 1);
-    assert_eq!(sig.algo, SigAlgo::Unknown(7));
-    assert_eq!(sig.bytes.len(), 64);
-    assert!(sig.bytes.iter().all(|b| *b == 0));
+    assert_golden(&frame, &GOLDEN);
 }
 
 #[test]
@@ -272,21 +301,14 @@ fn frag_golden_vector() {
         0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c,
         0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c,
     ];
-    let Frame::Frag {
-        from,
-        id,
-        index,
-        count,
-        data,
-    } = Frame::decode(&GOLDEN).unwrap()
-    else {
-        panic!("expected a Frag frame")
+    let frame = Frame::Frag {
+        from: [1; 16],
+        id: [2; 16],
+        index: 0,
+        count: 1,
+        data: Vec::from_slice(&[0x5Cu8; 64]).unwrap(),
     };
-    assert_eq!(from, [1; 16]);
-    assert_eq!(id, [2; 16]);
-    assert_eq!(index, 0);
-    assert_eq!(count, 1);
-    assert_eq!(&data[..], &[0x5Cu8; 64][..]);
+    assert_golden(&frame, &GOLDEN);
 }
 
 #[test]
@@ -297,11 +319,55 @@ fn ack_golden_vector() {
         0x02, 0x02, 0x02, 0x02, 0x02, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
         0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
     ];
-    let Frame::Ack { from, ids } = Frame::decode(&GOLDEN).unwrap() else {
-        panic!("expected an Ack frame")
+    let frame = Frame::Ack {
+        from: [1; 16],
+        ids: Vec::from_slice(&[[2u8; 16], [3u8; 16]]).unwrap(),
     };
-    assert_eq!(from, [1; 16]);
-    assert_eq!(&ids[..], &[[2u8; 16], [3u8; 16]][..]);
+    assert_golden(&frame, &GOLDEN);
+}
+
+#[test]
+fn ack_with_trailing_byte_is_malformed() {
+    // F13 / §10: frames are canonical. This is the Ack golden vector above
+    // plus one trailing 0x00 byte; the version byte matches and postcard can
+    // decode the Ack, but the leftover byte makes the whole frame Malformed.
+    const TRAILING: [u8; 52] = [
+        0x04, 0x03, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+        0x02, 0x02, 0x02, 0x02, 0x02, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
+        0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x00,
+    ];
+    assert_eq!(Frame::decode(&TRAILING), Err(WireError::Malformed));
+}
+
+#[test]
+fn addressed_obs_golden_vector() {
+    // An addressed observation with a nonzero age and an `observed_at`, so
+    // the vectors pin the `Dest` layout and both optional/varint fields.
+    const GOLDEN: [u8; 73] = [
+        0x04, 0x01, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05,
+        0x05, 0x05, 0x05, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
+        0x06, 0x06, 0x06, 0x06, 0xac, 0x02, 0xd2, 0x09, 0x01, 0x80, 0xd0, 0x95, 0xff, 0xbc, 0x31,
+        0x03, 0x63, 0x6d, 0x64, 0x02, 0x67, 0x6f, 0x01, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
+        0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0xe0, 0xd4, 0x03, 0x00,
+    ];
+    let frame = Frame::Obs {
+        from: [5; 16],
+        obs: Observation {
+            observer: [6; 16],
+            seq: 300,
+            age_ms: 1234,
+            observed_at: Some(1_700_000_000_000),
+            topic: Topic::from_slice(b"cmd").unwrap(),
+            payload: Payload::from_slice(b"go").unwrap(),
+            dest: Some(Dest {
+                to: [7; 16],
+                lifetime_ms: 60_000,
+            }),
+            sig: None,
+        },
+    };
+    assert_golden(&frame, &GOLDEN);
 }
 
 #[test]

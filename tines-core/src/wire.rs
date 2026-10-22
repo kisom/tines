@@ -14,13 +14,21 @@ use serde::{Deserialize, Serialize};
 /// avoid per-frame heap allocation in the `no_std` core; this keeps the enum
 /// large, so the informative `large_enum_variant` lint is suppressed here.
 ///
-/// Exposed publicly (see [`crate::Frame`]) so that `tines-core/tests/vectors.rs`
-/// can decode the pinned golden wire vectors and assert on the decoded shape.
-/// The wire layout (version byte, positional postcard tags, reserved Signature
-/// slot) is the frozen contract this crate guarantees across 0.x → 1.0.
+/// Crate-private (spec §3): the type is not API, but its encoding is. The
+/// wire layout (version byte, positional postcard tags, reserved Signature
+/// slot) is frozen for wire v1 and pinned byte-for-byte by
+/// `tines-core/tests/vectors.rs`, which runs as an in-crate test module.
+///
+/// ```compile_fail
+/// use tines_core::Frame; // crate-private: not reachable from outside core
+/// ```
+///
+/// ```compile_fail
+/// use tines_core::WireError; // crate-private too
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
-pub enum Frame {
+pub(crate) enum Frame {
     /// A broadcast bloom summary of a node's observation-id set.
     Summary {
         /// The sending node.
@@ -143,13 +151,10 @@ pub fn frame_sender(bytes: &[u8]) -> Option<NodeId> {
     Some(from)
 }
 
-/// Errors produced while (de)serializing frames on the wire.
-///
-/// Exposed publicly (see [`crate::WireError`]) so that `tines-core/tests/vectors.rs`
-/// can assert on the exact decode error (e.g. `VersionMismatch`) for the pinned
-/// malformed vectors.
+/// Errors produced while (de)serializing frames on the wire. Crate-private
+/// (spec §3); the exchange reports decode failures as [`crate::DropReason`].
 #[derive(Debug, PartialEq, Eq)]
-pub enum WireError {
+pub(crate) enum WireError {
     /// The output buffer was too small to hold the serialized frame.
     TooLarge,
     /// The input bytes were malformed, truncated, or not a valid `Frame`.
@@ -315,7 +320,8 @@ mod tests {
 
     #[test]
     fn frame_sender_peeks_from_field() {
-        // Version byte 0, variant tag 1, then `from: [3;16]` at bytes 2..18.
+        // Version byte (`WIRE_VERSION` = 4) at byte 0, variant tag 0
+        // (Summary) at byte 1, then `from: [3;16]` at bytes 2..18.
         const GOLDEN: [u8; 201] = [
             4u8, 0u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8,
             3u8, 239u8, 253u8, 182u8, 245u8, 13u8, 128u8, 4u8, 170u8, 170u8, 170u8, 170u8, 170u8,
@@ -340,9 +346,9 @@ mod tests {
 
     #[test]
     fn frame_sender_reads_from_fixed_offset_not_just_the_start() {
-        // The leading byte (the externally-tagged variant tag) is skipped, so a
-        // payload whose first byte is not the sender must still yield the `from`
-        // recorded at byte 1.
+        // The two leading bytes (the version byte and the externally-tagged
+        // variant tag) are skipped, so a payload whose first bytes are not the
+        // sender must still yield the `from` recorded at bytes 2..18.
         let bytes = {
             let mut b = [0u8; 32];
             b[0] = consts::WIRE_VERSION; // version slot (skipped by frame_sender)
@@ -513,54 +519,5 @@ mod tests {
             }
             other => panic!("expected Obs, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn gen_missing_golden_vectors() {
-        // THROWAWAY: encode canonical frames and print hex for vectors.rs.
-        let enc = |f: Frame| {
-            let mut buf = [0u8; consts::MAX_FRAME];
-            let n = f.encode(&mut buf).unwrap();
-            let hex: std::string::String =
-                buf[..n].iter().map(|b| std::format!("{b:02x}")).collect();
-            std::println!("{n} {hex}");
-        };
-
-        // unknown-algo Obs
-        let f = Frame::Obs {
-            from: [1; 16],
-            obs: Observation {
-                observer: [1; 16],
-                seq: 1,
-                age_ms: 0,
-                observed_at: None,
-                topic: Topic::from_slice(b"door/3").unwrap(),
-                payload: Payload::from_slice(&[0u8; consts::MAX_PAYLOAD]).unwrap(),
-                dest: None,
-                sig: Some(Signature {
-                    version: 1,
-                    algo: SigAlgo::Unknown(7),
-                    bytes: Vec::from_slice(&[0u8; 64]).unwrap(),
-                }),
-            },
-        };
-        enc(f);
-
-        // Frag
-        let f = Frame::Frag {
-            from: [1; 16],
-            id: [2; 16],
-            index: 0,
-            count: 1,
-            data: Vec::from_slice(&[0x5Cu8; 64]).unwrap(),
-        };
-        enc(f);
-
-        // Ack
-        let ids =
-            Vec::<ObservationId, { consts::ACK_IDS_CAP }>::from_slice(&[[2u8; 16], [3u8; 16]])
-                .unwrap();
-        let f = Frame::Ack { from: [1; 16], ids };
-        enc(f);
     }
 }

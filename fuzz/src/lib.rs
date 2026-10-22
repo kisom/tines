@@ -17,10 +17,11 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+use tines_core::conformance;
 use tines_core::transport::FrameBuf;
 use tines_core::{
     consts::{ACK_IDS_CAP, MAX_FRAME, MAX_PAYLOAD, MAX_TOPIC, SUMMARY_BYTES},
-    Event, Frame, MemStore, Node, NodeId, ObservationId, SendError, Tick, Transport,
+    Event, MemStore, Node, NodeId, ObservationId, SendError, Tick, Transport,
 };
 
 /// Wire address of a peer on the scripted transport. The exchange pins each
@@ -191,15 +192,13 @@ pub struct Harness {
     dropped_total: u64,
 }
 
-/// Serialize a frame into bytes via its public [`Frame::encode`] (version byte +
-/// postcard), returning `None` if it cannot fit in a `MAX_FRAME` buffer — the
-/// harness never panics on an over-large structured frame; it just skips it.
-fn encode_frame(frame: Frame) -> Option<Vec<u8>> {
+/// Serialize a frame into bytes via one of core's hidden `conformance`
+/// encoders (version byte + postcard), returning `None` if it cannot fit in a
+/// `MAX_FRAME` buffer — the harness never panics on an over-large structured
+/// frame; it just skips it.
+fn encode_frame(enc: impl FnOnce(&mut [u8]) -> Option<usize>) -> Option<Vec<u8>> {
     let mut buf = [0u8; MAX_FRAME];
-    match frame.encode(&mut buf) {
-        Ok(n) => Some(buf[..n].to_vec()),
-        Err(_) => None,
-    }
+    enc(&mut buf).map(|n| buf[..n].to_vec())
 }
 
 /// Build a well-formed `Obs` frame from an [`ObsSpec`], clamping the topic and
@@ -221,32 +220,20 @@ fn build_obs(spec: &ObsSpec) -> Option<Vec<u8>> {
             lifetime_ms,
         ),
     };
-    encode_frame(Frame::Obs {
-        from: spec.from,
-        obs,
-    })
+    encode_frame(|out| conformance::encode_obs(spec.from, &obs, out))
 }
 
 /// Build a well-formed `Summary` frame, clamping the bloom bits to
 /// `SUMMARY_BYTES`.
 fn build_summary(spec: &SpecSummary) -> Option<Vec<u8>> {
-    let bits: heapless::Vec<u8, SUMMARY_BYTES> =
-        spec.bits.iter().cloned().take(SUMMARY_BYTES).collect();
-    encode_frame(Frame::Summary {
-        from: spec.from,
-        salt: spec.salt,
-        bits,
-    })
+    let bits = &spec.bits[..spec.bits.len().min(SUMMARY_BYTES)];
+    encode_frame(|out| conformance::encode_summary(spec.from, spec.salt, bits, out))
 }
 
 /// Build a well-formed `Ack` frame, capping the id list at `ACK_IDS_CAP`.
 fn build_ack(spec: &AckSpec) -> Option<Vec<u8>> {
-    let ids: heapless::Vec<ObservationId, ACK_IDS_CAP> =
-        spec.ids.iter().copied().take(ACK_IDS_CAP).collect();
-    encode_frame(Frame::Ack {
-        from: spec.from,
-        ids,
-    })
+    let ids: Vec<ObservationId> = spec.ids.iter().copied().take(ACK_IDS_CAP).collect();
+    encode_frame(|out| conformance::encode_ack(spec.from, &ids, out))
 }
 
 /// Push a built frame (or skip it) into the inbound queue for `addr`.
