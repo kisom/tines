@@ -172,7 +172,10 @@ impl TinesNode {
         let executor = context.create_basic_executor();
         let node = executor.create_node("tines")?;
 
-        let store = LogStore::open(log_path, 0)?;
+        // Peer estimates outside the plausible range don't count (decision J).
+        let store = LogStore::builder(log_path)
+            .plausible_wall_ms(tines::trust::PLAUSIBLE_WALL_MS)
+            .open(0)?;
         let transport = BtTransport::new(me, peer, radio);
         let tines = TinesNodeCore::new(me, store.first_seq(), store, transport);
 

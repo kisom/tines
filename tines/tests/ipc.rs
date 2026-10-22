@@ -478,7 +478,10 @@ fn build_pair(dir: &Path) -> Pair {
     let world = Arc::new(Mutex::new(SharedInMemoryWorld::new()));
     let (a_id, b_id) = ([1; 16], [2; 16]);
     let a_store = LogStore::open(&dir.join("a.store.log"), 0).expect("a store open");
-    let b_store = LogStore::open(&dir.join("b.store.log"), 0).expect("b store open");
+    let b_store = LogStore::builder(&dir.join("b.store.log"))
+        .plausible_wall_ms(tines::trust::PLAUSIBLE_WALL_MS)
+        .open(0)
+        .expect("b store open");
     let ta = SharedInMemory {
         me: a_id,
         their: b_id,
@@ -816,7 +819,6 @@ fn window_adopts_a_later_larger_estimate() {
 /// `W + 6000`). Smallest-age selection would adopt `W`; the host adopts the
 /// latest estimate.
 #[test]
-#[ignore = "needs decision J store change"]
 fn latest_estimate_wins_over_smallest_age() {
     let dir = unique_dir("latest");
     let (mut node_a, node_b, world) = build_pair(&dir);
@@ -866,6 +868,26 @@ fn assert_not_adopted(tag: &str, observed_at: u64) {
 #[test]
 fn forged_max_observed_at_is_not_adopted() {
     assert_not_adopted("forged", u64::MAX);
+}
+
+/// Decision J with B3's bounds: a forged `u64::MAX` alongside an honest
+/// estimate doesn't hide it. The store drops the forged one before choosing
+/// the latest, so B adopts the honest time.
+#[test]
+fn forged_estimate_does_not_hide_an_honest_one() {
+    let dir = unique_dir("forged-honest");
+    let (mut node_a, node_b, world) = build_pair(&dir);
+    let socket_b = serve_b(node_b, HostClock::start(), &dir);
+
+    inject(&world, &crafted(1, u64::MAX, 0));
+    inject(&world, &crafted(2, W, 0));
+
+    let mut t = 0;
+    let at = b_adopted_stamp(&socket_b, &mut node_a, &mut t);
+    assert!(
+        (W..W + 60_000).contains(&at),
+        "B adopted the honest estimate: stamp {at}, expected ~{W}"
+    );
 }
 
 /// B3: an estimate below the floor (here 2001) is not adopted.

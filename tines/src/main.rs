@@ -124,9 +124,12 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // LogStore is the Store (S); BtTransport wraps it as the Transport (T).
     // unknown_downtime_age_ms (the broadcast floor while the wall clock is
     // unknown) is optional; leave the LogStore default when unset.
+    // Peer estimates outside the plausible range don't count (decision J).
+    let builder = LogStore::builder(Path::new(&config.log_path))
+        .plausible_wall_ms(tines::trust::PLAUSIBLE_WALL_MS);
     let builder = match config.unknown_downtime_age_ms {
-        Some(ms) => LogStore::builder(Path::new(&config.log_path)).set_unknown_downtime_age_ms(ms),
-        None => LogStore::builder(Path::new(&config.log_path)),
+        Some(ms) => builder.set_unknown_downtime_age_ms(ms),
+        None => builder,
     };
     let mut clock = HostClock::start();
     let store = builder

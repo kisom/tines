@@ -48,6 +48,12 @@ pub const WALL_FLOOR_MS: u64 = 1_767_225_600_000;
 /// still far below where `u64` milliseconds overflow.
 pub const WALL_CEILING_MS: u64 = WALL_FLOOR_MS + 36_525 * 24 * 60 * 60 * 1000;
 
+/// [`WALL_FLOOR_MS`]`..=`[`WALL_CEILING_MS`] as a range, for
+/// `LogStoreBuilder::plausible_wall_ms`. The store drops peer estimates outside
+/// it before choosing the latest, so one forged estimate can't hide the honest
+/// ones (decision J).
+pub const PLAUSIBLE_WALL_MS: core::ops::RangeInclusive<u64> = WALL_FLOOR_MS..=WALL_CEILING_MS;
+
 /// The default peer-time window: how long a host keeps collecting peer
 /// estimates after the first plausible one before adopting the latest
 /// (decision J, about 10 s).
@@ -56,7 +62,7 @@ pub const DEFAULT_PEER_TIME_WINDOW_MS: u64 = 10_000;
 /// Whether `wall_ms` (ms since the Unix epoch) lies within
 /// [`WALL_FLOOR_MS`]`..=`[`WALL_CEILING_MS`], so a host may adopt it.
 pub fn is_plausible_wall_ms(wall_ms: u64) -> bool {
-    (WALL_FLOOR_MS..=WALL_CEILING_MS).contains(&wall_ms)
+    PLAUSIBLE_WALL_MS.contains(&wall_ms)
 }
 
 /// The system clock in ms since the Unix epoch, if it is plausible.
