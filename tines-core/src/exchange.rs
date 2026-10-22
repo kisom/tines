@@ -236,6 +236,8 @@ struct Undo<A> {
     requeue: Option<(usize, ObservationId)>,
     /// Id whose `(id, addr)` bounce record this frame added.
     bounce: Option<ObservationId>,
+    /// Id whose `(id, addr)` `bcast_sent` record this frame added.
+    bcast: Option<ObservationId>,
 }
 
 /// A bounded ring of `(observation-id, addr)` pairs awaiting an `Ack`
@@ -260,9 +262,13 @@ impl<A: Clone> AckBuffer<A> {
         self.entries.len()
     }
 
-    /// Empty the buffer (F13): purge all pending acks when the peer goes away.
-    fn clear(&mut self) {
-        self.entries.clear();
+    /// Purge the pending acks owed to `addr` (F13), keeping every other
+    /// peer's.
+    fn retain_other(&mut self, addr: &A)
+    where
+        A: PartialEq,
+    {
+        self.entries.retain(|(_, a)| a != addr);
     }
 
     /// Enqueue `(id, addr)`, dropping the oldest entry if the buffer is full.
@@ -302,8 +308,11 @@ pub(crate) struct Exchange<A> {
     /// or received from, `addr` — never one merely observed while forwarding.
     bounce: Vec<(ObservationId, A, BounceKind), { consts::SEND_QUEUE_CAP }>,
     /// `(id, addr)` for each broadcast observation dispatched to `addr` on the
-    /// broadcast emit path. Used to validate inbound `Ack` receipts against
-    /// broadcasts we actually sent; overflow drops the oldest record.
+    /// broadcast emit path during its current contact. Used to validate inbound
+    /// `Ack` receipts against broadcasts we actually sent this contact; records
+    /// for an address are dropped when its contact starts or ends, and a
+    /// record is undone if its frame's send fails. Overflow drops the oldest
+    /// record.
     bcast_sent: Vec<(ObservationId, A), { consts::BCAST_SENT_CAP }>,
     /// One [`NodeEvent::Delivered`] per broadcast id a peer has confirmed,
     /// pushed drop-oldest when full. Drain through [`Exchange::drain_events`].
@@ -427,6 +436,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                 custody_cursor: peer.custody_cursor,
                 requeue: None,
                 bounce: None,
+                bcast: None,
             });
             peer.last_summary_sent = Some(now);
             self.salt = self.salt.wrapping_add(1);
@@ -476,6 +486,13 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         let Some(undo) = pending else {
             return;
         };
+        // Whatever the error, the broadcast was not dispatched, so a receipt
+        // for it must not be accepted (S10). A record evicted to make room for
+        // this one is not restored: that only loses a `Delivered` event.
+        if let Some(id) = undo.bcast {
+            self.bcast_sent
+                .retain(|(b, a)| !(*b == id && *a == undo.addr));
+        }
         if matches!(err, SendError::TooLarge) {
             return;
         }
@@ -682,7 +699,11 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
             // Broadcasts only: an addressed id goes through custody, never here.
             if let Some(obs) = store.get(&front, now).filter(|o| o.dest.is_none()) {
                 if let Some(res) = self.emit(idx, front, &obs, None, mtu, out) {
-                    self.record_bcast_sent(front, addr.clone());
+                    if self.record_bcast_sent(front, addr.clone()) {
+                        if let Some(undo) = self.undo.as_mut() {
+                            undo.bcast = Some(front);
+                        }
+                    }
                     return Some(res);
                 }
             }
@@ -691,15 +712,17 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
     }
 
     /// Records that a broadcast for `id` was dispatched to `addr`, evicting the
-    /// oldest record when `bcast_sent` is full.
-    fn record_bcast_sent(&mut self, id: ObservationId, addr: A) {
+    /// oldest record when `bcast_sent` is full. Returns `true` if a new record
+    /// was added.
+    fn record_bcast_sent(&mut self, id: ObservationId, addr: A) -> bool {
         if bcast_sent_contains(&self.bcast_sent, id, &addr) {
-            return;
+            return false;
         }
         if self.bcast_sent.is_full() {
             self.bcast_sent.remove(0);
         }
         let _ = self.bcast_sent.push((id, addr));
+        true
     }
 
     /// Addressed store-and-forward for the peer at `idx`: start sending one
@@ -772,6 +795,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
             custody_cursor: peer.custody_cursor,
             requeue: None,
             bounce: None,
+            bcast: None,
         };
         peer.in_flight = next;
         if next.is_none() {
@@ -827,11 +851,15 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         drained
     }
 
+    /// Starts a contact with `addr`. A repeat `Contact` for a known peer
+    /// starts a new contact too: the F6 pin and the per-contact records
+    /// (bounces, broadcast receipts) reset.
     fn add_peer(&mut self, addr: A) {
-        if self.peers.iter().any(|p| p.addr == addr) {
+        self.forget_contact(&addr);
+        if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == addr) {
+            peer.id = None;
             return;
         }
-        self.forget_bounces(&addr);
         if self.peers.len() < consts::MAX_PEERS {
             let _ = self.peers.push(Peer::new(addr));
         }
@@ -841,16 +869,21 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         if let Some(idx) = self.peers.iter().position(|p| p.addr == *addr) {
             self.peers.remove(idx);
         }
-        // F13: purge any pending acks to the removed peer so their ids are
-        // never acked again under this contact.
-        self.acks.clear();
-        self.bcast_acks.clear();
-        self.forget_bounces(addr);
+        // F13: purge the removed peer's pending acks (only its own) so their
+        // ids are never acked again under this contact.
+        self.acks.retain_other(addr);
+        self.bcast_acks.retain_other(addr);
+        if self.ack_undo.as_ref().is_some_and(|u| u.addr == *addr) {
+            self.ack_undo = None;
+        }
+        self.forget_contact(addr);
     }
 
-    /// Drops the bounce records for `addr`: suppression lasts one contact.
-    fn forget_bounces(&mut self, addr: &A) {
+    /// Drops the per-contact records for `addr` — bounce suppression and
+    /// broadcast receipts last one contact.
+    fn forget_contact(&mut self, addr: &A) {
         self.bounce.retain(|(_, baddr, _)| baddr != addr);
+        self.bcast_sent.retain(|(_, baddr)| baddr != addr);
     }
 
     /// Returns the index of the peer at `addr`, adding it as an implicit
@@ -860,7 +893,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
             return Some(idx);
         }
         if self.peers.len() < consts::MAX_PEERS {
-            self.forget_bounces(addr);
+            self.forget_contact(addr);
             let _ = self.peers.push(Peer::new(addr.clone()));
             return Some(self.peers.len() - 1);
         }
@@ -2789,7 +2822,10 @@ mod tests {
     /// `next_frame` until an Obs carrying `id` goes out. The emit path records
     /// the Sent bounce (addressed) or the `bcast_sent` entry (broadcast).
     fn deliver_to(ex: &mut Exchange<u8>, store: &mut MemStore, addr: u8, id: ObservationId) {
-        ex.on_event(Event::Contact(addr), store, 0);
+        // A repeat Contact would start a new contact; only contact a new peer.
+        if !ex.peers.iter().any(|p| p.addr == addr) {
+            ex.on_event(Event::Contact(addr), store, 0);
+        }
         empty_summary(ex, store, addr, [2; 16]);
         for _ in 0..consts::MAX_FRAME {
             if matches!(
@@ -3728,6 +3764,187 @@ mod tests {
         assert!(
             !carries(&frames, x_id),
             "an expired addressed id must never be sent"
+        );
+    }
+
+    /// S9 (F13): losing one peer purges only that peer's pending acks; the
+    /// acks owed to every other peer survive.
+    #[test]
+    fn lost_peer_purges_only_its_own_pending_acks() {
+        let a: NodeId = [2; 16];
+        let b: NodeId = [5; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        // Each peer sends a broadcast and an addressed observation.
+        for (addr, from) in [(1u8, a), (2u8, b)] {
+            let bc = Frame::Obs {
+                from,
+                obs: obs(from, 1, 0, None, b"t", b"bc"),
+            };
+            ex.on_event(Event::Frame(addr, frame_bytes(&bc)), &mut store, 0);
+            let ad = Frame::Obs {
+                from,
+                obs: observed_addressed(from, 2, ME, b"t", b"ad"),
+            };
+            ex.on_event(Event::Frame(addr, frame_bytes(&ad)), &mut store, 0);
+        }
+        assert_eq!(ex.bcast_acks.len(), 2);
+        assert_eq!(ex.acks.len(), 2);
+
+        ex.on_event(Event::Lost(1), &mut store, 0);
+        assert!(
+            ex.bcast_acks.entries.iter().all(|(_, addr)| *addr == 2) && ex.bcast_acks.len() == 1,
+            "only the lost peer's broadcast acks are purged"
+        );
+        assert!(
+            ex.acks.entries.iter().all(|(_, addr)| *addr == 2) && ex.acks.len() == 1,
+            "only the lost peer's addressed acks are purged"
+        );
+    }
+
+    /// Whether draining `ex` yields a `Delivered` for `id`.
+    fn delivered(ex: &mut Exchange<u8>, id: ObservationId) -> bool {
+        ex.drain_events()
+            .iter()
+            .any(|e| matches!(e, NodeEvent::Delivered { id: d, .. } if *d == id))
+    }
+
+    /// S10: a broadcast receipt counts only for this contact. After `Lost`
+    /// and a fresh `Contact`, an `Ack` for a broadcast sent last contact fires
+    /// no `Delivered`.
+    #[test]
+    fn broadcast_ack_is_not_accepted_from_a_previous_contact() {
+        let peer: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let b = obs([3; 16], 1, 0, None, b"t", b"bc");
+        let b_id = b.id();
+        store.insert(b, 0).unwrap();
+        deliver_to(&mut ex, &mut store, 1, b_id);
+
+        ex.on_event(Event::Lost(1), &mut store, 0);
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        let ack = Frame::Ack {
+            from: peer,
+            ids: heapless::Vec::from_slice(&[b_id]).unwrap(),
+        };
+        ex.on_event(Event::Frame(1, frame_bytes(&ack)), &mut store, 0);
+        assert!(
+            !delivered(&mut ex, b_id),
+            "a receipt for last contact's broadcast is not accepted"
+        );
+    }
+
+    /// S10: a repeat `Contact` (no `Lost` in between) also starts a new
+    /// contact for broadcast receipts.
+    #[test]
+    fn broadcast_ack_is_not_accepted_after_a_repeat_contact() {
+        let peer: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let b = obs([3; 16], 1, 0, None, b"t", b"bc");
+        let b_id = b.id();
+        store.insert(b, 0).unwrap();
+        deliver_to(&mut ex, &mut store, 1, b_id);
+
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        let ack = Frame::Ack {
+            from: peer,
+            ids: heapless::Vec::from_slice(&[b_id]).unwrap(),
+        };
+        ex.on_event(Event::Frame(1, frame_bytes(&ack)), &mut store, 0);
+        assert!(
+            !delivered(&mut ex, b_id),
+            "a repeat Contact starts a new contact for receipts"
+        );
+    }
+
+    /// S10: a broadcast whose send failed was never dispatched, so its
+    /// receipt is not accepted.
+    #[test]
+    fn failed_broadcast_send_is_not_confirmed() {
+        let peer: NodeId = [2; 16];
+        for err in [SendError::Busy, SendError::TooLarge] {
+            let mut ex = Exchange::new(ME);
+            let mut store = MemStore::new();
+            let b = obs([3; 16], 1, 0, None, b"t", b"bc");
+            let b_id = b.id();
+            store.insert(b, 0).unwrap();
+            empty_summary(&mut ex, &mut store, 1, peer);
+            // Poll until the broadcast goes out, then fail its send.
+            let mut sent = false;
+            for _ in 0..consts::MAX_FRAME {
+                if matches!(
+                    poll_frame(&mut ex, &store, consts::MAX_FRAME, 0),
+                    Some((_, Frame::Obs { obs, .. }, _)) if obs.id() == b_id
+                ) {
+                    sent = true;
+                    break;
+                }
+            }
+            assert!(sent);
+            ex.on_send_error(&err);
+
+            let ack = Frame::Ack {
+                from: peer,
+                ids: heapless::Vec::from_slice(&[b_id]).unwrap(),
+            };
+            ex.on_event(Event::Frame(1, frame_bytes(&ack)), &mut store, 0);
+            assert!(
+                !delivered(&mut ex, b_id),
+                "a broadcast that failed with {err:?} is not confirmed"
+            );
+        }
+    }
+
+    /// F6: a repeat `Contact` resets the pin, so the next frame's sender is
+    /// pinned afresh rather than dropped as `IdentityChanged`.
+    #[test]
+    fn repeat_contact_resets_identity_pin() {
+        let a: NodeId = [2; 16];
+        let b: NodeId = [9; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        let f1 = Frame::Obs {
+            from: a,
+            obs: obs(a, 1, 0, None, b"t", b"x"),
+        };
+        ex.on_event(Event::Frame(1, frame_bytes(&f1)), &mut store, 0);
+        assert_eq!(ex.peers()[0].id, Some(a));
+
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        let f2 = Frame::Obs {
+            from: b,
+            obs: obs(b, 1, 0, None, b"t", b"y"),
+        };
+        assert!(
+            ex.on_event(Event::Frame(1, frame_bytes(&f2)), &mut store, 0)
+                .is_some(),
+            "after a repeat Contact the new sender's frame is accepted"
+        );
+        assert_eq!(ex.peers()[0].id, Some(b), "the pin was reset");
+        assert!(ex.drain_events().is_empty(), "no IdentityChanged drop");
+    }
+
+    /// F6: a repeat `Contact` drops the per-contact bounce records, so an
+    /// addressed id received from the peer last contact may be offered back.
+    #[test]
+    fn repeat_contact_resets_bounce_records() {
+        let a: NodeId = [2; 16];
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        empty_summary(&mut ex, &mut store, 1, a);
+        // `a` hands us an addressed message for a third node.
+        let x = observed_addressed([7; 16], 1, [8; 16], b"t", b"x");
+        let x_id = x.id();
+        let f = Frame::Obs { from: a, obs: x };
+        ex.on_event(Event::Frame(1, frame_bytes(&f)), &mut store, 0);
+        assert!(is_sourced(&ex.bounce, x_id, &1u8));
+
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        assert!(
+            !is_sourced(&ex.bounce, x_id, &1u8),
+            "a repeat Contact forgets the previous contact's bounce records"
         );
     }
 }
