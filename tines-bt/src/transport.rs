@@ -32,8 +32,9 @@
 //!
 //! Up to [`MAX_PEERS`] connections may be live at once, one per bound
 //! [`NodeId`]. A second connection to the same [`NodeId`] replaces the first.
-//! The configured `peer` becomes an optional allowlist; empty means "any tines
-//! advertiser".
+//! Today the allowlist is exactly the configured `peer`, and frames and events
+//! from any other peer are dropped; an optional allowlist (empty meaning "any
+//! tines advertiser") is still to come (THREAT_MODEL.md F3).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{
@@ -266,9 +267,9 @@ impl BluerRadio {
     /// Start the `bluer`/BlueZ radio for a connection between `me` (this
     /// device) and `peer` (the peer's advertised [`NodeId`]).
     ///
-    /// `peer` is this node's allowlist: only that NodeId's connections are
-    /// accepted. With an empty allowlist the transport accepts any tines
-    /// advertiser.
+    /// `peer` is this node's whole allowlist: only that NodeId's connections
+    /// are accepted. (The radio loop treats an empty allowlist as "any tines
+    /// advertiser", but `new` never builds one; THREAT_MODEL.md F3.)
     pub fn new(me: NodeId, peer: NodeId) -> Self {
         let (event_tx, event_rx) = async_mpsc::unbounded_channel::<RadioEvent>();
         let (send_tx, send_rx) = async_mpsc::unbounded_channel::<(NodeId, Vec<u8>)>();

@@ -266,9 +266,9 @@ where
         }
     }
 
-    // On a schedule: trim stale observations and flush the store. Flush is
-    // `LogStore::flush`, reached through `Node::flush(now)`, which delegates to
-    // `Store::flush` — the infallible durability boundary.
+    // On a schedule: trim stale observations and flush the store. `Node::flush`
+    // delegates to `LogStore`'s `Store::flush` impl, the durability point; a
+    // failure is logged and the next scheduled flush retries.
     if host.rounds >= POLL_CAP {
         host.rounds = 0;
         node.trim(&TrimPolicy::default(), host.clock.now());

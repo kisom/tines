@@ -1,4 +1,30 @@
 //! tines-core: content-defined Observation identity and shared-memory core.
+//!
+//! # Stability
+//!
+//! tines-core 1.0 guarantees, within the 1.x line:
+//!
+//! - **Wire:** every 1.x release speaks wire v1 ([`consts::WIRE_VERSION`]).
+//!   Only new optional frame variants may be added, plus new [`SigAlgo`] ids
+//!   and signature versions within the 64-byte [`consts::MAX_SIG`] budget. A
+//!   wire-v2 change, including any post-quantum signature or a
+//!   [`consts::MAX_FRAME`] above 1500, ships as tines-core 2.0.
+//! - **Identity:** [`Observation::id`] never changes within a major version,
+//!   and should not change across majors unless the hash itself is broken.
+//! - **API:** standard semver; MSRV bumps are minor. Public types are
+//!   `#[non_exhaustive]` where they may grow. A method added to [`Store`],
+//!   [`Transport`] or [`BeliefPolicy`] after 1.0 must have a default whose
+//!   behaviour is safe: it may lose performance or telemetry, never data or
+//!   custody. Wall-clock folds live in the opt-in [`WallClockStore`] trait,
+//!   not in [`Store`]. The `#[doc(hidden)]` `conformance` module is not part
+//!   of the API.
+//! - **Local behaviour** (capacities, timings, scheduling order, which
+//!   candidate goes first) can change in a minor release as long as the
+//!   protocol properties hold: custody always keeps at least one holder,
+//!   receipts never shorten world state, and every frame fits
+//!   [`Transport::mtu`]. That's why the local constants are crate-private.
+//! - **Signatures:** 1.0 carries them ([`Observation::sig`]); 1.1 signs and
+//!   verifies them, without breaking the wire or the API.
 #![no_std]
 #![deny(missing_docs)]
 
