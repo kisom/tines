@@ -178,8 +178,10 @@ impl Reassembler {
             total += l;
         }
 
-        match postcard::from_bytes::<Observation>(&recon[..total]) {
-            Ok(obs) if obs.id() == id => {
+        // Require a canonical encoding (F13): the reassembled bytes must be
+        // exactly one observation, with no trailing bytes.
+        match postcard::take_from_bytes::<Observation>(&recon[..total]) {
+            Ok((obs, rest)) if rest.is_empty() && obs.id() == id => {
                 self.reset_slot();
                 Some(obs)
             }
@@ -576,6 +578,39 @@ mod tests {
             last = r.feed(*id, *index, *count, data, 0);
         }
         assert!(last.is_none(), "corrupted reassembly must not yield an obs");
+    }
+
+    /// F13: a reassembled observation must decode canonically. The
+    /// observation's encoding followed by one trailing byte is rejected even
+    /// though its prefix decodes to the right id.
+    #[test]
+    fn reassembled_trailing_byte_is_rejected() {
+        let obs = obs_with_payload([8; 16], 1024);
+        let mut buf = [0u8; consts::MAX_FRAME * 2];
+        let mut bytes = postcard::to_slice(&obs, &mut buf).unwrap().to_vec();
+        bytes.push(0);
+        let id = obs.id();
+        let chunk = 600;
+        let count = bytes.len().div_ceil(chunk) as u8;
+        let mut r = Reassembler::new();
+        let mut last = None;
+        for (i, data) in bytes.chunks(chunk).enumerate() {
+            last = r.feed(id, i as u8, count, data, 0);
+        }
+        assert!(
+            last.is_none(),
+            "trailing bytes after the observation are malformed"
+        );
+
+        // Without the trailing byte the same stream reassembles.
+        bytes.pop();
+        let count = bytes.len().div_ceil(chunk) as u8;
+        let mut r = Reassembler::new();
+        let mut last = None;
+        for (i, data) in bytes.chunks(chunk).enumerate() {
+            last = r.feed(id, i as u8, count, data, 0);
+        }
+        assert_eq!(last, Some(obs));
     }
 
     #[test]
