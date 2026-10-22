@@ -7,7 +7,7 @@ description = "Standalone tines service: hosts a tines Node over a Unix-domain-s
 authors.workspace = true
 repository.workspace = true
 readme.workspace = true
-keywords = ["robotics", "delay-tolerant", "science::robotics", "ipc", "ble"]
+keywords = ["robotics", "delay-tolerant", "ipc", "ble"]
 categories = ["science::robotics", "network-programming"]
 
 [dependencies]
