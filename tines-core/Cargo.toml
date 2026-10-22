@@ -26,3 +26,10 @@ heapless = { version = "0.8", features = ["serde"] }
 serde = { version = "1", default-features = false, features = ["derive"] }
 postcard = { version = "1", default-features = false }
 blake2 = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+proptest = "1"
+# The fuzz harness lives in `fuzz/` (outside this crate) but is compiled into
+# the test suite via a `#[path]` module include to keep it the SAME harness.
+# That source names `heapless` directly, so restate it here for the twin.
+heapless = { version = "0.8", features = ["serde"] }

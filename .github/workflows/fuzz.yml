@@ -1,0 +1,52 @@
+# Fuzzing lives on `cargo fuzz`, which needs a nightly toolchain and must never
+# be part of the stable `cargo clippy --workspace` gate in ci.yml. This workflow
+# is therefore SCHEDULED (not a PR push/PR gate) and runs against the corpus
+# that is checked into this repo under `fuzz/corpus/node/`.
+#
+# The 24 CPU-hour budget mentioned in Task 12 is release-time; this scheduled run
+# uses a modest per-run budget so it stays cheap while still re-executing every
+# known input and continuing to grow the corpus.
+
+name: Fuzz
+
+on:
+  schedule:
+    # Daily at 00:05 UTC. Deliberately not push/PR — the nightly + cargo-fuzz
+    # toolchain is slow to install/build and has no place in a review gate.
+    - cron: "5 0 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz-node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The corpus is committed, so the run continues where it left off and
+          # re-runs every known crashing/non-crashing input on each schedule.
+          fetch-depth: 0
+
+      - name: Install nightly toolchain + cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+          rustup default nightly
+          cargo install cargo-fuzz
+
+      - name: Run the Node harness against the checked-in corpus
+        # Re-runs every corpus entry (fast path) and then continues fuzzing for
+        # the run budget. The corpus directory is part of the repo, so it grows
+        # in place across schedules; a fresh checkout still has prior inputs.
+        run: cargo fuzz run node -- -max_total_time=1800
+
+      - name: Upload corpus artifacts (optional retention)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-node
+          path: fuzz/corpus/node/
+          if-no-files-found: ignore
+          retention-days: 7

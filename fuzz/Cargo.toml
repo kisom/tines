@@ -1,0 +1,28 @@
+[package]
+name = "fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# cargo-fuzz needs this marker to treat the crate as a fuzzer root (rather than
+# erroring that it does not look like a cargo-fuzz manifest).
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+tines-core = { path = "../tines-core", version = "0.3.0", features = ["conformance"] }
+libfuzzer-sys = "0.4"
+heapless = "0.8"
+
+# The fuzz target is exposed as an explicit nightly release bin so cargo-fuzz can
+# find it (`cargo fuzz run node`). Without a [[bin]] entry cargo reports "no bin
+# target named node"; each file in fuzz_targets/ maps to one such [[bin]].
+[[bin]]
+name = "node"
+path = "fuzz_targets/node.rs"
+
+[features]
+default = ["conformance"]
+conformance = ["tines-core/conformance"]
+
+[workspace]

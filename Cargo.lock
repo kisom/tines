@@ -1491,6 +1491,7 @@ dependencies = [
  "blake2",
  "heapless 0.8.0",
  "postcard",
+ "proptest",
  "serde",
 ]
 
