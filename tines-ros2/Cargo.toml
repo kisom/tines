@@ -21,12 +21,12 @@ ros2 = ["dep:rclrs", "dep:ros-env", "dep:tines"]
 
 [dependencies]
 tines-core = { path = "../tines-core", version = "1" }
-tines-store = { path = "../tines-store", version = "0.3.0" }
-tines-bt = { path = "../tines-bt", version = "0.3.0" }
+tines-store = { path = "../tines-store", version = "0.4.0" }
+tines-bt = { path = "../tines-bt", version = "0.4.0" }
 # The host's wall-clock abstraction (`HostClock`) and the trusted-time state
 # machine it drives. Only needed behind the `ros2` feature — `TinesNode` is the
 # only consumer and that is compiled only with `ros2` — so keep it optional.
-tines = { path = "../tines", version = "0.3.0", optional = true }
+tines = { path = "../tines", version = "0.4.0", optional = true }
 rclrs = { version = "0.8", optional = true }
 # ros_env provides the ROS 2 message types (std_msgs, including
 # UInt8MultiArray) by include!()ing the generated crates from

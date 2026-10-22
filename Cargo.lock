@@ -1462,7 +1462,7 @@ dependencies = [
 
 [[package]]
 name = "tines"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "heapless 0.8.0",
  "postcard",
@@ -1475,7 +1475,7 @@ dependencies = [
 
 [[package]]
 name = "tines-bt"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bluer",
  "futures",
@@ -1497,7 +1497,7 @@ dependencies = [
 
 [[package]]
 name = "tines-ros2"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "rclrs",
  "ros-env",
@@ -1509,7 +1509,7 @@ dependencies = [
 
 [[package]]
 name = "tines-sim"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "proptest",
  "rand 0.8.8",
@@ -1518,7 +1518,7 @@ dependencies = [
 
 [[package]]
 name = "tines-store"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "postcard",
  "serde",
