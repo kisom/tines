@@ -219,8 +219,13 @@ impl<S: Store, T: Transport> Node<S, T> {
         &self.store
     }
 
-    /// Lift the quarantine on held observations once the host has trusted wall
-    /// time, by folding the wall clock into a [`WallClockStore`] backend.
+    /// Pass trusted wall time (ms since the Unix epoch) to a
+    /// [`WallClockStore`] backend, which folds the downtime into what it held
+    /// at start-up and lifts its quarantine (see [`WallClockStore`]).
+    ///
+    /// Call it once, when the host first has trusted time. A second call is a
+    /// no-op that returns the first fold's report. Core forwards the value and
+    /// never reads it.
     pub fn set_wall_clock(&mut self, wall_now: u64, now: Tick) -> <S as WallClockStore>::FoldReport
     where
         S: WallClockStore,
@@ -228,8 +233,11 @@ impl<S: Store, T: Transport> Node<S, T> {
         self.store.set_wall_clock(wall_now, now)
     }
 
-    /// Best estimate of trusted wall time from a peer's observation, if the
-    /// backend supports it (see [`WallClockStore`]).
+    /// The backend's estimate of the current wall time from peers'
+    /// observations, if any (see [`WallClockStore::peer_time_estimate`]).
+    ///
+    /// Peer time is unauthenticated until 1.1: bound the estimate before
+    /// passing it to [`Self::set_wall_clock`].
     pub fn peer_time_estimate(&self, now: Tick) -> Option<u64>
     where
         S: WallClockStore,
@@ -237,13 +245,16 @@ impl<S: Store, T: Transport> Node<S, T> {
         self.store.peer_time_estimate(now)
     }
 
-    /// Best-effort durability flush, advancing each stored observation's age
-    /// up to `now`.
+    /// Flush the store: its durability point (see [`Store::flush`]).
     ///
-    /// This is the durability boundary a host reaches on its flush schedule —
-    /// delegates to [`Store::flush`], so it is infallible by contract: a failed
-    /// flush is, at worst, a duplicate custodian on the next exchange, never a
-    /// lost message.
+    /// Everything inserted, released or trimmed so far becomes durable, and
+    /// `now` becomes the time anchor for ages after a restart. Flushing twice
+    /// is harmless, and a `now` earlier than the last anchor is clamped to it.
+    /// A failure returns [`StoreError::Backend`] and leaves the node and its
+    /// store usable, so the application can retry on its next flush.
+    ///
+    /// Core never flushes on its own: the application decides how often,
+    /// like `poll` and `trim`. On flash, every flush costs wear.
     pub fn flush(&mut self, now: Tick) -> Result<(), StoreError> {
         self.store.flush(now)
     }

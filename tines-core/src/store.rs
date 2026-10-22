@@ -107,14 +107,27 @@ pub trait Store {
     /// re-inserting them later is accepted.
     fn trim(&mut self, policy: &TrimPolicy, now: Tick) -> usize;
 
-    /// Best-effort durability flush, advancing each stored observation's age
-    /// up to the caller's `now` and recording `now` as the flush clock.
+    /// The store's durability point.
     ///
-    /// Flush must not lose messages, must never resurrect a released message,
-    /// and is infallible by contract: a failed flush is, at worst, a
-    /// duplicate custodian on the next exchange — never a lost message.
-    /// Backends that cannot persist more cheaply default to a no-op that
-    /// simply returns `Ok(())`.
+    /// A flush does two things:
+    /// - everything inserted, released or trimmed so far becomes durable;
+    /// - `now` becomes the time anchor for ages after a restart, so a
+    ///   persistent backend can count the time between this flush and the
+    ///   restart into each age.
+    ///
+    /// More of the contract:
+    /// - Flushing twice is harmless.
+    /// - A `now` earlier than the last anchor is clamped to it.
+    /// - A flush doesn't change any age [`Self::get`] reports at `now` or
+    ///   later, evict anything, or undo a release.
+    /// - A failure returns [`StoreError::Backend`] and leaves the store
+    ///   usable. What wasn't made durable is at risk only if the process
+    ///   then stops before a later flush succeeds.
+    /// - The application decides when to flush; core never calls `flush`
+    ///   itself. On flash, every flush costs wear.
+    ///
+    /// The default does nothing and returns `Ok(())`, which is correct for a
+    /// store that holds nothing across a restart, such as `MemStore`.
     fn flush(&mut self, now: Tick) -> Result<(), StoreError> {
         let _ = now;
         Ok(())
@@ -128,24 +141,38 @@ pub(crate) fn current_age(obs: &Observation, stored_at: Tick, now: Tick) -> u64 
     obs.age_ms.saturating_add(now.saturating_sub(stored_at))
 }
 
-/// A [`Store`] that a host can feed trusted wall-clock time into.
+/// A [`Store`] that holds data across power-off and can take trusted wall
+/// time from the host (spec §9, decision H).
 ///
-/// tines-core itself never deals with wall time — this trait is a host-facing
-/// hook so a host can lift the quarantine on observations held across a
-/// power-off, and estimate trusted time from a peer's observation, without a
-/// general `&mut Store` backdoor (decision F in the spec). Only backends that
-/// support a wall-clock fold implement it; `MemStore` and other pure-tick
-/// stores do not.
+/// A store that has been powered off can't tell how long it was off from
+/// ticks alone, which restart on every boot. A backend that implements this
+/// trait holds back what it loaded at start-up (its *quarantine*: not
+/// offered, delivered or acked, but still deduped) until the host has
+/// trusted wall time, then folds the downtime into those ages. Core never
+/// reads or interprets a wall time: this trait only carries the host's value
+/// to the backend, and the backend's estimate back to the host. Hosts reach
+/// it through [`Node::set_wall_clock`](crate::Node::set_wall_clock) and
+/// [`Node::peer_time_estimate`](crate::Node::peer_time_estimate), so no
+/// `&mut Store` escapes the facade. Only backends that hold data across
+/// power-off implement it; `MemStore` doesn't.
 pub trait WallClockStore: Store {
-    /// Summary of a wall-clock fold, for the host's logs.
+    /// The backend's summary of what a fold did, for the host's logs.
     type FoldReport;
 
-    /// Fold trusted wall time into the store, lifting the quarantine on held
-    /// observations. The host calls this exactly once, on the first trusted
-    /// time.
+    /// Fold trusted wall time into the store: `wall_now` is the host's
+    /// trusted wall time in ms since the Unix epoch, and `now` the current
+    /// tick. Lifts the quarantine on what the store held at start-up.
+    ///
+    /// The fold runs once, when the host first has trusted time. A second
+    /// call is a no-op that returns the first fold's report.
     fn set_wall_clock(&mut self, wall_now: u64, now: Tick) -> Self::FoldReport;
 
-    /// Best estimate of trusted wall time from a peer's observation stored
-    /// since the last open, if any. `None` means stay quarantined.
+    /// An estimate of the current wall time (ms since the Unix epoch) from
+    /// peers' observations stored since start-up that carry `observed_at`,
+    /// or `None` if there are none yet.
+    ///
+    /// Peer time is unauthenticated until 1.1: a peer can claim any
+    /// `observed_at`, so the host bounds the estimate before it passes it to
+    /// [`Self::set_wall_clock`].
     fn peer_time_estimate(&self, now: Tick) -> Option<u64>;
 }

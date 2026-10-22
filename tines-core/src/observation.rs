@@ -46,13 +46,17 @@ pub struct Observation {
     pub observer: NodeId,
     /// The observer's per-observation sequence number.
     pub seq: u64,
-    /// The observer's elapsed time for this observation, in ms.
+    /// How long ago the observation was made, in ms: a *lower bound* on its
+    /// true age.
     ///
-    /// This is a *lower bound* on the observation's true age: it counts time
-    /// only while the observer's clock runs. Time the host spent powered off is
-    /// recovered when the store is opened (see [`Self::observed_at`]); the time
-    /// in an un-flushed crash window is bounded by the host's flush cadence,
-    /// and in-flight time is negligible. Relays never advance it.
+    /// Every holder advances it by the time the observation spends in its
+    /// store, so it counts the time spent on running clocks. It misses time a
+    /// holder was powered off until the holder's store recovers it from a
+    /// trusted wall clock, time between a holder's last flush and a crash, and
+    /// time in flight. Every error makes an observation look younger, never
+    /// older.
+    ///
+    /// For absolute time, use [`Self::observed_at`].
     pub age_ms: u64,
     /// The observer's wall-clock time, in ms since the Unix epoch (UTC), when
     /// this observation was published, or `None` if the observer has no
