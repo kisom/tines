@@ -201,23 +201,54 @@ pub fn no_tombstones<S: Store>(mut make: impl FnMut() -> S) {
     assert_eq!(store.len(), 1);
 }
 
-/// Flushing twice is safe: it must not error and must not evict, and age must
-/// keep advancing afterwards.
+/// The in-process half of the `flush` contract (spec §4): flushing twice is
+/// harmless, a flush neither evicts nor changes a reported age, a release
+/// survives it, the store stays usable afterwards, and a `now` earlier than
+/// the last anchor is clamped rather than moving any age backwards or
+/// forwards.
+///
+/// What a flush makes durable can only be checked across a restart, which
+/// this `std`-free suite can't do; a persistent backend tests that itself
+/// (`tines-store` does, through the trait and through `Node::flush`).
 pub fn idempotent_flush<S: Store>(mut make: impl FnMut() -> S) {
     let mut store = make();
     let fresh = signed_obs(1, b"t", &[1u8; 8]);
     let id = fresh.id();
     store.insert(fresh, 1000).unwrap();
+    assert!(store.flush(2000).is_ok(), "the first flush succeeds");
     assert!(
         store.flush(2000).is_ok(),
-        "the first flush is a best-effort success"
-    );
-    assert!(
-        store.flush(2000).is_ok(),
-        "the second flush is a no-op that still succeeds"
+        "a second flush at the same tick is harmless"
     );
     assert!(store.contains(&id), "flush does not evict");
     assert_eq!(store.len(), 1);
     let got = store.get(&id, 2500).unwrap();
     assert_eq!(got.age_ms, 1500, "age keeps advancing past a flush");
+
+    // An earlier `now` is clamped to the last anchor: no age changes.
+    assert!(store.flush(1500).is_ok(), "an earlier now is not an error");
+    assert_eq!(store.get(&id, 2500).unwrap().age_ms, 1500);
+
+    // An observation stored after the anchor isn't aged by a flush whose
+    // `now` is behind its insert tick.
+    let later = signed_obs(2, b"t", &[2u8; 8]);
+    let later_id = later.id();
+    store.insert(later, 5000).unwrap();
+    assert!(store.flush(3000).is_ok());
+    assert_eq!(
+        store.get(&later_id, 5000).unwrap().age_ms,
+        0,
+        "a flush never moves an insert tick backwards"
+    );
+
+    // A release survives a flush, and the store is still usable after it.
+    store.release(&id);
+    assert!(store.flush(6000).is_ok());
+    assert!(store.is_released(&id), "a flush keeps a release");
+    let third = signed_obs(3, b"t", &[3u8; 8]);
+    assert!(
+        store.insert(third, 6000).unwrap(),
+        "the store accepts inserts after a flush"
+    );
+    assert_eq!(store.len(), 3);
 }
