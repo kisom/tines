@@ -232,7 +232,7 @@ fn bounce_scenario() -> impl Strategy<Value = BounceScenario> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 16, .. ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: 64, .. ProptestConfig::default() })]
 
     /// Every connected component of the contact graph must be fully gossiped by
     /// the end of the trace. Tested at `loss = 0`: the spec's convergence is
@@ -465,6 +465,13 @@ proptest! {
             recipient_idx = nodes.saturating_sub(1)
         );
     }
+}
+
+proptest! {
+    // Each case floods an 8-node world with 257..=288 addressed observations,
+    // so this property gets its own, smaller case count rather than lowering
+    // the shared one above.
+    #![proptest_config(ProptestConfig { cases: 16, .. ProptestConfig::default() })]
 
     /// The shared bounce table (`SEND_QUEUE_CAP` entries, drop-oldest, shared
     /// across all `MAX_PEERS` peers) overflows when more than its capacity of
@@ -543,5 +550,22 @@ proptest! {
                  the custody cursor starved it after the bounce table overflowed",
             );
         }
+
+        // (c) the table really overflowed, so (a) and (b) tested something.
+        // Core keeps a bounce record until that peer's contact changes, and
+        // this trace is a single contact window, so each id that left node 0
+        // put a `Sent` record into node 0's table within one contact. Only
+        // node 0 ever originated these ids, so any id another node holds left
+        // node 0. More than SEND_QUEUE_CAP of them means node 0's table had to
+        // evict.
+        let left_node_0 = ids
+            .iter()
+            .filter(|(_, id)| sim.nodes[1..].iter().any(|n| n.store().contains(id)))
+            .count();
+        prop_assert!(
+            left_node_0 > SEND_QUEUE_CAP,
+            "only {left_node_0} ids left node 0 (SEND_QUEUE_CAP={SEND_QUEUE_CAP}); \
+             the bounce table never overflowed, so this case tested nothing",
+        );
     }
 }
