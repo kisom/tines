@@ -30,9 +30,11 @@
 //!   incremented on every open. `first_seq() = boot_count << 32`, which is
 //!   core's documented contract; a resumed node therefore never reuses a
 //!   sequence number.
-//! * `Record::Clock` — a tick marker written by [`LogStore::flush`]. On load
-//!   each live observation's age is folded up to the last clock marker so
-//!   pre-reboot elapsed time is recovered (see [`LogStore::open`]).
+//! * `Record::Clock` — a tick marker written by `flush` (the [`Store::flush`]
+//!   impl) and at the end of every snapshot, with a wall time once trusted
+//!   time is set. On load each live observation's age is folded up to the
+//!   last clock marker so pre-reboot elapsed time is recovered (see
+//!   [`LogStore::open`]).
 //!
 //! On load the index is rebuilt by replaying the log, then every age is
 //! rebased to load time: each entry's `age_ms` is folded by the time elapsed
@@ -44,39 +46,64 @@
 //! reboot instead of freezing at (and under-counting from) their pre-shutdown
 //! value.
 //!
+//! Snapshots (spec §9, decision I)
+//!
+//! A `stored_at` is a tick from the boot that wrote it, so an append-only log
+//! would mix tick domains across boots, and the fold's results would live only
+//! in memory. So the log is rewritten as a snapshot at two points: at the end
+//! of [`LogStore::open`] (after the tick fold) and at the end of
+//! [`LogStore::set_wall_clock`]. A snapshot is the header, the current `Boot`
+//! record, every live observation with its current age and `stored_at = now`,
+//! a `Release` record for every released id still held, and a closing clock
+//! marker at `now` (with the wall time after `set_wall_clock`, none at open).
+//! It holds no trimmed records. Every `stored_at` on disk then belongs to the
+//! current boot, and the fold's results (expiries, floors, known-downtime
+//! advances) are durable.
+//!
 //! Crash recovery & robustness
 //!
 //! * Framing & checksums. Every record carries a [`SYNC_MARKER`] and a CRC-32C
 //!   over its body, so any corruption is detectable rather than silently
 //!   misparsed.
-//! * Torn trailing records. The log is append-only, so a crash mid-append can
-//!   leave a partial trailing record — a header whose body ran past
-//!   end-of-file — or a bit-roted/corrupt record. [`LogStore::open`] recovers
-//!   by scanning for the next well-formed record: a record whose marker,
-//!   length, CRC or body-decode is bad is *skipped* (scan forward for the next
-//!   `SYNC_MARKER` and verify its CRC before accepting it), and the bytes
-//!   leading up to it are dropped. Only bad bytes at the very end, with no
-//!   valid record after them, count as a torn tail; a torn tail is truncated
-//!   and the file and its directory are fsynced.
+//! * Torn trailing records. Between snapshots the log is append-only, so a
+//!   crash mid-append can leave a partial trailing record — a header whose
+//!   body ran past end-of-file — or a bit-roted/corrupt record.
+//!   [`LogStore::open`] recovers by scanning for the next well-formed record: a
+//!   record whose marker, length, CRC or body-decode is bad is *skipped* (scan
+//!   forward for the next `SYNC_MARKER` and verify its CRC before accepting
+//!   it), and the bytes leading up to it are dropped. Only bad bytes at the
+//!   very end, with no valid record after them, count as a torn tail. The open
+//!   snapshot rewrites the log without either.
+//! * Snapshots are atomic. A snapshot is written to a temporary file in the
+//!   log's directory, fsynced, renamed over the log, and then the directory is
+//!   fsynced. A crash before the rename leaves the old log intact (the next
+//!   open repeats the same fold and removes the leftover temporary file);
+//!   after it, the snapshot is the log.
+//! * Torn first header. A file shorter than the header that starts with the
+//!   magic was torn while the log was first created; it holds no records, so
+//!   it opens as a new log. Any other short file is refused.
 //! * Write cap. `write_record` refuses a record over [`MAX_RECORD_BYTES`], so
 //!   the writer can no longer produce a record the reader rejects.
 //!
-//! * Durability contract. `flush()` appends a `Record::Clock` and `sync_all`s,
-//!   making the appended observation and release records durable across a power
-//!   loss. `insert`, `release`, and `trim` update the in-memory index and (for
-//!   `insert`/`trim`) append records, but those records reach disk only on the
-//!   next `flush()`. Hosts that need crash durability must `flush()` before
-//!   shutdown (see the durability contract in the module docs). `release`, by
-//!   contrast, appends its `Release` record immediately (best-effort: an append
-//!   error is logged), so a single release is durable across a kill-without-flush
-//!   without waiting for a flush.
+//! * Durability contract. `flush(now)` appends a `Record::Clock` and
+//!   `sync_all`s, making the appended observation and release records durable
+//!   across a power loss. `insert`, `release`, and `trim` update the in-memory
+//!   index and append records, but those records are durable across a power
+//!   loss only after the next flush (or snapshot). Hosts that need crash
+//!   durability must flush before shutdown. `release` appends its `Release`
+//!   record immediately (best-effort: an append error is logged), so a release
+//!   survives a process kill without waiting for a flush.
 //!
 //! Isolation & integrity
 //!
-//! * Exclusive lock. `open` takes an exclusive `File::try_lock`; a second
-//!   opener gets a clear error instead of interleaving on the same file.
-//! * Permissions. The log file is created mode `0600` and its parent directory
-//!   (created if missing) mode `0700`.
+//! * Exclusive lock. `open` takes an exclusive `File::try_lock` on the log
+//!   file; a second opener gets a clear error instead of interleaving on the
+//!   same file. A snapshot locks its temporary file before renaming it over
+//!   the log, so the file at the log's path stays locked while the store is
+//!   alive, and an opener that locked a file a snapshot just replaced notices
+//!   and retries on the new one.
+//! * Permissions. The log file (and a snapshot's temporary file) is created
+//!   mode `0600` and its parent directory (created if missing) mode `0700`.
 //! * Format version. The file starts with a `"TINESLOG"` header carrying a
 //!   `format_version`; a missing or unknown header is an error that names the
 //!   fix (delete the log). The 1.0 work bumps `format_version` for the new
@@ -244,18 +271,31 @@ struct Entry {
 /// boot counter, durable releases, crash recovery, exclusive lock, and
 /// permissions.
 pub struct LogStore {
+    /// Where the log lives; the snapshot's temporary file sits beside it.
+    path: PathBuf,
+    /// The live log, opened for appends and holding the exclusive lock.
     file: File,
     index: BTreeMap<ObservationId, Entry>,
     boot_count: u64,
     /// Number of corrupt records skipped while rebuilding the index on the last
     /// [`Self::open`] (0 if the log was clean). Exposed for hosts to report.
     skipped_records: usize,
-    /// The last clock marker seen while rebuilding the index, if any: the
-    /// `(marker_tick, marker_wall)` pair. The reopen fold anchors to the later
-    /// of this and the boot record; the downtime fold anchors to it.
+    /// The previous boot's last clock marker, `(tick, wall)`, as read from the
+    /// log at [`Self::open`]. The open snapshot replaces it on disk with a
+    /// marker that has no wall time, so it is kept here for the downtime fold
+    /// in [`Self::set_wall_clock`].
     last_marker: Option<(Tick, Option<u64>)>,
-    /// Caller ticks of downtime already folded during [`Self::open`].
+    /// Caller ticks of downtime already folded during [`Self::open`]: `now`
+    /// at open minus the previous marker's tick, saturating.
     counted_ticks: u64,
+    /// The caller's `now` at [`Self::open`]. The fold subtracts the ticks
+    /// elapsed since then exactly once (S2 of the 1.0 review).
+    open_tick: Tick,
+    /// The time anchor: the latest tick the store has been given (open,
+    /// insert, flush or fold). An earlier `now` passed to `flush` or
+    /// `set_wall_clock` is clamped up to it, so `stored_at` and the clock
+    /// markers never move backwards.
+    anchor: Tick,
     /// The `unknown_downtime_age_ms` broadcast floor configured on open.
     unknown_downtime_age_ms: u64,
     /// Wall-clock value captured by [`Self::set_wall_clock`]; `Some` once the
@@ -368,9 +408,16 @@ impl LogStore {
     /// hand out up to 2³² sequence numbers before the high word would roll
     /// over, which is more than any robot needs.
     ///
-    /// If the log has a corrupt middle record it is skipped and only a torn
-    /// *tail* is truncated; the number of corrupt records skipped is reported
-    /// once on stderr and is available via [`Self::skipped_records`].
+    /// If the log has a corrupt middle record it is skipped and a torn tail is
+    /// dropped; the number of corrupt records skipped is reported once on
+    /// stderr and is available via [`Self::skipped_records`].
+    ///
+    /// Before returning, `open` rewrites the log as a snapshot of what it
+    /// loaded (spec §9, decision I; see the module docs), with every age
+    /// folded to `now` and a closing clock marker at `now` that carries no
+    /// wall time. That makes the new boot counter durable, keeps every
+    /// `stored_at` on disk in this boot's ticks, and compacts the log. If the
+    /// snapshot can't be written, `open` fails and the old log is untouched.
     ///
     /// An exclusive lock is taken on the file, so a second `open` while this
     /// one is alive fails with [`StoreError::Backend`].
@@ -382,44 +429,33 @@ impl LogStore {
         // Ensure the parent directory exists (mode 0700 if we create it).
         ensure_parent_dir(path)?;
 
-        // Open for reads (to load) and appends (to write later). Append mode is
-        // correct because we load by reading the whole file below, and every
-        // mutation appends to the end of the log. Set mode 0600 via
-        // set_permissions below so it is enforced whether or not the file
-        // pre-existed.
-        let mut tmp = OpenOptions::new();
-        let opts = tmp.read(true).create(true).append(true);
-        let mut file = opts.open(path).map_err(|_| StoreError::Backend)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|_| StoreError::Backend)?;
-        }
+        // Open the log and take its exclusive lock (see `open_locked`).
+        let file = open_locked(path)?;
 
-        // Exclusive lock: a second opener must not interleave on the same file.
-        // (`try_lock` takes an exclusive lock on this toolchain's std; the
-        // spec's `try_lock_exclusive` is not present here.)
-        file.try_lock().map_err(|_| {
+        // We hold the lock, so nobody else is mid-snapshot: a temporary file
+        // left beside the log is from a snapshot interrupted before its
+        // rename. The log itself is intact, so the leftover is discarded.
+        let tmp_path = snapshot_tmp_path(path);
+        if tmp_path.exists() {
+            let _ = std::fs::remove_file(&tmp_path);
             eprintln!(
-                "tines-store: refusing to open {}: another process already \
-                 holds the store lock (an earlier instance may still be \
-                 running); delete nothing, just wait for it to release.",
-                path.display()
+                "tines-store: removed {} left by an interrupted snapshot; \
+                 the log itself is intact.",
+                tmp_path.display()
             );
-            StoreError::Backend
-        })?;
+        }
 
         let data = std::fs::read(path).map_err(|_| StoreError::Backend)?;
 
-        // Header: write a fresh one on an empty log, otherwise validate the
-        // existing one. A missing or unknown header is an error that names the
-        // fix (delete the log).
-        if data.is_empty() {
-            write_header(&mut file)?;
+        // Header: an empty log (or one whose header was torn while it was
+        // first created) is new; otherwise validate it. A missing or unknown
+        // header is an error that names the fix (delete the log).
+        let data: &[u8] = if is_torn_new_log(&data) {
+            &[]
         } else {
             validate_header(&data, path)?;
-        }
+            &data
+        };
 
         let mut index: BTreeMap<ObservationId, Entry> = BTreeMap::new();
         let mut dead: HashSet<ObservationId> = HashSet::new();
@@ -449,7 +485,7 @@ impl LogStore {
             // at or after `pos`. If it starts after `pos`, the bytes in between
             // were a corrupt/torn record we skipped. If there is no well-formed
             // record left, the remainder is a torn tail.
-            match parse_valid_record(&data, pos) {
+            match parse_valid_record(data, pos) {
                 Some((start, end, rec)) => {
                     if start > pos {
                         skipped += 1;
@@ -504,19 +540,13 @@ impl LogStore {
             index.remove(&id);
         }
 
-        // A torn tail (bad bytes at EOF with no valid record after) is truncated
-        // back to the last complete boundary, then the file and its directory
-        // are fsynced so the clean tail is durable.
+        // A torn tail (bad bytes at EOF with no valid record after) is dropped:
+        // the open snapshot below rewrites the log from the records loaded.
         let dropped = data.len().saturating_sub(good_end);
         if dropped > 0 {
-            file.set_len(good_end as u64)
-                .map_err(|_| StoreError::Backend)?;
-            file.sync_all().map_err(|_| StoreError::Backend)?;
-            let _ = sync_dir(path);
             eprintln!(
-                "tines-store: truncated {} torn byte(s) at the tail of {} \
-                 while loading ({} complete record(s) loaded); fsynced file \
-                 and directory.",
+                "tines-store: dropped {} torn byte(s) at the tail of {} \
+                 while loading ({} complete record(s) loaded).",
                 dropped,
                 path.display(),
                 records_loaded,
@@ -526,20 +556,19 @@ impl LogStore {
         if skipped > 0 {
             eprintln!(
                 "tines-store: skipped {} corrupt record(s) in {} while loading \
-                 ({} complete record(s) loaded); the log has been repaired \
-                 and will rewrite a clean tail on the next mutation.",
+                 ({} complete record(s) loaded); the open snapshot rewrites \
+                 the log without them.",
                 skipped,
                 path.display(),
                 records_loaded,
             );
         }
 
-        // Increment the boot counter and durably persist it before returning, so
-        // a later open reads a strictly higher value and first_seq() climbs.
-        let boot_count = last_boot_count.map(|c| c + 1).unwrap_or(1);
-        let record = Record::Boot { count: boot_count };
-        write_record(&mut file, &record)?;
-        file.sync_all().map_err(|_| StoreError::Backend)?;
+        // Increment the boot counter. The open snapshot below makes it durable
+        // before returning, so a later open reads a strictly higher value and
+        // first_seq() climbs. Saturating: a corrupt-but-valid huge count must
+        // not panic (first_seq then repeats, which core dedupes safely).
+        let boot_count = last_boot_count.map_or(1, |c| c.saturating_add(1));
 
         // Fold each live observation's age up to the last clock marker and then
         // to load time. Anchoring to each entry's insert tick keeps the fold
@@ -562,18 +591,28 @@ impl LogStore {
             entry.stored_at = now;
         }
 
-        Ok(LogStore {
+        let mut store = LogStore {
+            path: path.to_path_buf(),
             file,
             index,
             boot_count,
             skipped_records: skipped,
             last_marker,
             counted_ticks: last_marker.map_or(0, |(tick, _)| now.saturating_sub(tick)),
+            open_tick: now,
+            anchor: now,
             unknown_downtime_age_ms,
             wall_at_set: None,
             tick_at_set: None,
             fold_report: None,
-        })
+        };
+
+        // Decision I: rewrite the log as a snapshot, so every `stored_at` on
+        // disk belongs to this boot and the new boot count is durable. The
+        // store can't know the wall time at open, so the closing marker has
+        // none: a restart before trusted time takes the unknown path.
+        store.write_snapshot(now, None)?;
+        Ok(store)
     }
 
     /// The sequence number the next `Node::observe` should use for this boot.
@@ -595,50 +634,88 @@ impl LogStore {
         self.skipped_records
     }
 
-    /// Persist the current index state to disk.
-    ///
-    /// This is the durability boundary: `flush(now)` advances each entry's age
-    /// to the caller's `now`, appends a `Record::Clock` tick marker stamped
-    /// with `now`, and calls `sync_all`, after which the appended observation
-    /// and release records are durable across a power loss. Because `insert`
-    /// only reaches disk via a subsequent `flush()`, hosts that need crash
-    /// durability must call `flush()` before shutdown (see the durability
-    /// contract in the module docs).
-    ///
-    /// `now` is the caller's current tick, which the marker records: anchoring
-    /// the reopen fold to when the host actually flushed — rather than the last
-    /// insert tick — keeps ages exact across a reboot.
-    pub fn flush(&mut self, now: Tick) -> Result<(), StoreError> {
-        // Advance every entry's age up to the caller's `now` in memory, so each
-        // `entry.obs.age_ms` is the true current age and `stored_at` marks when
-        // that age was computed. Ages are recomputed from each entry's own
-        // `stored_at` on the next load (see [`LogStore::open`]).
-        for entry in self.index.values_mut() {
-            entry.obs.age_ms = entry
-                .obs
-                .age_ms
-                .saturating_add(now.saturating_sub(entry.stored_at));
-            entry.stored_at = now;
-        }
+    /// Clamp `now` to the time anchor and advance the anchor to it.
+    fn advance_anchor(&mut self, now: Tick) -> Tick {
+        self.anchor = self.anchor.max(now);
+        self.anchor
+    }
 
-        // Record a clock marker stamped with the caller's `now` so the load-time
-        // age fold anchors to when the host actually flushed — not the last
-        // insert tick (that stale-marker bug was F18).
-        //
-        // The wall value is *derived*: if a trusted wall clock has been
-        // established (see [`LogStore::set_wall_clock`]) the marker carries
-        // `wall_at_set + (now - tick_at_set)`; before that it is `None`, which
-        // is what makes the reopen fold treat this marker's downtime as unknown.
-        let wall = match (self.wall_at_set, self.tick_at_set) {
+    /// Advance every entry's age to `now` in memory and set its `stored_at` to
+    /// `now`. `now` must not be behind any entry's `stored_at` (callers pass
+    /// the anchor), so no `stored_at` moves backwards.
+    fn rebase_to(&mut self, now: Tick) {
+        for entry in self.index.values_mut() {
+            entry.obs.age_ms = current_age(&entry.obs, entry.stored_at, now);
+            entry.stored_at = entry.stored_at.max(now);
+        }
+    }
+
+    /// The wall time a clock marker written at tick `now` carries: derived as
+    /// `wall_at_set + (now - tick_at_set)` once trusted time is set, else
+    /// `None`. Saturating, so a peer's absurd wall time can't overflow it.
+    fn marker_wall(&self, now: Tick) -> Option<u64> {
+        match (self.wall_at_set, self.tick_at_set) {
             (Some(wall_at_set), Some(tick_at_set)) => {
-                Some(wall_at_set + now.saturating_sub(tick_at_set))
+                Some(wall_at_set.saturating_add(now.saturating_sub(tick_at_set)))
             }
             _ => None,
+        }
+    }
+
+    /// Rewrite the log as a snapshot of the current state at tick `now`
+    /// (decision I): header, the current `Boot` record, every live observation
+    /// with its current age and `stored_at = now`, a `Release` record for every
+    /// released id still held, and a closing clock marker at `now` carrying
+    /// `wall`. Trimmed records are not carried over.
+    ///
+    /// The snapshot goes to a temporary file beside the log (created mode
+    /// `0600` and locked before it becomes the log), is fsynced, renamed over
+    /// the log, and then the directory is fsynced. A crash before the rename
+    /// leaves the old log intact; after it, the snapshot is the log. Because
+    /// the temporary file is locked before the rename, the file at the log's
+    /// path is locked by this store at every instant (see `open_locked`).
+    ///
+    /// `now` must already be clamped to the anchor. The in-memory entries are
+    /// rebased to `now` as well, so memory and disk agree.
+    fn write_snapshot(&mut self, now: Tick, wall: Option<u64>) -> Result<(), StoreError> {
+        self.rebase_to(now);
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&header_bytes());
+        buf.extend(encode_record(&Record::Boot {
+            count: self.boot_count,
+        })?);
+        for entry in self.index.values() {
+            buf.extend(encode_record(&Record::Obs {
+                obs: Box::new(entry.obs.clone()),
+                stored_at: now,
+            })?);
+        }
+        for (id, entry) in self.index.iter() {
+            if entry.released {
+                buf.extend(encode_record(&Record::Release { id: *id })?);
+            }
+        }
+        buf.extend(encode_record(&Record::Clock { tick: now, wall })?);
+
+        let tmp_path = snapshot_tmp_path(&self.path);
+        // We hold the log's lock, so any file here is a leftover.
+        let _ = std::fs::remove_file(&tmp_path);
+        let tmp = match write_locked_tmp(&tmp_path, &buf) {
+            Ok(tmp) => tmp,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e);
+            }
         };
-        let record = Record::Clock { tick: now, wall };
-        write_record(&mut self.file, &record)?;
-        self.file.sync_all().map_err(|_| StoreError::Backend)?;
-        Ok(())
+        if std::fs::rename(&tmp_path, &self.path).is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(StoreError::Backend);
+        }
+        // The snapshot is the log now: append to it from here on. Dropping the
+        // old handle releases the lock on the old, now unlinked, file.
+        self.file = tmp;
+        sync_dir(&self.path)
     }
 
     /// Append a single record to the log.
@@ -654,15 +731,27 @@ impl LogStore {
     /// observation is quarantined. This is the moment the host reports a
     /// *trusted* wall clock.
     ///
-    /// **Known downtime**: the last marker on disk carries a wall time and
-    /// `wall_now` is not behind it. Every quarantined observation gains the wall
-    /// elapsed since that marker (`wall_now - marker_wall`), minus the ticks
-    /// already counted during this open (saturating to zero).
+    /// **Known downtime**: the previous boot's last marker (as read at open)
+    /// carries a wall time and `wall_now` is not behind it. Every quarantined
+    /// observation gains the wall time elapsed since that marker
+    /// (`wall_now - marker_wall`), minus the ticks already counted for it:
+    /// those the open fold added past the marker tick, and this boot's ticks
+    /// since open (`now - open_tick`), counted once whether or not a flush
+    /// ran in between. Saturating to zero.
     ///
     /// **Unknown downtime**: no marker, a marker without a wall time, or a
     /// marker whose wall time is ahead of `wall_now`. Quarantined addressed
     /// observations are aged past their lifetime (never delivered/forwarded);
     /// quarantined broadcasts are floored to `max(age, unknown_downtime_age_ms)`.
+    ///
+    /// The fold then rewrites the log as a snapshot (decision I) whose closing
+    /// marker carries `wall_now`, so its results are durable: an addressed
+    /// observation it expired stays released after a later reboot, and a
+    /// floored broadcast keeps its floor. If the snapshot fails, the fold
+    /// still holds in memory, but clock markers carry no wall time until the
+    /// next open, so that open takes the unknown path again.
+    ///
+    /// A `now` earlier than the store's time anchor is clamped to it.
     ///
     /// This runs exactly once; a second call returns the first report unchanged
     /// (see the `set_wall_clock_runs_once` test).
@@ -676,6 +765,7 @@ impl LogStore {
             return report;
         }
 
+        let now = self.advance_anchor(now);
         let mut expired_addressed = 0usize;
         let mut floored_broadcasts = 0usize;
         let mut known_downtime_ms: Option<u64> = None;
@@ -684,16 +774,18 @@ impl LogStore {
             // There is a marker with a usable wall time. Downtime is known.
             Some((_marker_tick, Some(marker_wall))) if marker_wall <= wall_now => {
                 let downtime_ms = wall_now.saturating_sub(marker_wall);
-                // Ticks already folded in during the reopen (load) fold.
-                let counted = self.counted_ticks;
-                let extra_ticks = downtime_ms.saturating_sub(counted) as Tick;
+                // The wall time since the marker, minus the ticks the open fold
+                // already counted (open tick past the marker tick), minus this
+                // boot's ticks since open. Every quarantined entry's age already
+                // includes the latter, whether or not a flush has rebased it in
+                // between, so it is subtracted once for all (S2).
+                let added = downtime_ms
+                    .saturating_sub(self.counted_ticks)
+                    .saturating_sub(now.saturating_sub(self.open_tick));
                 for entry in self.index.values_mut() {
                     if !entry.quarantined {
                         continue;
                     }
-                    // Advance by the wall elapsed since the marker, minus the
-                    // ticks already counted during this open.
-                    let added = extra_ticks.saturating_sub(now.saturating_sub(entry.stored_at));
                     entry.obs.age_ms = entry.obs.age_ms.saturating_add(added);
                     entry.quarantined = false;
                 }
@@ -714,8 +806,10 @@ impl LogStore {
                         // lifetime and released (withheld from delivery), exactly
                         // as if it had been delivered and acknowledged.
                         let lifetime = entry.obs.dest.as_ref().map(|d| d.lifetime_ms).unwrap_or(0);
+                        // Saturating: at `lifetime_ms = u64::MAX` no age is
+                        // past it, and `released` alone withholds it.
                         if entry.obs.age_ms <= lifetime {
-                            entry.obs.age_ms = lifetime + 1;
+                            entry.obs.age_ms = lifetime.saturating_add(1);
                             expired_addressed += 1;
                         }
                         entry.released = true;
@@ -740,6 +834,24 @@ impl LogStore {
         self.wall_at_set = Some(wall_now);
         self.tick_at_set = Some(now);
 
+        // Decision I: snapshot the folded state, so the fold is durable (an
+        // expired message stays released, a floored broadcast keeps its floor)
+        // and the closing marker carries the wall time.
+        if self.write_snapshot(now, Some(wall_now)).is_err() {
+            // The fold holds in memory, but not on disk. If later markers
+            // carried a wall time, the next open would see a *known* downtime
+            // and the unfolded records on disk would come back: an expired
+            // message resurrected. So markers stay without a wall time for
+            // this run, and the next open takes the unknown path again.
+            self.wall_at_set = None;
+            self.tick_at_set = None;
+            eprintln!(
+                "tines-store: failed to snapshot {} after the wall-clock fold; \
+                 clock markers carry no wall time until the next open.",
+                self.path.display()
+            );
+        }
+
         let report = FoldReport {
             downtime_ms: known_downtime_ms,
             expired_addressed,
@@ -759,40 +871,43 @@ impl LogStore {
         report
     }
 
-    /// Estimate the true wall time from the observations stored since this
-    /// open — the peer-observation fallback in the trusted-time state machine
-    /// (`HostClock::anchor_wall`).
+    /// Estimate the current wall time from peers' observations: the latest
+    /// estimate among the observations that aren't quarantined and carry an
+    /// `observed_at` (decision J).
     ///
-    /// Scans the entries stored *since this open*: the non-quarantined ones
-    /// (quarantined ones are invisible to the scan, being pre-open data whose
-    /// age cannot be verified). Among those carrying an `observed_at`, the
-    /// youngest (smallest `age_ms`) gives the best estimate, because a younger
-    /// observation's age has been trusted longest. The estimate is
+    /// Each candidate's estimate is
     ///
     /// ```text
     /// observed_at + age_ms + (now - stored_at)
     /// ```
     ///
-    /// i.e. the peer's wall time when it made the observation, aged by its
-    /// current age plus the ticks elapsed since we stored it. `age_ms` is a
-    /// lower bound on the age at send time, so the estimate is never later than
-    /// the true current wall time — a peer cannot report a younger age than its
-    /// own clock implies.
+    /// i.e. the observer's wall time when it made the observation, plus its
+    /// age when it arrived, plus the ticks elapsed since. Every term saturates.
+    /// Because `age_ms` is a lower bound, an honest estimate is never later
+    /// than the true time, so the latest estimate is the closest one.
     ///
-    /// Returns `None` when no stored observation carries an `observed_at` yet:
-    /// there is nothing to derive time from.
+    /// Only observations inserted since this open count: anything held from
+    /// before it is quarantined, and its age isn't trusted yet.
+    ///
+    /// **Peer time is unauthenticated** until signatures land in 1.1: a peer
+    /// can claim any `observed_at`, including one absurdly far ahead (this
+    /// returns `u64::MAX` rather than overflowing). The host bounds the
+    /// estimate and collects estimates for a short window before adopting
+    /// the latest one with [`Self::set_wall_clock`] (spec §9).
+    ///
+    /// Returns `None` when no candidate carries an `observed_at` yet.
     pub fn peer_time_estimate(&self, now: Tick) -> Option<u64> {
         self.index
             .values()
-            .filter(|entry| !entry.quarantined && entry.obs.observed_at.is_some())
-            .min_by_key(|entry| entry.obs.age_ms)
-            .and_then(|entry| {
+            .filter(|entry| !entry.quarantined)
+            .filter_map(|entry| {
                 entry.obs.observed_at.map(|observed_at| {
                     observed_at
                         .saturating_add(entry.obs.age_ms)
                         .saturating_add(now.saturating_sub(entry.stored_at))
                 })
             })
+            .max()
     }
 
     /// The [`FoldReport`] from the (single) `set_wall_clock`, before it runs or
@@ -814,14 +929,127 @@ impl WallClockStore for LogStore {
     }
 }
 
-/// Write the log header: `magic ‖ format_version ‖ reserved`.
-fn write_header(file: &mut File) -> Result<(), StoreError> {
-    file.write_all(&MAGIC).map_err(|_| StoreError::Backend)?;
-    file.write_all(&FORMAT_VERSION.to_le_bytes())
-        .map_err(|_| StoreError::Backend)?;
-    file.write_all(&0u16.to_le_bytes()) // reserved for future use
-        .map_err(|_| StoreError::Backend)?;
-    Ok(())
+/// The log header: `magic ‖ format_version ‖ reserved`.
+fn header_bytes() -> [u8; HEADER_LEN] {
+    let mut out = [0u8; HEADER_LEN];
+    out[0..8].copy_from_slice(&MAGIC);
+    out[8..10].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    // out[10..12]: reserved for future use, zero.
+    out
+}
+
+/// Whether `data` is a log with no records yet: empty, or a header torn by a
+/// crash while the log was first created.
+///
+/// A torn header is shorter than [`HEADER_LEN`] and starts with (a prefix of)
+/// the magic. Records only ever follow a complete header, so such a file holds
+/// no data, and treating it as new loses nothing. Any other short file may not
+/// be ours, so it is left to [`validate_header`] to refuse.
+fn is_torn_new_log(data: &[u8]) -> bool {
+    if data.len() >= HEADER_LEN {
+        return false;
+    }
+    let n = data.len().min(MAGIC.len());
+    data[..n] == MAGIC[..n]
+}
+
+/// The temporary file a snapshot is written to before it is renamed over the
+/// log at `path`: same directory, so the rename is atomic.
+fn snapshot_tmp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".snapshot-tmp");
+    path.with_file_name(name)
+}
+
+/// Open the log at `path` (creating it, mode `0600`) and take its exclusive
+/// lock.
+///
+/// The lock lives on the log file itself. A snapshot replaces that file by
+/// rename, so the lock must follow it: the snapshot locks its temporary file
+/// *before* renaming it over the log (see [`LogStore::write_snapshot`]), so
+/// whatever file is at `path` is locked while the store is alive. A second
+/// opener can still race a snapshot: it opens the old file, and the store
+/// releases that file's lock right after the rename. So after locking, the
+/// opener checks that its file is still the one at `path`. If not, it retries
+/// on the new file, whose lock the live store holds.
+fn open_locked(path: &Path) -> Result<File, StoreError> {
+    const ATTEMPTS: usize = 8;
+    for _ in 0..ATTEMPTS {
+        let mut opts = OpenOptions::new();
+        opts.read(true).create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(path).map_err(|_| StoreError::Backend)?;
+        // Enforce 0600 whether or not the file pre-existed.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|_| StoreError::Backend)?;
+        }
+        // Exclusive lock: a second opener must not interleave on the same file.
+        file.try_lock().map_err(|_| {
+            eprintln!(
+                "tines-store: refusing to open {}: another process already \
+                 holds the store lock (an earlier instance may still be \
+                 running); delete nothing, just wait for it to release.",
+                path.display()
+            );
+            StoreError::Backend
+        })?;
+        if is_file_at(&file, path) {
+            return Ok(file);
+        }
+    }
+    eprintln!(
+        "tines-store: refusing to open {}: the log kept being replaced while \
+         taking its lock; another process may be using it.",
+        path.display()
+    );
+    Err(StoreError::Backend)
+}
+
+/// Whether `file` is the file currently at `path`, not one a rename replaced.
+#[cfg(unix)]
+fn is_file_at(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::metadata(path)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// Without inode numbers there is nothing to compare; trust the open.
+#[cfg(not(unix))]
+fn is_file_at(_file: &File, _path: &Path) -> bool {
+    true
+}
+
+/// Create `tmp_path` (mode `0600`, which must not exist yet), lock it, write
+/// `bytes` and fsync it. Returns the locked handle, ready to append to once it
+/// is renamed over the log.
+fn write_locked_tmp(tmp_path: &Path, bytes: &[u8]) -> Result<File, StoreError> {
+    let mut opts = OpenOptions::new();
+    opts.read(true).create_new(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(tmp_path).map_err(|_| StoreError::Backend)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| StoreError::Backend)?;
+    }
+    file.try_lock().map_err(|_| StoreError::Backend)?;
+    file.write_all(bytes).map_err(|_| StoreError::Backend)?;
+    file.sync_all().map_err(|_| StoreError::Backend)?;
+    Ok(file)
 }
 
 /// Reject a log whose header is missing, truncated, or an unknown version,
@@ -1006,7 +1234,7 @@ impl Store for LogStore {
     /// Insert an observation.
     ///
     /// The record is appended to the log, but is durable across a power loss
-    /// only after a call to [`Self::flush`]; hosts that need crash durability
+    /// only after a call to [`Store::flush`]; hosts that need crash durability
     /// must flush before shutdown (see the durability contract in the module
     /// docs).
     fn insert(&mut self, obs: Observation, now: Tick) -> Result<bool, StoreError> {
@@ -1021,6 +1249,7 @@ impl Store for LogStore {
             stored_at: now,
         };
         self.append(&record)?;
+        self.advance_anchor(now);
         self.index.insert(
             id,
             Entry {
@@ -1089,7 +1318,7 @@ impl Store for LogStore {
     /// appended to the log at the same time (best-effort: an append error is
     /// logged, not raised, keeping [`Store::release`] infallible). The release
     /// is therefore durable across a kill-without-flush — unlike a flush-only
-    /// release, it does not wait for a later [`Self::flush`].
+    /// release, it does not wait for a later [`Store::flush`].
     fn release(&mut self, id: &ObservationId) {
         if let Some(entry) = self.index.get_mut(id) {
             entry.released = true;
@@ -1132,8 +1361,15 @@ impl Store for LogStore {
     /// the number of observations removed. Trimmed ids are not tombstoned:
     /// re-inserting them later is accepted.
     ///
+    /// **Quarantined observations are exempt from every rule** (spec §9,
+    /// decision L): `keep_per_topic`, `max_age_ms` and `max_count` all rank by
+    /// age, and a quarantined observation's age isn't trusted until
+    /// [`LogStore::set_wall_clock`] folds the downtime in. They are neither
+    /// trimmed nor counted, so a store in quarantine can briefly hold more
+    /// than `max_count`, until the fold.
+    ///
     /// Each removed id appends a `Record::Trim` record, but that record is
-    /// durable across a power loss only after a [`Self::flush`]; hosts that
+    /// durable across a power loss only after a [`Store::flush`]; hosts that
     /// need crash durability must flush before shutdown.
     fn trim(&mut self, policy: &TrimPolicy, now: Tick) -> usize {
         let mut removed: BTreeSet<ObservationId> = BTreeSet::new();
@@ -1201,6 +1437,34 @@ impl Store for LogStore {
         }
         removed.len()
     }
+
+    /// The durability point (spec §4).
+    ///
+    /// Clamps `now` to the time anchor (an earlier `now` than any tick the
+    /// store has been given counts as that tick, so nothing moves backwards),
+    /// rebases every entry's age to it in memory, appends a clock marker at
+    /// `now` and fsyncs the log. Everything inserted, released or trimmed so
+    /// far is then durable, and the next [`LogStore::open`] folds ages from
+    /// that marker. After [`LogStore::set_wall_clock`] the marker carries the
+    /// derived wall time `wall_at_set + (now - tick_at_set)`; before it, none.
+    ///
+    /// Flushing twice is harmless: it appends a second marker. A failure
+    /// returns [`StoreError::Backend`] and leaves the store usable; the
+    /// in-memory state is unchanged apart from the rebase, which doesn't
+    /// change the age `get` reports at `now` or later.
+    fn flush(&mut self, now: Tick) -> Result<(), StoreError> {
+        let now = self.advance_anchor(now);
+        self.rebase_to(now);
+        // The marker records the caller's `now`, not the last insert tick
+        // (that stale-marker bug was F18).
+        let record = Record::Clock {
+            tick: now,
+            wall: self.marker_wall(now),
+        };
+        write_record(&mut self.file, &record)?;
+        self.file.sync_all().map_err(|_| StoreError::Backend)?;
+        Ok(())
+    }
 }
 
 impl LogStore {
@@ -1255,7 +1519,7 @@ mod tests {
         // error, so the writer can never emit a record the reader rejects.
         let path = unique_path("oversize");
         let mut f = std::fs::File::create(&path).unwrap();
-        write_header(&mut f).unwrap();
+        f.write_all(&header_bytes()).unwrap();
 
         // A body exactly at the cap is accepted; one byte over is refused. The
         // framing entry point exercises the same cap guard the private
@@ -1281,8 +1545,9 @@ mod tests {
             assert!(s.insert(c, 1002).unwrap());
             s.flush(1002).unwrap();
         }
-        // Flip a byte in the body of the second data record (Obs(b)).
-        corrupt_body(&path, 2);
+        // Flip a byte in the body of the second data record (Obs(b)): the
+        // open snapshot wrote Boot and Clock first, then Obs(a), Obs(b).
+        corrupt_body(&path, 3);
         {
             let s = LogStore::open(&path, 3000).unwrap();
             assert!(
@@ -1343,6 +1608,88 @@ mod tests {
             LogStore::open(&path, 0).is_err(),
             "an unknown header must be rejected"
         );
+    }
+
+    #[test]
+    fn interrupted_snapshot_is_discarded() {
+        // A crash before the snapshot's rename leaves a temporary file beside
+        // an intact log. The next open ignores it (even a well-formed one) and
+        // removes it.
+        let path = unique_path("tmp_left");
+        let a = obs([1; 16], 1, 0, None);
+        {
+            let mut s = LogStore::open(&path, 0).unwrap();
+            s.insert(a.clone(), 0).unwrap();
+            s.flush(0).unwrap();
+        }
+        // A complete, valid log holding something else, never renamed.
+        let tmp = snapshot_tmp_path(&path);
+        {
+            let other = unique_path("tmp_other");
+            let mut s = LogStore::open(&other, 0).unwrap();
+            s.insert(obs([2; 16], 2, 0, None), 0).unwrap();
+            s.flush(0).unwrap();
+            drop(s);
+            std::fs::rename(&other, &tmp).unwrap();
+        }
+        let s = LogStore::open(&path, 0).unwrap();
+        assert!(s.contains(&a.id()), "the log is what was renamed last");
+        assert!(!s.contains(&obs([2; 16], 2, 0, None).id()));
+        assert_eq!(s.len(), 1);
+        assert!(!tmp.exists(), "the leftover is removed");
+    }
+
+    #[test]
+    fn open_rewrites_the_log_as_a_snapshot() {
+        // Trimmed records and the previous boots' records don't survive the
+        // open snapshot: the log holds just the current state.
+        let path = unique_path("compact");
+        {
+            let mut s = LogStore::open(&path, 0).unwrap();
+            for seq in 0..20 {
+                s.insert(obs([1; 16], seq, 0, None), 0).unwrap();
+            }
+            let mut policy = TrimPolicy::default();
+            policy.max_count = Some(1);
+            assert_eq!(s.trim(&policy, 0), 19);
+            s.flush(0).unwrap();
+        }
+        let before = std::fs::metadata(&path).unwrap().len();
+        drop(LogStore::open(&path, 0).unwrap());
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(after < before, "{after} < {before}");
+        let data = std::fs::read(&path).unwrap();
+        let mut kinds = Vec::new();
+        let mut pos = HEADER_LEN;
+        while let Some((_, end, rec)) = parse_valid_record(&data, pos) {
+            kinds.push(match rec {
+                Record::Obs { .. } => "obs",
+                Record::Trim { .. } => "trim",
+                Record::Release { .. } => "release",
+                Record::Boot { .. } => "boot",
+                Record::Clock { wall, .. } => {
+                    assert_eq!(wall, None, "the open snapshot's marker has no wall");
+                    "clock"
+                }
+            });
+            pos = end;
+        }
+        assert_eq!(kinds, ["boot", "obs", "clock"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_on_a_replaced_file_is_detected() {
+        // The race `open_locked` guards against: an opener's file is renamed
+        // over between its open and its lock.
+        let path = unique_path("replaced");
+        std::fs::write(&path, b"old").unwrap();
+        let stale = File::open(&path).unwrap();
+        assert!(is_file_at(&stale, &path));
+        let other = unique_path("replacement");
+        std::fs::write(&other, b"new").unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        assert!(!is_file_at(&stale, &path));
     }
 
     fn obs(observer: [u8; 16], seq: u64, age: u64, at: Option<u64>) -> Observation {

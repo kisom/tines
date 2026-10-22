@@ -373,8 +373,9 @@ mod fleet_fixes_f5 {
             assert!(s.insert(a_obs([3; 16], 3), 1002).unwrap());
             s.flush(1002).expect("flush");
         }
-        // Corrupt the middle observation (record index 2: Boot, obs-1, obs-2).
-        corrupt_record(&path, 2);
+        // Corrupt the middle observation (record index 3: the open snapshot's
+        // Boot and Clock, then obs-1, obs-2).
+        corrupt_record(&path, 3);
         {
             let s = LogStore::open(&path, 3000).expect("reopen");
             assert!(
@@ -997,6 +998,378 @@ mod quarantined_duplicate_exchange {
         assert!(
             link.borrow().sent.get() >= 1,
             "A must have offered the held observation to B"
+        );
+    }
+}
+
+// Review fixes B1, B2/S2 (decision I), S3, B3, decision J and decision L.
+mod snapshots_and_flush {
+    use super::*;
+    use tines_core::{consts, Event, Node, SendError, Store, Transport, TrimPolicy};
+    use tines_store::LogStore;
+
+    fn addressed(observer: [u8; 16], seq: u64, to: [u8; 16], lifetime: u64) -> Observation {
+        Observation::addressed(observer, seq, b"task", b"go", to, lifetime)
+    }
+
+    struct NullTransport;
+
+    impl Transport for NullTransport {
+        type Addr = u8;
+        fn poll(&mut self) -> Option<Event<u8>> {
+            None
+        }
+        fn send(&mut self, _to: &u8, _frame: &[u8]) -> Result<(), SendError> {
+            Ok(())
+        }
+        fn mtu(&self) -> usize {
+            consts::MAX_FRAME
+        }
+    }
+
+    /// Flush through the `Store` trait, never the backend's own method.
+    fn flush_generic<S: Store>(store: &mut S, now: u64) {
+        store.flush(now).expect("trait flush");
+    }
+
+    fn age_after_reopen(path: &std::path::Path, id: &tines_core::ObservationId) -> u64 {
+        let s = LogStore::open(path, 0).unwrap();
+        s.get(id, 0).unwrap().age_ms
+    }
+
+    /// B1: a flush through the `Store` trait (or `Node::flush`) writes the
+    /// clock marker, so a flushed store and an unflushed one give different
+    /// ages after a reboot.
+    #[test]
+    fn trait_flush_is_the_log_flush() {
+        let o = obs([1; 16], 1, 0, None);
+        let id = o.id();
+
+        let unflushed = store_path("b1_unflushed");
+        {
+            let mut s = LogStore::open(&unflushed, 0).unwrap();
+            s.insert(o.clone(), 1000).unwrap();
+        }
+        let generic = store_path("b1_generic");
+        {
+            let mut s = LogStore::open(&generic, 0).unwrap();
+            s.insert(o.clone(), 1000).unwrap();
+            flush_generic(&mut s, 5000);
+        }
+        let via_node = store_path("b1_node");
+        {
+            let mut s = LogStore::open(&via_node, 0).unwrap();
+            s.insert(o.clone(), 1000).unwrap();
+            let mut node = Node::new([9; 16], s.first_seq(), s, NullTransport);
+            node.flush(5000).expect("Node::flush");
+        }
+
+        assert_eq!(
+            age_after_reopen(&unflushed, &id),
+            0,
+            "no marker after the insert: the crash window isn't counted"
+        );
+        assert_eq!(age_after_reopen(&generic, &id), 4000);
+        assert_eq!(age_after_reopen(&via_node, &id), 4000);
+    }
+
+    /// B2 (lineage): ages survive any number of reboots, because the open
+    /// snapshot rewrites every `stored_at` into the current boot's ticks.
+    #[test]
+    fn age_lineage_across_three_opens() {
+        let path = store_path("b2_lineage");
+        let o = obs([1; 16], 1, 0, None);
+        let id = o.id();
+        {
+            let mut s = LogStore::open(&path, 0).unwrap();
+            s.insert(o, 1000).unwrap();
+            s.flush(50_000).unwrap();
+        }
+        {
+            // Every boot's ticks restart at 0.
+            let mut s = LogStore::open(&path, 0).unwrap();
+            assert_eq!(s.get(&id, 0).unwrap().age_ms, 49_000);
+            s.flush(500).unwrap();
+        }
+        {
+            let s = LogStore::open(&path, 0).unwrap();
+            assert_eq!(
+                s.get(&id, 0).unwrap().age_ms,
+                49_500,
+                "the third open keeps the lineage instead of resetting it"
+            );
+        }
+    }
+
+    /// B2 (resurrection): an addressed message expired by an unknown-downtime
+    /// fold stays released after a later reboot whose downtime is known.
+    #[test]
+    fn fold_expiry_survives_known_downtime_reboot() {
+        let path = store_path("b2_resurrect");
+        let a = addressed([2; 16], 1, [3; 16], 10_000);
+        let id = a.id();
+        {
+            let mut s = LogStore::open(&path, 0).unwrap();
+            s.insert(a, 0).unwrap();
+            s.flush(0).unwrap(); // no wall time yet
+        }
+        {
+            let mut s = LogStore::open(&path, 0).unwrap();
+            let report = s.set_wall_clock(1_000_000, 0);
+            assert_eq!(report.downtime_ms, None);
+            assert_eq!(report.expired_addressed, 1);
+            s.flush(100).unwrap(); // marker wall 1_000_100
+        }
+        {
+            let mut s = LogStore::open(&path, 0).unwrap();
+            let report = s.set_wall_clock(1_000_200, 0);
+            assert_eq!(report.downtime_ms, Some(100), "downtime is known now");
+            assert!(s.is_released(&id), "the expired message stays released");
+            let mut offered = 0usize;
+            s.for_each_addressed_id(&mut |_| offered += 1);
+            assert_eq!(offered, 0, "never offered for custody again");
+            assert!(
+                s.get(&id, 0).unwrap().age_ms > 10_000,
+                "still past lifetime"
+            );
+        }
+    }
+
+    /// B2: a broadcast floored by an unknown-downtime fold keeps its floor.
+    #[test]
+    fn fold_floor_survives_reboot() {
+        let path = store_path("b2_floor");
+        let b = obs([1; 16], 1, 0, None);
+        let id = b.id();
+        {
+            let mut s = LogStore::open(&path, 0).unwrap();
+            s.insert(b, 0).unwrap();
+            s.flush(0).unwrap();
+        }
+        {
+            let mut s = LogStore::open_with(&path, 0, 30_000).unwrap();
+            assert_eq!(s.set_wall_clock(1_000_000, 0).floored_broadcasts, 1);
+        }
+        {
+            // Killed without a flush after the fold: the fold's snapshot is
+            // the durable state.
+            let mut s = LogStore::open_with(&path, 0, 30_000).unwrap();
+            assert_eq!(s.get(&id, 0).unwrap().age_ms, 30_000);
+            let report = s.set_wall_clock(1_000_000, 0);
+            assert_eq!(
+                report.downtime_ms,
+                Some(0),
+                "the fold snapshot's marker has a wall"
+            );
+            assert_eq!(s.get(&id, 0).unwrap().age_ms, 30_000);
+        }
+    }
+
+    /// S2: a flush between open and `set_wall_clock` has already counted its
+    /// share of this boot's ticks; the fold must not count them again.
+    #[test]
+    fn flush_before_fold_does_not_double_count() {
+        let path = store_path("s2_double");
+        let b = obs([1; 16], 1, 0, None);
+        let id = b.id();
+        {
+            let mut s = LogStore::open(&path, 0).unwrap();
+            s.insert(b, 0).unwrap();
+            s.set_wall_clock(1_000_000, 0);
+            s.flush(0).unwrap(); // marker: tick 0, wall 1_000_000
+        }
+        {
+            // Off for 11 s, then up for 4 s before trusted time arrives.
+            let mut s = LogStore::open(&path, 0).unwrap();
+            s.flush(4000).unwrap();
+            let report = s.set_wall_clock(1_015_000, 4000);
+            assert_eq!(report.downtime_ms, Some(15_000));
+            assert_eq!(
+                s.get(&id, 4000).unwrap().age_ms,
+                15_000,
+                "true age is 15 s, not 19 s"
+            );
+        }
+    }
+
+    /// The open snapshot's marker has no wall time: a restart before trusted
+    /// time takes the unknown path, even if the previous boot had trust.
+    #[test]
+    fn restart_before_trust_takes_unknown_path() {
+        let path = store_path("open_marker_no_wall");
+        {
+            let mut s = LogStore::open(&path, 0).unwrap();
+            s.insert(addressed([2; 16], 1, [3; 16], 60_000), 0).unwrap();
+            s.set_wall_clock(1_000_000, 0);
+            s.flush(10).unwrap();
+        }
+        {
+            // Opened, never trusted, never flushed.
+            let _s = LogStore::open(&path, 0).unwrap();
+        }
+        {
+            let mut s = LogStore::open(&path, 0).unwrap();
+            let report = s.set_wall_clock(1_000_500, 0);
+            assert_eq!(report.downtime_ms, None);
+            assert_eq!(report.expired_addressed, 1);
+        }
+    }
+
+    /// S3: a `now` earlier than the last anchor is clamped, and `stored_at`
+    /// never moves backwards.
+    #[test]
+    fn flush_clamps_an_earlier_now() {
+        let path = store_path("s3_clamp");
+        let b = obs([1; 16], 1, 0, None);
+        let id = b.id();
+        {
+            let mut s = LogStore::open(&path, 0).unwrap();
+            s.insert(b, 5000).unwrap();
+            s.flush(3000).unwrap();
+            assert_eq!(s.get(&id, 5000).unwrap().age_ms, 0);
+            s.flush(8000).unwrap();
+            s.flush(6000).unwrap(); // earlier than the last anchor
+            assert_eq!(s.get(&id, 8000).unwrap().age_ms, 3000);
+        }
+        // The clamped marker is at 8000, not 6000.
+        assert_eq!(age_after_reopen(&path, &id), 3000);
+    }
+
+    /// B3: wall times near `u64::MAX` never overflow, in the marker or in the
+    /// unknown-downtime expiry.
+    #[test]
+    fn huge_wall_and_lifetime_saturate() {
+        let path = store_path("b3_saturate");
+        let a = addressed([2; 16], 1, [3; 16], u64::MAX);
+        let id = a.id();
+        {
+            let mut s = LogStore::open(&path, 0).unwrap();
+            s.insert(a, 0).unwrap();
+            s.set_wall_clock(u64::MAX - 5, 0);
+            s.flush(1_000).unwrap(); // derived wall saturates
+        }
+        {
+            let mut s = LogStore::open(&path, 0).unwrap();
+            let report = s.set_wall_clock(u64::MAX, 0);
+            assert_eq!(report.downtime_ms, Some(0));
+        }
+        let path = store_path("b3_lifetime");
+        {
+            let mut s = LogStore::open(&path, 0).unwrap();
+            s.insert(addressed([2; 16], 1, [3; 16], u64::MAX), 0)
+                .unwrap();
+        }
+        {
+            let mut s = LogStore::open(&path, 0).unwrap();
+            let report = s.set_wall_clock(1000, 0); // unknown downtime
+            assert_eq!(report.downtime_ms, None);
+            assert!(
+                s.is_released(&id),
+                "never delivered after an unknown downtime"
+            );
+        }
+    }
+
+    /// Decision J: the latest estimate wins, quarantined entries never count,
+    /// and a huge `observed_at` saturates instead of overflowing.
+    #[test]
+    fn peer_time_estimate_is_the_latest() {
+        let path = store_path("j_latest");
+        {
+            let mut s = LogStore::open(&path, 0).unwrap();
+            // Held across the reboot below: quarantined, so never a candidate.
+            s.insert(obs([7; 16], 1, 0, Some(9_000_000)), 0).unwrap();
+            s.flush(0).unwrap();
+        }
+        let mut s = LogStore::open(&path, 0).unwrap();
+        assert_eq!(
+            s.peer_time_estimate(0),
+            None,
+            "quarantined data is no source"
+        );
+        // Younger, but further behind: estimate 1_000_000 + 10 + 100.
+        s.insert(obs([1; 16], 1, 10, Some(1_000_000)), 100).unwrap();
+        // Older, but later: estimate 1_000_500 + 5_000 + 100.
+        s.insert(obs([2; 16], 1, 5_000, Some(1_000_500)), 100)
+            .unwrap();
+        assert_eq!(s.peer_time_estimate(200), Some(1_005_600));
+        s.insert(obs([3; 16], 1, 0, Some(u64::MAX - 5)), 100)
+            .unwrap();
+        assert_eq!(s.peer_time_estimate(200), Some(u64::MAX));
+    }
+
+    /// Decision L: quarantined entries are exempt from every trim rule, not
+    /// just the age trim.
+    #[test]
+    fn trim_keeps_quarantined_entries() {
+        let path = store_path("l_trim");
+        {
+            let mut s = LogStore::open(&path, 0).unwrap();
+            for seq in 1..=3 {
+                s.insert(obs([1; 16], seq, 1_000_000, None), 0).unwrap();
+            }
+            s.flush(0).unwrap();
+        }
+        let mut s = LogStore::open(&path, 0).unwrap();
+        let mut policy = TrimPolicy::default();
+        policy.keep_per_topic = Some(1);
+        policy.max_age_ms = Some(1);
+        policy.max_count = Some(1);
+        assert_eq!(s.trim(&policy, 0), 0, "nothing quarantined is trimmed");
+        assert_eq!(s.len(), 3, "the store may exceed max_count in quarantine");
+        // Fresh inserts are trimmed normally alongside them.
+        s.insert(obs([2; 16], 1, 0, None), 0).unwrap();
+        s.insert(obs([2; 16], 2, 5, None), 0).unwrap();
+        assert_eq!(s.trim(&policy, 10), 2);
+        assert_eq!(s.len(), 3);
+    }
+
+    /// The exclusive lock survives the snapshot's rename, and the new file
+    /// keeps mode 0600.
+    #[cfg(unix)]
+    #[test]
+    fn lock_and_mode_survive_snapshot() {
+        use std::os::unix::fs::MetadataExt;
+        let path = store_path("lock_snapshot");
+        {
+            let mut s = LogStore::open(&path, 0).unwrap();
+            assert!(
+                LogStore::open(&path, 0).is_err(),
+                "locked after the open snapshot"
+            );
+            s.insert(obs([1; 16], 1, 0, None), 0).unwrap();
+            s.set_wall_clock(1_000_000, 0);
+            assert!(
+                LogStore::open(&path, 0).is_err(),
+                "locked after the fold snapshot"
+            );
+            let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+            // Writes after the rename land in the live log.
+            s.insert(obs([1; 16], 2, 0, None), 0).unwrap();
+            s.flush(10).unwrap();
+        }
+        let s = LogStore::open(&path, 0).unwrap();
+        assert!(s.contains(&obs([1; 16], 2, 0, None).id()));
+        assert_eq!(s.len(), 2);
+    }
+
+    /// A header torn by a crash while the log was first created holds no
+    /// records, so it opens as a new log. Anything else that short is refused.
+    #[test]
+    fn torn_first_header_opens_as_new() {
+        let path = store_path("torn_header");
+        std::fs::write(&path, b"TINESL").unwrap();
+        let s = LogStore::open(&path, 0).expect("a torn header is an empty log");
+        assert_eq!(s.len(), 0);
+        drop(s);
+        let path = store_path("short_foreign");
+        std::fs::write(&path, b"HELLO").unwrap();
+        assert!(LogStore::open(&path, 0).is_err(), "not our file: refuse it");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"HELLO",
+            "and leave it alone"
         );
     }
 }

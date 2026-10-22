@@ -1,4 +1,5 @@
-//! tines-store — persistent append-only `LogStore` backend.
+//! tines-store — persistent `LogStore` backend: an append-only log, rewritten
+//! as a snapshot at open and after the wall-clock fold.
 //!
 //! This crate is the host-side (std) persistence layer for tines. The `Store`
 //! trait, `TrimPolicy`, and `StoreError` live in `tines-core` (which stays
