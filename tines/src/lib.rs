@@ -12,6 +12,7 @@
 
 pub mod clock;
 pub mod ipc;
+pub mod trust;
 
 pub use clock::HostClock;
 pub use ipc::{handle, serve, BeliefOut, EventOut, Request, Response};

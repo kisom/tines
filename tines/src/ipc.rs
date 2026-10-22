@@ -42,6 +42,7 @@ use std::time::Duration;
 use tines_core::{Node, NodeEvent, Store, Transport, TrimPolicy};
 use tines_store::LogStore;
 
+use crate::trust::{adopt_wall_clock, PeerTimeWindow};
 use crate::HostClock;
 
 const MAX_FRAME: usize = 1 << 20; // 1 MiB cap on a single JSON frame
@@ -215,43 +216,63 @@ where
     }
 }
 
+/// The serve loop's state between polls: the host clock, the peer-time window,
+/// and the poll-round count that schedules trim and flush.
+struct HostState {
+    clock: HostClock,
+    window: PeerTimeWindow,
+    rounds: u64,
+}
+
 // Drive the exchange until no new observations arrive or the per-iteration cap
 // (`POLL_CAP`) is reached, then — on schedule — trim and flush.
 //
 // The node isn't `Send` (the real `BtTransport` carries a `dyn Radio` with no
 // `Send` bound), so this can't run on its own thread; it runs inline in
 // [`serve`], fed by the socket read timeouts.
-fn poll_exchange<T>(node: &mut Node<LogStore, T>, clock: &mut HostClock, rounds: &mut u64)
+fn poll_exchange<T>(node: &mut Node<LogStore, T>, host: &mut HostState)
 where
     T: Transport + 'static,
 {
-    while node.poll(clock.now()) > 0 && *rounds < POLL_CAP {
-        *rounds += 1;
+    while node.poll(host.clock.now()) > 0 && host.rounds < POLL_CAP {
+        host.rounds += 1;
     }
 
-    // Peer-time trust scan. The brief resolves trusted time in order: a local
-    // (system-clock) source first, then a peer. The system-clock path anchors
-    // the wall at startup (see main); here, after the poll, we fall back to a
-    // peer: scan the observations stored *since this open* (quarantined data is
-    // invisible) for one carrying `observed_at`, estimate the true wall from the
-    // youngest, and anchor once. If nothing has been received we stay
-    // quarantined — the robot's own fail-safe is outside tines.
-    if !clock.is_trusted() {
-        let now = clock.now();
-        if let Some(est) = node.peer_time_estimate(now) {
-            node.set_wall_clock(est, now);
-            clock.anchor_wall(est, now);
-            eprintln!("tines: trusted wall clock from peer (estimate {est} ms)");
+    // Peer-time trust (spec §9, decision J). Trusted time comes from a local
+    // source first — `main` anchors a trusted system clock at startup — and
+    // otherwise from a peer. While untrusted, re-query the store's estimate
+    // (drawn only from observations stored since this open; quarantined data
+    // is invisible) on every poll, and let the window pick the latest
+    // plausible one; adopt it once, when the window closes. With no peer time
+    // the host stays quarantined: the robot's own fail-safe is outside tines.
+    //
+    // The estimate scans the store, O(n) on every poll. That's acceptable
+    // only because it stops for good once the clock is trusted.
+    if !host.clock.is_trusted() {
+        let now = host.clock.now();
+        let was_open = host.window.is_open();
+        let adopted = host.window.offer(node.peer_time_estimate(now), now);
+        if !was_open && host.window.is_open() {
+            eprintln!("tines: peer wall time seen, collecting estimates before adopting");
+        }
+        if let Some(est) = adopted {
+            match adopt_wall_clock(node, &mut host.clock, est, now) {
+                Some(report) => eprintln!(
+                    "tines: trusted wall clock from peer (estimate {est} ms, downtime {:?} ms)",
+                    report.downtime_ms
+                ),
+                None => eprintln!("tines: peer wall time {est} ms rejected"),
+            }
         }
     }
 
     // On a schedule: trim stale observations and flush the store. Flush is
     // `LogStore::flush`, reached through `Node::flush(now)`, which delegates to
     // `Store::flush` — the infallible durability boundary.
-    if *rounds >= POLL_CAP {
-        *rounds = 0;
-        node.trim(&TrimPolicy::default(), clock.now());
-        match node.flush(clock.now()) {
+    if host.rounds >= POLL_CAP {
+        host.rounds = 0;
+        node.trim(&TrimPolicy::default(), host.clock.now());
+        match node.flush(host.clock.now()) {
             Ok(()) => {}
             Err(e) => eprintln!("tines: store flush failed: {e:?}"),
         }
@@ -273,11 +294,18 @@ where
 ///
 /// `poll_interval_ms` is the read-timeout cadence that feeds the poll loop; the
 /// default (20 ms) keeps the exchange responsive without busy-polling.
+///
+/// `clock` is anchored already if the host trusts a local clock. Otherwise
+/// `serve` takes its wall time from peers: from the first plausible estimate
+/// it collects for `peer_time_window_ms` (decision J; default
+/// [`DEFAULT_PEER_TIME_WINDOW_MS`](crate::trust::DEFAULT_PEER_TIME_WINDOW_MS)),
+/// then adopts the latest, once.
 pub fn serve<T>(
     mut node: Node<LogStore, T>,
     socket_path: impl AsRef<Path>,
-    mut clock: HostClock,
+    clock: HostClock,
     poll_interval_ms: u64,
+    peer_time_window_ms: u64,
 ) -> std::io::Result<()>
 where
     T: Transport + 'static,
@@ -307,7 +335,11 @@ where
         }
     });
 
-    let mut rounds = 0u64;
+    let mut host = HostState {
+        clock,
+        window: PeerTimeWindow::new(peer_time_window_ms),
+        rounds: 0,
+    };
     loop {
         match rx.recv_timeout(Duration::from_millis(poll_interval_ms.max(1))) {
             Ok(mut stream) => {
@@ -316,11 +348,11 @@ where
                 stream
                     .set_read_timeout(Some(Duration::from_millis(poll_interval_ms.max(1))))
                     .expect("connection read timeout");
-                serve_stream(&mut node, &mut stream, &mut clock, &mut rounds)?;
+                serve_stream(&mut node, &mut stream, &mut host)?;
             }
             // Timeout: run the exchange poll loop instead of blocking.
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                poll_exchange(&mut node, &mut clock, &mut rounds);
+                poll_exchange(&mut node, &mut host);
             }
             // The accept thread is gone; stop serving.
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -335,8 +367,7 @@ where
 fn serve_stream<T>(
     node: &mut Node<LogStore, T>,
     stream: &mut UnixStream,
-    clock: &mut HostClock,
-    rounds: &mut u64,
+    host: &mut HostState,
 ) -> io::Result<()>
 where
     T: Transport + 'static,
@@ -344,10 +375,10 @@ where
     loop {
         match read_request(stream) {
             Ok(request) => {
-                let now = clock.now();
+                let now = host.clock.now();
                 // Stamp the observation with the trusted wall time if the host
                 // has one; `None` before the first trusted time (R4).
-                let observed_at = clock.wall_ms(now);
+                let observed_at = host.clock.wall_ms(now);
                 let response = handle(node, request, observed_at, now);
                 if write_response(stream, &response).is_err() {
                     // A client that vanished mid-connection shouldn't take
@@ -357,13 +388,13 @@ where
                 // Drive the exchange after every request so a busy client that
                 // connects back-to-back can't starve it (the WouldBlock path
                 // below only fires once the client goes idle).
-                poll_exchange(node, clock, rounds);
+                poll_exchange(node, host);
             }
             // Peer closed the connection cleanly.
             Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             // Idle read: drive the exchange rather than blocking forever.
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                poll_exchange(node, clock, rounds);
+                poll_exchange(node, host);
             }
             // A malformed frame isn't a disconnect: tell the client and keep
             // serving this connection. The frame can't be identified, so the

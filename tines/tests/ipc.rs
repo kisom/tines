@@ -256,7 +256,8 @@ fn observe_and_belief_over_socket() {
     let socket = dir.join("ipc.sock");
     let node = build_node([9; 16], &dir);
     let serve_path = socket.clone();
-    let _handle = thread::spawn(move || serve(node, serve_path, HostClock::start(), 20).unwrap());
+    let _handle =
+        thread::spawn(move || serve(node, serve_path, HostClock::start(), 20, WINDOW_MS).unwrap());
 
     let mut stream = connect(&socket);
 
@@ -304,7 +305,8 @@ fn events_over_socket() {
     node.poll(0); // ack processed -> confidence event fires
 
     let serve_path = socket.clone();
-    let _handle = thread::spawn(move || serve(node, serve_path, HostClock::start(), 20).unwrap());
+    let _handle =
+        thread::spawn(move || serve(node, serve_path, HostClock::start(), 20, WINDOW_MS).unwrap());
     let mut stream = connect(&socket);
 
     rpc(&mut stream, &Request::Events);
@@ -364,7 +366,8 @@ fn malformed_frame_gets_error_and_connection_survives() {
     let socket = dir.join("ipc.sock");
     let node = build_node([3; 16], &dir);
     let serve_path = socket.clone();
-    let _handle = thread::spawn(move || serve(node, serve_path, HostClock::start(), 20).unwrap());
+    let _handle =
+        thread::spawn(move || serve(node, serve_path, HostClock::start(), 20, WINDOW_MS).unwrap());
     let mut stream = connect(&socket);
 
     // A length-prefixed frame whose body is not valid JSON.
@@ -461,14 +464,17 @@ impl Transport for SharedInMemory {
     }
 }
 
+/// Nodes A and B over one shared in-memory world, and the world.
+type Pair = (
+    Node<LogStore, SharedInMemory>,
+    Node<LogStore, SharedInMemory>,
+    Arc<Mutex<SharedInMemoryWorld>>,
+);
+
 /// Two [`Node`]s over a shared [`SharedInMemory`] world, each with its own
-/// store, bound to ids `[1;16]` (A) and `[2;16]` (B).
-fn build_pair(
-    dir: &Path,
-) -> (
-    Node<LogStore, SharedInMemory>,
-    Node<LogStore, SharedInMemory>,
-) {
+/// store, bound to ids `[1;16]` (A) and `[2;16]` (B), and the world itself (so a
+/// test can inject frames into either inbox).
+fn build_pair(dir: &Path) -> Pair {
     let world = Arc::new(Mutex::new(SharedInMemoryWorld::new()));
     let (a_id, b_id) = ([1; 16], [2; 16]);
     let a_store = LogStore::open(&dir.join("a.store.log"), 0).expect("a store open");
@@ -482,12 +488,13 @@ fn build_pair(
     let tb = SharedInMemory {
         me: b_id,
         their: a_id,
-        world,
+        world: world.clone(),
         contacted: false,
     };
     (
         Node::new(a_id, a_store.first_seq(), a_store, ta),
         Node::new(b_id, b_store.first_seq(), b_store, tb),
+        world,
     )
 }
 
@@ -495,12 +502,7 @@ fn build_pair(
 /// (addressed) observation behind the unknown-wall-clock quarantine — as if B
 /// had resumed with held data. The first open inserts the held observation and
 /// is dropped so the record lands on disk; reopening loads it quarantined.
-fn build_pair_with_held(
-    dir: &Path,
-) -> (
-    Node<LogStore, SharedInMemory>,
-    Node<LogStore, SharedInMemory>,
-) {
+fn build_pair_with_held(dir: &Path) -> Pair {
     let world = Arc::new(Mutex::new(SharedInMemoryWorld::new()));
     let (a_id, b_id) = ([1; 16], [2; 16]);
     let held_store0 = LogStore::open(&dir.join("b.store.log"), 0).expect("b store open0");
@@ -527,12 +529,13 @@ fn build_pair_with_held(
     let tb = SharedInMemory {
         me: b_id,
         their: a_id,
-        world,
+        world: world.clone(),
         contacted: false,
     };
     (
         Node::new(a_id, a_store.first_seq(), a_store, ta),
         Node::new(b_id, b_store.first_seq(), b_store, tb),
+        world,
     )
 }
 
@@ -540,7 +543,7 @@ fn build_pair_with_held(
 #[test]
 fn f2_direct_propagation() {
     let dir = unique_dir("probe");
-    let (mut node_a, mut node_b) = build_pair(&dir);
+    let (mut node_a, mut node_b, _) = build_pair(&dir);
     // Observe FIRST so the broadcast is already in A's store when the summary
     // exchange rebuilds the send queue (mirrors pair.rs).
     let observed = node_a.observe(&topic(), &payload(), None, 0).unwrap();
@@ -565,16 +568,16 @@ fn f2_direct_propagation() {
 #[test]
 fn f2_propagation_between_instances() {
     let dir = unique_dir("propagate");
-    let (node_a, node_b) = build_pair(&dir);
+    let (node_a, node_b, _) = build_pair(&dir);
 
     let socket_a = dir.join("a.sock");
     let socket_b = dir.join("b.sock");
     let (clock_a, clock_b) = (HostClock::start(), HostClock::start());
 
     let socket_a_thread = socket_a.clone();
-    let _a = thread::spawn(move || serve(node_a, socket_a_thread, clock_a, 20).unwrap());
+    let _a = thread::spawn(move || serve(node_a, socket_a_thread, clock_a, 20, WINDOW_MS).unwrap());
     let socket_b_thread = socket_b.clone();
-    let _b = thread::spawn(move || serve(node_b, socket_b_thread, clock_b, 20).unwrap());
+    let _b = thread::spawn(move || serve(node_b, socket_b_thread, clock_b, 20, WINDOW_MS).unwrap());
 
     // A observes on its socket.
     let mut stream_a = connect(&socket_a);
@@ -612,162 +615,261 @@ fn f2_propagation_between_instances() {
     panic!("observation through A never became a belief through B");
 }
 
-// Trusted wall time (Task 10b): each test pins the brief's requirement verbatim.
+// Trusted wall time (spec §9, decisions G and J; 1.0 review B3).
+//
+// These run the host's own trust logic: B is a served instance (its node moves
+// into `serve`), A is a bare node the test pumps. What B decided is read off
+// the `observed_at` of an observation B makes over IPC once it reaches A —
+// `serve` stamps it from B's `HostClock`, so it is `None` until B adopts a
+// wall time and `adopted + elapsed` after.
 
-/// With a trusted clock, an IPC `Observe` produces an observation carrying
-/// `observed_at = Some(_)` (R4: once trusted, every observation is stamped).
+/// The peer-time window the served instances use: short, to keep tests fast.
+const WINDOW_MS: u64 = 300;
+
+/// A plausible wall time (2027-01-15), inside the hosts' bounds.
+const W: u64 = 1_800_000_000_000;
+
+/// An observation from A with a forged or chosen `observed_at` and `age_ms`.
+/// `Observation` is non-exhaustive, so build it and then set the age.
+fn crafted(seq: u64, observed_at: u64, age_ms: u64) -> Observation {
+    let mut obs =
+        Observation::broadcast([1; 16], seq, &topic(), b"crafted").with_observed_at(observed_at);
+    obs.age_ms = age_ms;
+    obs
+}
+
+/// Deliver `obs` to B's inbox as a broadcast from A.
+fn inject(world: &Arc<Mutex<SharedInMemoryWorld>>, obs: &Observation) {
+    let (a_id, b_id) = ([1u8; 16], [2u8; 16]);
+    let ev = encode_frame(a_id, OBS_TAG, &(a_id, obs.clone()));
+    world
+        .lock()
+        .unwrap()
+        .inboxes
+        .entry(b_id)
+        .or_default()
+        .push_back(ev);
+}
+
+/// Serve B on its own thread; returns the socket path.
+fn serve_b(node_b: Node<LogStore, SharedInMemory>, clock: HostClock, dir: &Path) -> PathBuf {
+    let socket = dir.join("b.sock");
+    let path = socket.clone();
+    let _b = thread::spawn(move || serve(node_b, path, clock, 5, WINDOW_MS).unwrap());
+    socket
+}
+
+/// Pump A until `done(A, t)` holds, or panic after ~20 s.
+fn pump_a_until(
+    node_a: &mut Node<LogStore, SharedInMemory>,
+    t: &mut u64,
+    what: &str,
+    mut done: impl FnMut(&Node<LogStore, SharedInMemory>, u64) -> bool,
+) {
+    for _ in 0..10_000 {
+        let _ = node_a.poll(*t);
+        if done(node_a, *t) {
+            return;
+        }
+        *t += 2;
+        thread::sleep(Duration::from_millis(2));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// Make an observation on B over IPC, wait for it to reach A, and return the
+/// `observed_at` B stamped it with.
+fn b_stamp(
+    socket_b: &Path,
+    node_a: &mut Node<LogStore, SharedInMemory>,
+    t: &mut u64,
+    n: u32,
+) -> Option<u64> {
+    let mut stream = connect(socket_b);
+    rpc(
+        &mut stream,
+        &Request::Observe {
+            topic: hex_encode(&topic()),
+            payload: hex_encode(format!("probe-{n}").as_bytes()),
+        },
+    );
+    let id = match read_response(&mut stream) {
+        Response::Observe { id } => id,
+        other => panic!("expected Observe, got {other:?}"),
+    };
+    let mut found = None;
+    pump_a_until(node_a, t, "B's observation to reach A", |a, now| {
+        a.store().for_each_topic(&topic(), now, &mut |obs| {
+            if hex_encode(&obs.id()) == id {
+                found = Some(obs.observed_at);
+            }
+        });
+        found.is_some()
+    });
+    found.expect("found")
+}
+
+/// Probe B until its observations carry a wall time; return the first one.
+fn b_adopted_stamp(
+    socket_b: &Path,
+    node_a: &mut Node<LogStore, SharedInMemory>,
+    t: &mut u64,
+) -> u64 {
+    for n in 0..50 {
+        if let Some(at) = b_stamp(socket_b, node_a, t, n) {
+            return at;
+        }
+        thread::sleep(Duration::from_millis(WINDOW_MS / 2));
+    }
+    panic!("B never adopted a wall time");
+}
+
+/// With a trusted clock, an IPC `Observe` through `serve` produces an
+/// observation carrying the host's wall time (R4: once trusted, every
+/// observation is stamped).
 #[test]
 fn observe_has_observed_at_after_trusted_time() {
     let dir = unique_dir("after");
-    let (mut node_a, _) = build_pair(&dir);
+    let (mut node_a, node_b, _) = build_pair(&dir);
+    let mut clock_b = HostClock::start();
+    clock_b.anchor_wall(W, clock_b.now());
+    let socket_b = serve_b(node_b, clock_b, &dir);
 
-    // A is trusted (a "system clock"); wall_ms is Some once anchored.
-    let mut clock_a = HostClock::start();
-    let wall = 1_700_000_000_000u64;
-    clock_a.anchor_wall(wall, 0);
-    let observed_at = clock_a.wall_ms(0).expect("trusted");
-
-    let id = node_a
-        .observe(&topic(), &payload(), Some(observed_at), 0)
-        .unwrap();
-    let stored = node_a.store().get(&id, 0).expect("stored");
-    assert_eq!(stored.observed_at, Some(wall));
+    let mut t = 0;
+    let at = b_stamp(&socket_b, &mut node_a, &mut t, 0).expect("stamped once trusted");
+    assert!(
+        (W..W + 60_000).contains(&at),
+        "stamp is the anchored wall plus elapsed ticks: {at}"
+    );
 }
 
-/// Without a trusted clock, an IPC `Observe` carries `observed_at = None` (R4:
-/// a observation made while quarantined is un-stamped).
+/// Without a trusted clock (and no peer time to adopt), an IPC `Observe`
+/// through `serve` carries `observed_at = None` (R4: an observation made while
+/// quarantined is un-stamped).
 #[test]
 fn observe_has_no_observed_at_before_trusted_time() {
     let dir = unique_dir("before");
-    let (mut node_a, _) = build_pair(&dir);
+    let (mut node_a, node_b, _) = build_pair(&dir);
+    let socket_b = serve_b(node_b, HostClock::start(), &dir);
 
-    // A has no trusted clock yet: wall_ms is None, so observed_at is None.
-    let clock_a = HostClock::start();
-    let observed_at = clock_a.wall_ms(0);
-    assert_eq!(observed_at, None);
-
-    let id = node_a
-        .observe(&topic(), &payload(), observed_at, 0)
-        .unwrap();
-    let stored = node_a.store().get(&id, 0).expect("stored");
-    assert_eq!(stored.observed_at, None);
+    let mut t = 0;
+    assert_eq!(b_stamp(&socket_b, &mut node_a, &mut t, 0), None);
 }
 
-/// Of two received observations with `observed_at`, the peer estimate comes from
-/// the one with the smallest `age_ms` (the youngest), so the wall is pulled
-/// toward the newest broadcast.
-#[test]
-fn smallest_age_wins() {
-    let dir = unique_dir("young");
-    let (mut node_a, mut node_b) = build_pair(&dir);
-
-    // A observes two broadcasts on the same topic: an old one and one 5000 ms
-    // newer. The younger one has the smaller age_ms, so the peer estimate must
-    // be drawn from it.
-    let mut clock_a = HostClock::start();
-    let wall = 1_700_000_000_000u64;
-    clock_a.anchor_wall(wall, 0);
-
-    let old = node_a
-        .observe(&topic(), b"old", clock_a.wall_ms(0), 0)
-        .unwrap();
-    let young = node_a
-        .observe(&topic(), b"young", clock_a.wall_ms(5000), 5000)
-        .unwrap();
-
-    let poll_interval = 10u64;
-    let mut t = 0u64;
-    let mut both = false;
-    for _ in 0..1000 {
-        let _ = node_a.poll(t);
-        let _ = node_b.poll(t);
-        t += poll_interval;
-        if node_b.store().contains(&old) && node_b.store().contains(&young) {
-            both = true;
-            break;
-        }
-    }
-    assert!(both, "both broadcasts never reached B after 1000 rounds");
-
-    let now = t;
-    let est = node_b
-        .peer_time_estimate(now)
-        .expect("peer_time_estimate should find both observations");
-    // The young observation's observed_at (wall + 5000) is newer, so the
-    // estimate must sit near it -- well ahead of the old observation's wall.
-    assert!(
-        est > wall + 4000,
-        "estimate must come from the younger observation: got {est}, expected > {}",
-        wall + 4000
-    );
-}
-
-/// Instance A has trusted time and observes; instance B has none and a log that
-/// already holds one quarantined (held) observation. After an exchange B's
-/// `set_wall_clock` has run with an estimate within one poll interval of A's
-/// wall time, and B's held observation becomes visible.
+/// Instance B has no trusted time and a log that already holds one
+/// quarantined (held) observation addressed to A. A broadcasts an observation
+/// carrying a wall time. B's own host logic — not the test — derives an
+/// estimate from it, adopts it once the window closes, and stamps its later
+/// observations with it. Adopting runs the unknown-downtime fold, which
+/// expires B's held addressed observation, so it never reaches A.
 #[test]
 fn time_from_peer() {
     let dir = unique_dir("peer");
-    let (mut node_a, mut node_b) = build_pair_with_held(&dir);
+    let (mut node_a, node_b, _) = build_pair_with_held(&dir);
+    let socket_b = serve_b(node_b, HostClock::start(), &dir);
 
-    // A is trusted (system-clock equivalent); anchor the wall at tick 0.
-    let mut clock_a = HostClock::start();
-    let wall = 1_700_000_000_000u64;
-    clock_a.anchor_wall(wall, 0);
-
-    // A observes a broadcast (carrying trusted wall time) at tick 0.
-    let observed_at = clock_a.wall_ms(0);
-    let held = node_a
-        .observe(&topic(), &payload(), observed_at, 0)
-        .unwrap();
-
-    // Drive the exchange until A's broadcast lands in B's store. B's first poll
-    // returns Contact, so it receives on the next round.
-    let poll_interval = 10u64;
-    let mut t = 0u64;
-    let mut received = false;
-    for _ in 0..1000 {
-        let _ = node_a.poll(t);
-        let _ = node_b.poll(t);
-        if node_b.store().contains(&held) {
-            received = true;
-            break;
-        }
-        t += poll_interval;
-    }
-    assert!(received, "A's broadcast never reached B");
-
-    // Estimate the true wall from the youngest non-quarantined observed_at-
-    // bearing observation this boot (B's held obs is quarantined -> invisible),
-    // which is A's broadcast.
-    let now_b = t;
-    let est = node_b
-        .peer_time_estimate(now_b)
-        .expect("peer_time_estimate should find A's broadcast");
-
-    let a_wall_now = clock_a.wall_ms(now_b).expect("A trusted");
+    // A observes at tick 0 with a trusted wall time; the exchange carries it
+    // to B.
+    node_a
+        .observe(&topic(), &payload(), Some(W), 0)
+        .expect("observe");
+    let mut t = 0;
+    let at = b_adopted_stamp(&socket_b, &mut node_a, &mut t);
     assert!(
-        est <= a_wall_now,
-        "estimate never later than true time: {est} > {a_wall_now}"
+        (W..W + 60_000).contains(&at),
+        "B's stamp follows A's wall time: {at}"
     );
-    assert!(
-        a_wall_now.saturating_sub(est) <= poll_interval,
-        "estimate within one poll interval: diff {} ms",
-        a_wall_now - est
-    );
+    // The held observation was addressed to A; the fold expired it, so it is
+    // never delivered.
+    let mut held_seen = false;
+    node_a.store().for_each_topic(&topic(), t, &mut |obs| {
+        held_seen |= obs.payload.as_slice() == b"held";
+    });
+    assert!(!held_seen, "B's held addressed observation reached A");
+}
 
-    // The first trusted time anchors the wall once and runs the fold. Under the
-    // (unknown) downtime B is in, the fold ages its held observation past
-    // lifetime and lifts its quarantine (the "becomes visible" event): the fold
-    // report counts exactly that one addressed observation expiring.
-    let report = node_b.set_wall_clock(est, now_b);
-    assert_eq!(
-        report.downtime_ms, None,
-        "unknown downtime for a fresh store"
+/// Decision J's window: the host doesn't adopt the first plausible estimate.
+/// A first observation gives an estimate of about `W`; a second, arriving
+/// inside the window, gives about `W + 6000`. The host adopts the later,
+/// larger one.
+#[test]
+fn window_adopts_a_later_larger_estimate() {
+    let dir = unique_dir("window");
+    let (mut node_a, node_b, world) = build_pair(&dir);
+    let socket_b = serve_b(node_b, HostClock::start(), &dir);
+
+    inject(&world, &crafted(1, W - 1_000, 1_000)); // estimate ~ W
+    thread::sleep(Duration::from_millis(WINDOW_MS / 3));
+    inject(&world, &crafted(2, W + 6_000, 0)); // estimate ~ W + 6000
+
+    let mut t = 0;
+    let at = b_adopted_stamp(&socket_b, &mut node_a, &mut t);
+    assert!(
+        (W + 6_000..W + 66_000).contains(&at),
+        "B adopted the larger estimate: stamp {at}, expected >= {}",
+        W + 6_000
     );
-    assert_eq!(
-        report.expired_addressed, 1,
-        "the held observation is aged past lifetime on trust"
+}
+
+/// Decision J's selection: of two observations arriving together, the one
+/// with the smaller `age_ms` gives the *smaller* estimate (`W` against
+/// `W + 6000`). Smallest-age selection would adopt `W`; the host adopts the
+/// latest estimate.
+#[test]
+#[ignore = "needs decision J store change"]
+fn latest_estimate_wins_over_smallest_age() {
+    let dir = unique_dir("latest");
+    let (mut node_a, node_b, world) = build_pair(&dir);
+    let socket_b = serve_b(node_b, HostClock::start(), &dir);
+
+    inject(&world, &crafted(1, W, 0)); // smaller age, estimate ~ W
+    inject(&world, &crafted(2, W + 5_000, 1_000)); // estimate ~ W + 6000
+
+    let mut t = 0;
+    let at = b_adopted_stamp(&socket_b, &mut node_a, &mut t);
+    assert!(
+        (W + 6_000..W + 66_000).contains(&at),
+        "B adopted the latest estimate: stamp {at}, expected >= {}",
+        W + 6_000
     );
+}
+
+/// B stores an observation with the given `observed_at`, keeps serving, and
+/// never adopts a wall time from it.
+fn assert_not_adopted(tag: &str, observed_at: u64) {
+    let dir = unique_dir(tag);
+    let (mut node_a, node_b, world) = build_pair(&dir);
+    let socket_b = serve_b(node_b, HostClock::start(), &dir);
+
+    let bad = crafted(1, observed_at, 0);
+    inject(&world, &bad);
+    // B stored it: it forwards it back to A, which doesn't hold it.
+    let mut t = 0;
+    pump_a_until(
+        &mut node_a,
+        &mut t,
+        "B to forward the observation",
+        |a, _| a.store().contains(&bad.id()),
+    );
+    // Give the window ample time to have closed had B accepted it.
+    thread::sleep(Duration::from_millis(3 * WINDOW_MS));
+    assert_eq!(
+        b_stamp(&socket_b, &mut node_a, &mut t, 0),
+        None,
+        "B adopted an implausible wall time from observed_at = {observed_at}"
+    );
+}
+
+/// B3: a forged `observed_at = u64::MAX` neither panics the host nor gets
+/// adopted (the estimate saturates to `u64::MAX`, above the ceiling). The
+/// host still answers IPC afterwards, which `b_stamp` exercises.
+#[test]
+fn forged_max_observed_at_is_not_adopted() {
+    assert_not_adopted("forged", u64::MAX);
+}
+
+/// B3: an estimate below the floor (here 2001) is not adopted.
+#[test]
+fn below_floor_observed_at_is_not_adopted() {
+    assert_not_adopted("floor", 1_000_000_000_000);
 }

@@ -80,7 +80,7 @@ impl HostClock {
     /// (R4: an observation made while quarantined carries `observed_at = None`).
     pub fn wall_ms(&self, now: u64) -> Option<u64> {
         self.wall_at_set
-            .map(|wall| wall + now.saturating_sub(self.anchor_tick))
+            .map(|wall| wall.saturating_add(now.saturating_sub(self.anchor_tick)))
     }
 
     /// Whether the host has a trusted wall clock (i.e. trust has been
@@ -124,6 +124,15 @@ mod tests {
             second < 60_000,
             "HostClock::now must be ms since process start, was {second}",
         );
+    }
+
+    /// B3: a forged wall near `u64::MAX` saturates instead of overflowing
+    /// (a panic in debug, a wrap to about 1970 in release).
+    #[test]
+    fn wall_ms_saturates_instead_of_overflowing() {
+        let mut clock = HostClock::start();
+        clock.anchor_wall(u64::MAX - 5, 0);
+        assert_eq!(clock.wall_ms(100), Some(u64::MAX));
     }
 
     #[test]
