@@ -19,7 +19,7 @@ architecture in the **spec first**:
 - **Addressed delivery (authoritative):** `docs/superpowers/specs/2026-10-18-tines-addressed-delivery.md`
 - **Fleet deployment v1 (authoritative):** `docs/superpowers/specs/2026-10-18-tines-fleet-deployment-design.md` — supersedes the addressed-delivery spec's epidemic forwarding (custody chain with handoff receipts).
 - **Fleet fixes (done):** `docs/superpowers/specs/2026-10-19-tines-fleet-fixes.md` — security-assessment findings F1–F5 and F17.
-- **tines-core 1.0 (done — shipped as tines-core 1.0.0, 2026-10-21):** `docs/superpowers/specs/2026-10-18-tines-1-0-design.md` — wire version, public API, signature slot, core hardening (§10).
+- **tines-core 1.0 (implemented on `feat/tines-core-1-0`; publish pending):** `docs/superpowers/specs/2026-10-18-tines-1-0-design.md` — wire version, public API, signature slot, core hardening (§10).
 - **Host hardening (next, hosts):** `docs/superpowers/specs/2026-10-19-tines-host-hardening.md` — findings F10–F12.
 - **Implementation plans:** `docs/superpowers/plans/`
 
@@ -111,15 +111,28 @@ Split into **wire** (frozen for wire v1 — changing one changes how a v1 peer
 decodes or interprets a frame) and **local** (never crosses the wire; may
 change in a minor release):
 
-- **Wire:** `WIRE_VERSION=4`, `MAX_TOPIC=64`, `MAX_PAYLOAD=1024`,
+- **Wire** (public): `WIRE_VERSION=4`, `MAX_TOPIC=64`, `MAX_PAYLOAD=1024`,
   `MAX_FRAME=1500`, `SUMMARY_BYTES=512`, `ACK_IDS_CAP=90`, `MAX_SIG=64`,
-  `BLOOM_K=3`, plus the private `MAX_FRAGMENTS=64`.
-- **Local:** `MAX_PEERS=8`, `SUMMARY_INTERVAL_MS=2000`,
-  `REASSEMBLY_TIMEOUT_MS=5000`, `SEND_QUEUE_CAP=256`, `MIN_MTU`,
-  `EVENT_QUEUE_CAP=64`, `DROP_TABLE_CAP=32`, `BCAST_SENT_CAP=256`,
-  `ACK_BUFFER_CAP=256`.
+  `BLOOM_K=3`. Also wire, but private: `MAX_FRAGMENTS=64`, which lives in
+  `tines-core/src/frag.rs`, not `consts.rs`.
+- **Local** (`pub(crate)`, spec decision K: defaults that a later 1.x makes
+  configurable): `MAX_PEERS=8`, `SUMMARY_INTERVAL_MS=2000`,
+  `REASSEMBLY_TIMEOUT_MS=5000`, `SEND_QUEUE_CAP=256`, `EVENT_QUEUE_CAP=64`,
+  `DROP_TABLE_CAP=32`, `BCAST_SENT_CAP=256`, `ACK_BUFFER_CAP=256`,
+  `PEER_IDLE_MS=30_000`, and `MIN_MTU=23`. `MIN_MTU` is the lower bound of the
+  fragmentation MTU sweep in tests (BLE ATT's default), not the smallest
+  usable MTU; `Transport::mtu`'s rustdoc states those floors (85 bytes for
+  every valid observation).
 
-Match the exact values above.
+Match the exact values above. A crate outside core that needs a matching
+number keeps its own constant (as `tines-bt` does for `MAX_PEERS` and
+`MIN_MTU`).
+
+The `conformance` feature also compiles a `#[doc(hidden)]`
+`tines_core::conformance` module: byte-level frame encoders and decoders, and
+mirrors of the local limits, for the fuzz harness and tests outside core. It
+isn't supported public API and isn't covered by semver. Don't build on it
+outside the workspace and `fuzz/`.
 
 ## Crate layout
 

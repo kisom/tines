@@ -37,7 +37,7 @@ the peer's advertised [`NodeId`] instead:
   hard-coded one.
 
 A frame's declared sender is then checked against the bound [`NodeId`]: the
-transport peeks the `from` field with [`wire::frame_sender`] and drops any frame
+transport peeks the `from` field with [`frame_sender`] and drops any frame
 whose declared sender differs from the bound peer (an address-spoofing
 violation).
 
@@ -49,7 +49,8 @@ violation).
 
 ## Multi-peer
 
-Up to [`MAX_PEERS`] connections may be live at once, one per bound [`NodeId`];
+Up to `MAX_PEERS` (8, tines-bt's own cap, equal to tines-core's peer table)
+connections may be live at once, one per bound [`NodeId`];
 a second connection to the same [`NodeId`] replaces the first.
 
 **Current limit:** `BluerRadio::new` and `BtTransport::new` still take a single
@@ -75,12 +76,11 @@ BlueZ version here, along with whether SeqPacket worked or the length-prefix
 fallback was needed.
 
 [`Transport`]: https://docs.rs/tines-core/latest/tines_core/transport/trait.Transport.html
-[`NodeId`]: https://docs.rs/tines-core/latest/tines_core/observation/struct.NodeId.html
+[`NodeId`]: https://docs.rs/tines-core/latest/tines_core/observation/type.NodeId.html
 [`Radio`]: crate::Radio
 [`BluerRadio`]: crate::BluerRadio
 [`adv::decode_ad_node_id`]: crate::adv::decode_ad_node_id
-[`wire::frame_sender`]: https://docs.rs/tines-core/latest/tines_core/wire/fn.frame_sender.html
+[`frame_sender`]: https://docs.rs/tines-core/latest/tines_core/fn.frame_sender.html
 [`MAX_FRAME`]: https://docs.rs/tines-core/latest/tines_core/consts/constant.MAX_FRAME.html
-[`MAX_PEERS`]: https://docs.rs/tines-core/latest/tines_core/consts/constant.MAX_PEERS.html
 [`l2cap::SeqPacket`]: https://docs.rs/bluer/latest/bluer/l2cap/struct.SeqPacket.html
 [`SeqPacketListener`]: https://docs.rs/bluer/latest/bluer/l2cap/struct.SeqPacketListener.html

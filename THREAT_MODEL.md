@@ -3,10 +3,13 @@
 - **Assessed:** `master` at `3b1a644` (tines-core / tines-store / tines-bt /
   tines-ros2 / tines 0.3.0, fleet-deployment milestone mostly landed)
 - **Date:** 2026-10-19
-- **Updated:** 2026-10-20 at `89041ea`, after the fleet fixes landed. The
-  findings keep their original text; each fixed one ends with a **Fixed**
-  or **Partly fixed** line, and §6 adds F18, found in the re-check.
-- **Status:** living document.It's not a spec: update it when the code or the
+- **Updated:** 2026-10-21 at `411daa0` (`feat/tines-core-1-0`), after the
+  tines-core 1.0 review fixes landed. Earlier update: 2026-10-20 at
+  `89041ea`, after the fleet fixes. The findings keep their original text;
+  each fixed one ends with a **Fixed** or **Partly fixed** line. §6 adds
+  F18, found in the fleet re-check, and F19, found with the 1.0 trusted-time
+  work.
+- **Status:** living document. It's not a spec: update it when the code or the
   trust assumptions change.
 - **Related:** the 1.0 spec (`docs/superpowers/specs/2026-10-18-tines-1-0-design.md`),
   especially §2a (signature slot) and §2b (age and the 1.1 threat model).
@@ -57,22 +60,24 @@ threat questions (§8) before designing signing.
 | F5 | Fixed | `4718b6f`, `24b5a78` |
 | F17 | Fixed | `6e2dc6f` |
 
-**1.0 fixes, 2026-10-21** (through `941a7ce`):
+**1.0 fixes, 2026-10-21** (through `411daa0`, on `feat/tines-core-1-0`; not
+yet merged or published):
 
 | # | Status | Commit |
 |---|---|---|
-| F6 | Fixed | `fb71810` |
-| F8 | Fixed | `fb71810` |
-| F9 | Fixed | `fb71810`, `a180ec2` |
-| F13 | Fixed | `fb71810` |
-| F18 | **Partly fixed**: the stale clock-marker tick is fixed (`Store::flush(now)` takes the caller's `now`); hosts still don't flush on a schedule | `c42f5de` |
-| F19 | **Open** (new, 2026-10-21): peer-derived trusted time is unauthenticated | — |
+| F6 | Fixed | `fb71810`, `506d880` (the pin resets on a repeat `Contact`) |
+| F8 | Fixed | `fb71810`, `84c79fa` (silent and contact-only peers are evicted) |
+| F9 | Fixed | `fb71810`, `a180ec2`, `53f592f` (rate-limit slack) |
+| F13 | Fixed (Reassembler displacement accepted, per spec) | `fb71810`, `506d880`, `9362e9f` |
+| F18 | **Partly fixed**: the store side is done (flush through the `Store` trait, the caller's tick as the marker, clamping), and both hosts flush right after they first adopt trusted time. Hosts still don't flush on a timer or at shutdown | `c42f5de`, `06a0577`, `039fbf7`, `e4544bf` |
+| F19 | **Partly mitigated** (new, 2026-10-21): peer time is chosen by decision J and bounded to a plausible range, but it stays unauthenticated until 1.1 | `039fbf7`, `e4544bf`, `4690bf9`, `03b75f2` |
 
 Still open:
 - F10–F12: the host-hardening spec.
 - F7 and F14: 1.1.
-- F18 (remaining): scheduled flushes, host work (§10).
-- F19: 1.1 (signatures), or a local clock source before peers (§6).
+- F18 (remaining): timed and shutdown flushes, host work (§10).
+- F19 (remaining): 1.1 (signatures); until then, a local clock source
+  wherever one exists (§6).
 
 ## 2. System and trust boundaries
 
@@ -145,10 +150,10 @@ the fleet fixes.
 | Malformed frames dropped | Hard constraint | **Holds** in core (wire.rs:64-69). The 1.0 spec adds reporting. | Unchanged; 1.0 adds reporting. |
 | Bounded memory in core | Fixed-capacity buffers | **Holds** for the exchange (§6 table). **Doesn't hold for the system**: MemStore and LogStore are unbounded without `trim`, and no host calls `trim` (F10). | Unchanged in practice: the service calls `trim` with an empty default policy, tines-ros2 never does (F10, F18). |
 | Custody: ≥ 1 holder (no carrier failure) | Fleet spec, sim property | **Breaks without an attacker** when a store is full (F1). Breaks trivially under A1 (F7). | Holds without an attacker (F1 fixed, with a sim property). Still breaks under A1 (F7). |
-| Frames bound to the advertised NodeId | Fleet spec ("frames whose `from` differs … are dropped at the transport") | **Doesn't hold** (F3, F6). | **Holds at the transport** for tines-bt (F3), against unauthenticated adverts. Core still re-reads `from` per frame (F6). |
+| Frames bound to the advertised NodeId | Fleet spec ("frames whose `from` differs … are dropped at the transport") | **Doesn't hold** (F3, F6). | **Holds at the transport** for tines-bt (F3), against unauthenticated adverts. Since 1.0 (`fb71810`, `506d880`) core also pins a peer's NodeId to its first frame in a contact and drops, and counts, a frame whose `from` differs (F6). |
 | Released messages not re-forwarded after reboot | Fleet spec | **Doesn't hold**: release flags are never flushed (F4). Safe direction (duplicate custodian), but wasteful. | **Holds**: `Release` records are appended at once (not fsynced until the next flush, so a power cut can still lose one). |
 | `next_seq` persisted across reboots | Core contract | **Doesn't hold** in either host (F4). | **Holds**: a persisted boot counter seeds `first_seq` in both hosts. |
-| Age continues across reboot | Fleet spec | Partly. Hosts open the store at tick 0, and the service's tick is wall-clock *seconds* (F17). | Partly. Monotonic ms (F17 fixed) and clock markers fold age across a restart, but only up to the last flush, which may be long ago or never (F18). |
+| Age continues across reboot | Fleet spec | Partly. Hosts open the store at tick 0, and the service's tick is wall-clock *seconds* (F17). | Partly. Monotonic ms (F17 fixed) and clock markers fold age across a restart, but only up to the last flush, which may be long ago or never (F18). Since 1.0 the downtime itself is folded in once the host has trusted wall time; without it, held addressed messages expire and broadcasts are floored (F18, F19). |
 
 ## 6. Findings
 
@@ -312,6 +317,10 @@ handshake.
   the transport, so this is F3's consequence. Still, core could cheaply
   refuse a NodeId *change* for an existing peer within a contact, and
   should, once the transport binds identities.
+- **Fixed in `fb71810`, `506d880`:** the first decoded frame in a contact
+  pins `peer.id`. A later frame with another `from` is dropped and counted as
+  `DropReason::IdentityChanged`. The pin resets on `Lost` and on a repeat
+  `Contact`.
 
 ### F7 — Custody can be taken by anyone the carrier sends to (Medium; by design v1)
 
@@ -339,6 +348,12 @@ Eight spoofed addresses lock a robot out of exchange until restart.
 
 **Fix:** idle-timeout eviction in core (a local constant), and real
 `Lost` events from tines-bt.
+- **Fixed in `84c79fa`** (first attempt `fb71810` evicted only the peer that
+  had just sent): a peer with no inbound frame for `PEER_IDLE_MS` (30 s),
+  counted from its contact if it never sent, is removed as if `Lost`. Idle
+  peers are swept before a peer is added and at the start of every
+  `next_frame`, so eight silent or contact-only addresses can't hold the
+  table.
 
 ### F9 — Summary amplification (Medium, A1)
 
@@ -351,9 +366,18 @@ re-queues what was already sent.
 
 - Each rebuild also scans every broadcast and clones payloads, which costs
   CPU and allocation per summary, with no rate limit.
-- **Fix:** rate-limit summary processing per peer (honour at most one per
-  `SUMMARY_INTERVAL_MS`), and remember what was already sent this contact
-  (`bcast_sent` already exists) so a repeated summary doesn't re-queue it.
+- **Fix** (as amended in spec §10, 2026-10-20 and decision L):
+  - Rate-limit summary processing per peer: act on at most one summary per
+    `SUMMARY_INTERVAL_MS`. To allow for poll jitter, a summary is accepted
+    once at least `SUMMARY_INTERVAL_MS / 2` has passed since the last one
+    acted on, which still bounds replay to two per interval.
+  - The send-queue rebuild skips ids the peer's filter says it holds
+    (`Bloom::might_contain`). Output per received summary stays bounded by
+    `SEND_QUEUE_CAP`.
+  - It doesn't skip ids already sent this contact. "Sent" doesn't mean
+    "received", so a peer that lost an id must get it again on its next
+    summary.
+- **Fixed in `fb71810`, `a180ec2`, `53f592f`.**
 
 ### F10 — Unbounded growth (Medium, A0/A1/A4)
 
@@ -364,6 +388,9 @@ re-queues what was already sent.
     which removes nothing; tines-ros2 never calls it. Releases are now one
     small record each rather than a growing list, but the log still never
     compacts.
+  - *At `411daa0`:* `LogStore` rewrites the log as a snapshot at every open
+    and after the wall-clock fold (`06a0577`), which compacts it. Between
+    those points it only grows, and the trim policy is still empty.
 - Unbounded channels: tines-bt's inbound and outbound `mpsc`
   (transport.rs:207-208), and tines-ros2's inbound `mpsc` (node.rs:152).
 - The IPC server allocates up to 1 MiB per request frame.
@@ -435,6 +462,15 @@ re-queues what was already sent.
 - **Trailing bytes:** `postcard::from_bytes` accepts trailing bytes after a
   valid frame. That's harmless now, but the 1.0 vectors should pin
   rejection so the wire format is canonical.
+- **Fixed in `fb71810`, `506d880`, `9362e9f`**, with Reassembler
+  displacement accepted, per spec §10:
+  - the event queue drops the oldest event;
+  - removing a peer purges that peer's pending acks, and only its own
+    (`506d880`; the first fix purged every peer's);
+  - a frame, and a reassembled observation (`9362e9f`), must decode with
+    no trailing bytes, or it's counted as `Malformed`;
+  - displacement stays as it is: it's same-address only, and the transport
+    binding (F3) plus the F6 pin limit who can do it.
 
 ### F14 — Belief policies trust attacker-controlled fields (Medium; by design v1)
 
@@ -489,8 +525,8 @@ marker that carries age across a restart, and it's the only `fsync` for
 inserts and trims (log.rs module docs, "Durability contract").
 
 - The service runs `trim` and `flush` only after `POLL_CAP` (64) polls that
-  each stored something new (tines/src/ipc.rs:199-217). The counter
-  advances only while observations arrive, so a robot that is mostly
+  each stored something new (tines/src/ipc.rs:269-279 at `411daa0`). The
+  counter advances only while observations arrive, so a robot that is mostly
   offline, the normal case, may never flush.
 - tines-ros2 never calls `flush` or `trim`.
 - Even when it runs, `flush` wrote `LogStore`'s own tick as the clock
@@ -514,30 +550,81 @@ inserts and trims (log.rs module docs, "Durability contract").
   `flush_interval_ms`, from the host's monotonic clock) in both hosts, and
   on clean shutdown. The fleet-fixes spec asked for "a scheduled flush". The
   trim defaults belong to host hardening (F10).
+- **Partly fixed in `c42f5de`, `06a0577`, `039fbf7`, `e4544bf`.**
+  - **Store side, done.** `Store::flush(now)` takes the caller's tick
+    (`c42f5de`). `LogStore` implements it as the trait method, so
+    `Node::flush` really writes the marker and fsyncs; before `06a0577` it
+    hit the trait's no-op default. An earlier `now` is clamped to the
+    store's time anchor.
+  - **Flush after first trusted time, done.** Both hosts adopt trusted time
+    through `tines::trust::adopt_wall_clock` (tines/src/trust.rs:90-108),
+    which flushes right after the fold. So the first marker with a wall time
+    reaches disk at once.
+  - **Snapshots.** `LogStore` also rewrites the log at open and after the
+    fold (decision I), so the fold's results survive a reboot.
+  - **Still open (host work):**
+    - The service's scheduled trim and flush are still tied to `POLL_CAP`
+      productive polls (tines/src/ipc.rs:269-279).
+    - tines-ros2 flushes only when it adopts trusted time, and never trims.
+    - Neither host flushes on a timer or at clean shutdown. A quiet robot
+      that loses power long after its last flush still under-counts the
+      time since that flush.
 
-### F19 — Peer-derived trusted time is unauthenticated (Medium, A0)
+### F19 — Peer-derived trusted time is unauthenticated (Medium, A0/A1)
 
 *Added 2026-10-21, when the hosts gained the peer-time path (Task 10b).*
-When a host has no `trusted_clock = "system"` source, it estimates wall time
-from a peer's observation: `observed_at + age_ms` from the youngest such
-observation, then folds it into the store once. Nothing authenticates that
-estimate.
+When a host has no local trusted clock, it estimates wall time from peers'
+observations (`observed_at + age_ms`, advanced by local ticks since the
+observation arrived), then folds it into the store once. Nothing
+authenticates that estimate.
 
 - **Effect:**
-  - A forged time **ahead** of the true time only makes observations expire
-    early: the fold ages everything faster, addressed messages die sooner,
-    and `observed_at` stamps run fast. Availability loss, not integrity loss.
-  - A forged time **behind** the true time takes the "downtime unknown"
-    path (or under-folds), leaving the store quarantined longer or ages
-    younger — the same effect as F17/F18 by another route.
-  - Worst case: the robot's own `observed_at` stamps are wrong until a
-    local source corrects them, so every observation it publishes between
-    the forged fold and the correction carries a bad wall time.
-- **Mitigation:** prefer a local source whenever one exists (the config
-  flag is exactly that); otherwise accept that a peer's time is a
-  lower-bound hint, not a trusted clock. Signing and verification (1.1)
-  closes it; a monotonic-host sanity check (reject a wall time behind the
-  last fold) would contain the "behind" case today.
+  - A time too far **ahead** makes the fold over-count downtime: addressed
+    messages expire early, facts look stale, and `observed_at` stamps run
+    fast. That's availability loss, not integrity loss.
+  - A time **behind** the last clock marker reads as "clock went backwards",
+    which takes the unknown-downtime path: held addressed messages expire
+    and broadcasts are floored. Also the safe direction.
+  - A time behind the truth but still ahead of the marker under-counts the
+    downtime, so held ages come out too young. That's the dangerous
+    direction (spec §2b, §9). Honest estimates can land here, because age
+    is a lower bound.
+  - Before the 1.0 review, a forged `observed_at = u64::MAX` overflowed
+    `wall + elapsed` in the hosts and the store: a panic in debug, a time
+    near 1970 in release (review B3).
+- **Mitigated since `039fbf7`, `e4544bf`, `4690bf9`, `03b75f2`:**
+  - **Decision J: the latest estimate in a window.** From the first
+    plausible estimate, the host collects for `peer_time_window_ms`
+    (default 10 s) and then adopts the latest one, so an honest undershoot
+    loses to a better estimate. `LogStore::peer_time_estimate` returns the
+    latest estimate among observations stored since this open. A forger
+    gains nothing over the old smallest-age rule.
+  - **Plausibility bounds (review B3).**
+    - The hosts adopt only wall times between `WALL_FLOOR_MS`
+      (2026-01-01Z) and `WALL_CEILING_MS` (floor + 100 years, about 2126).
+      That applies to peers and to the system clock (`tines::trust`).
+    - The store drops estimates outside
+      `LogStoreBuilder::plausible_wall_ms` before choosing the latest, so a
+      forged far-future estimate can't hide the honest ones. Both hosts set
+      it.
+    - The wall-time arithmetic saturates.
+  - **Local sources first.** The service's `trusted_clock = "system"`, and
+    tines-ros2's new `trust_system_clock` / `trust_wall_clock`, both take
+    priority over peers. A ROS2-only fleet now has a local source.
+- **Still open:**
+  - Peer time is unauthenticated until 1.1. Within the plausible range, a
+    forger can still choose the time, and the window takes the latest
+    estimate, forged or not.
+  - A wrong-but-plausible time spreads. The robot stamps its own
+    observations' `observed_at` from it, and peers without a trusted clock
+    can adopt those stamps in turn.
+  - The adopted time is corrected only at the next restart, or when a
+    local trusted source arrives. Nothing corrects it while the host runs
+    (decision J), and on the peer path it's adopted once per run.
+- **Mitigation for deployments:** give every robot a local trusted source
+  (RTC, GPS, or an NTP-synced clock with the service ordered after
+  `time-sync.target`). Signing and verification in 1.1 close the forged
+  case.
 
 ## 7. Threats by STRIDE, mapped to findings
 
@@ -582,22 +669,34 @@ The sim covers honest-node custody properties and random garbage frames
 (`tests/props.rs:281`, `tests/relay.rs`). It doesn't cover:
 
 - well-formed malicious frames: forged acks, spoofed `from`/`observer`,
-  NodeId changes mid-contact;
+  NodeId changes mid-contact (since `37ca04d` the fuzz harness generates
+  all three, but in the core harness only; the sim and the hosts don't);
 - ~~a store returning `Full` (F1)~~ (covered since `2738de4`: a unit test
   and the full-store custody sim property);
-- summary floods and peer-table exhaustion (F8, F9);
-- reassembly abuse;
+- ~~summary floods and peer-table exhaustion (F8, F9)~~ (covered since
+  `37ca04d`, `8ba1e86`: the fuzz harness's adversarial mode replays
+  summaries and floods the peer table from 3 × `MAX_PEERS` addresses, and
+  the proptest twin checks recovery after `PEER_IDLE_MS`);
+- reassembly abuse (now partly covered: the adversarial mode sends
+  conflicting, repeated and out-of-order fragment streams);
 - a full disk (`LogStore` corruption in the middle, oversized records,
   concurrent openers, and restart and seq continuity are covered since
   `848721a` and `4718b6f`);
-- a quiet host restarting without having flushed (F18);
+- a quiet host restarting without having flushed (F18). `tines-store`
+  now tests flushing through the trait, opening three times, and clamping
+  (`06a0577`), but no host-level test covers a long quiet run;
+- forged peer time beyond overflow and range checks: nothing tests a
+  wrong-but-plausible estimate spreading through `observed_at` (F19);
 - most of the hosts: IPC abuse, ROS2 injection and self-echo (F11, F12).
   The service now has a two-instance exchange test (`d98895b`), and
   tines-bt has mock-radio tests for framing, binding and contact events
   (`7df9f41`).
 
-The 1.0 fuzz harness (spec §7) should take an *adversarial peer* mode, not
-just random bytes: structured frames with chosen ids and identities.
+The 1.0 fuzz harness (spec §7) has an *adversarial peer* mode since
+`37ca04d`, as well as random bytes: structured frames with chosen ids and
+identities, checked against the §7 and §10 properties. It runs nightly in CI
+(`.github/workflows/fuzz.yml`), with a proptest twin in the PR gate. The
+agreed fuzz budget hasn't been run and recorded yet.
 
 ## 10. Where each finding is being fixed
 
@@ -605,17 +704,18 @@ just random bytes: structured frames with chosen ids and identities.
 |---|---|---|---|
 | F1, F2, F5, F17 | Fleet milestone (M3) | `docs/superpowers/specs/2026-10-19-tines-fleet-fixes.md` | Fixed (§1) |
 | F3, F4 | Fleet milestone (M3) | same | Partly fixed; the rest has no spec yet |
-| F18 | Host work, with or before host hardening | none yet | Open |
+| F18 | Store side: tines-core 1.0 and tines-store; timed and shutdown flushes: host work, with or before host hardening | 1.0 spec §4, §9; none yet for the host part | Partly fixed (§1) |
 | F10–F12 | Host hardening, before a robot leaves the lab | `docs/superpowers/specs/2026-10-19-tines-host-hardening.md` | Open |
-| F6, F8, F9, F13 | tines-core 1.0 | `docs/superpowers/specs/2026-10-18-tines-1-0-design.md` §10 | Open |
+| F6, F8, F9, F13 | tines-core 1.0 | `docs/superpowers/specs/2026-10-18-tines-1-0-design.md` §10 | Fixed (§1); F13's Reassembler displacement accepted |
+| F19 | Hosts and tines-store (decision J, plausibility bounds); authentication in 1.1 | 1.0 spec §9, decision J; §2a | Partly mitigated (§1) |
 | F7, F14, §8 | 1.1 (threat model, link authentication, signing) | 1.0 spec §2a, §2b | Open |
 | F15, F16 | Accepted for now | — | — |
 
 Mark each finding fixed here, with its commit, when it lands.
 
 The remaining F3 work (one configured peer) and F18 are host-only. Neither
-blocks the tines-core 1.0 work, but both block a fleet of more than two
-robots.
+blocks tines-core 1.0, but both block a fleet of more than two robots. F19's
+remainder waits for 1.1.
 
 ## 11. Recommendations, in order
 
@@ -629,22 +729,27 @@ robots.
      locking).
    - F17 (monotonic ms clock).
    - Each with a regression test.
-2. **Host follow-ups:** the F3 multi-peer allowlist and F18 scheduled
-   flush. Small, and needed before more than two robots share a fleet.
+2. **Host follow-ups:** the F3 multi-peer allowlist and the rest of F18
+   (timed and shutdown flushes in both hosts, and trim in tines-ros2).
+   Small, and needed before more than two robots share a fleet. The F18
+   store side and the flush after first trusted time are done.
 3. **Host hardening before any robot leaves the lab:**
    - F10 (trim, bounded channels, compaction).
    - F11 (socket permissions, peer creds, timeouts).
    - F12 (ignore own publications, SROS2 guidance, rate limits).
-4. **Core hardening (rides with 1.0):**
-   - F8 (idle eviction).
-   - F9 (summary rate limit, no re-queue).
-   - F13 (event drop-oldest, purge acks on peer loss, reject trailing
-     bytes).
+4. **Core hardening (rides with 1.0):** done on `feat/tines-core-1-0`
+   (2026-10-21), publish pending.
+   - F8 (idle eviction, including silent and contact-only peers).
+   - F9 (summary rate limit with slack; the rebuild skips what the peer's
+     filter holds).
+   - F13 (event drop-oldest, purge only the lost peer's acks, reject
+     trailing bytes; displacement accepted).
    - F6 (refuse NodeId change within a contact).
 5. **1.1:**
    - Write the full threat model from §4/§8.
    - Choose link authentication.
-   - Add signing per spec §2a (F14, F7).
+   - Add signing per spec §2a (F14, F7), and authenticate peer time
+     (F19).
    - Add "replace if better signed" dedupe.
 6. **Later:** confidentiality and rotating rendezvous identifiers (F15),
    only if the deployment needs them.
