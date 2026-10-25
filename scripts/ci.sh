@@ -24,6 +24,11 @@ sh scripts/check-no-std.sh
 # compiling on the pinned stable toolchain, or the scheduled job rots unseen.
 cargo fmt --manifest-path fuzz/Cargo.toml -- --check
 cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+# The tines-gui crate sits outside the workspace like fuzz/ (standalone
+# manifest + lockfile, GUI release cadence), but it must keep resolving and
+# compiling on the pinned stable toolchain.
+cargo fmt --manifest-path tines-gui/Cargo.toml -- --check
+cargo clippy --locked --manifest-path tines-gui/Cargo.toml --all-targets -- -D warnings
 # Post-1.0.0 release gate: every 1.x change to tines-core must stay
 # semver-compatible with the published 1.0.0. Skipped where the tool is not
 # installed (`cargo install cargo-semver-checks --locked`); the GitHub Actions

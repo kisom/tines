@@ -1,0 +1,23 @@
+[package]
+name = "tines-gui"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Fleet console for tines: launcher and per-node windows driving the service IPC"
+publish = false
+
+[dependencies]
+tines = { path = "../tines", version = "0.4.0" }
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "wayland"] }
+egui = "0.36"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+notify = "8"
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["wgpu"] }
+tempfile = "3"
+
+# Like fuzz/, this crate sits outside the workspace (the GUI is a separate
+# deliverable with its own release cadence).
+[workspace]
