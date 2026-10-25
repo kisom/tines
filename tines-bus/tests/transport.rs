@@ -102,6 +102,16 @@ fn spoofed_frame_is_dropped() {
         Duration::from_secs(3),
     );
 
+    // B's side of the same join: the newcomer learns A is there.
+    match poll_until(
+        &mut b,
+        |ev| matches!(ev, Event::Contact(_)),
+        Duration::from_secs(3),
+    ) {
+        Event::Contact(id) => assert_eq!(id, [1; 16]),
+        other => panic!("expected Contact, got {other:?}"),
+    }
+
     // A (complicit) sends a frame that claims to be from C: the bus stamps
     // A as the envelope sender, so B must never surface it.
     let spoofed = frame_from(&[9; 16]);

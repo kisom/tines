@@ -221,6 +221,15 @@ fn process_msg(idx: usize, payload: &[u8], conns: &mut [Conn], actions: &mut Vec
                         });
                     }
                 }
+                // ...and the newcomer learns everyone already here.
+                for c in before.iter().chain(after.iter()) {
+                    if let Some(existing) = c.id {
+                        actions.push(Action::Forward {
+                            to: idx,
+                            env: control(0, existing),
+                        });
+                    }
+                }
             }
         }
         Some(my_id) => {

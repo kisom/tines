@@ -1469,6 +1469,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tines-bt",
+ "tines-bus",
  "tines-core",
  "tines-store",
 ]

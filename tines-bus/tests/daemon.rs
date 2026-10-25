@@ -79,6 +79,21 @@ fn expect_no_data(s: &mut UnixStream, window_ms: u64) {
 }
 
 #[test]
+fn newcomer_learns_existing_peers() {
+    let dir = unique_dir("newcomer");
+    let sock = spawn_daemon(&dir);
+
+    let mut a = connect(&sock);
+    hello(&mut a, &[1; 16]);
+
+    // B joins after A: B must be told A is already there.
+    let mut b = connect(&sock);
+    hello(&mut b, &[2; 16]);
+    expect_control(&mut a, 0, &[2; 16]);
+    expect_control(&mut b, 0, &[1; 16]);
+}
+
+#[test]
 fn duplicate_hello_replaces() {
     let dir = unique_dir("dup");
     let sock = spawn_daemon(&dir);
@@ -113,6 +128,9 @@ fn mismatched_from_is_dropped() {
     let mut b = connect(&sock);
     hello(&mut b, &[2; 16]);
 
+    // B learns about A on join (the newcomer announcement).
+    expect_control(&mut b, 0, &[1; 16]);
+
     // A (registered as [1;16]) claims to be [2;16]: nothing may reach B.
     data(&mut a, &[2; 16], &[2; 16], &[0xAB; 10]);
     expect_no_data(&mut b, 300);
@@ -142,6 +160,8 @@ fn unknown_dest_is_dropped() {
     hello(&mut b, &[2; 16]);
     // Wait until the daemon has registered B: A sees the join control.
     expect_control(&mut a, 0, &[2; 16]);
+    // B's side of the same join: the newcomer learns A is already here.
+    expect_control(&mut b, 0, &[1; 16]);
     data(&mut a, &[1; 16], &[2; 16], &[0xCD; 10]);
     let p = read_envelope(&mut b).unwrap().expect("connection closed");
     assert_eq!(p.len(), 42);
@@ -158,8 +178,10 @@ fn oversized_frame_closes_connection() {
     let mut b = connect(&sock);
     hello(&mut b, &[2; 16]);
 
-    // Handshake: once A has seen B join, both hellos are registered.
+    // Handshake: once A has seen B join, both hellos are registered, and
+    // B has learned A on its side too.
     expect_control(&mut a, 0, &[2; 16]);
+    expect_control(&mut b, 0, &[1; 16]);
 
     // A frame one byte over MAX_FRAME: that connection is closed...
     data(&mut a, &[1; 16], &[2; 16], &vec![0u8; MAX_FRAME + 1]);

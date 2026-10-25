@@ -1,7 +1,8 @@
 //! Standalone `tines` service binary.
 //!
-//! Loads a JSON config, builds a `Node<LogStore, BtTransport>` (BLE over
-//! `bluer`), and serves the IPC ([`tines::serve`]) over a Unix-domain socket.
+//! Loads a JSON config, builds a `Node<LogStore, HostTransport>` (BLE over
+//! `bluer`, or the host bus — see [`tines::config::TransportKind`]), and
+//! serves the IPC ([`tines::serve`]) over a Unix-domain socket.
 //! One instance per device — the typical deployment on robots without ROS2.
 //!
 //! The node and peer ids are 32 lowercase hex chars (the 16-byte `NodeId`).
@@ -11,14 +12,16 @@
 //! # Config
 //!
 //! A JSON object; an unknown key is an error, so a typo can't silently fall
-//! back to a default.
+//! back to a default. The full contract lives in [`tines::config::Config`].
 //!
 //! | key | required | meaning |
 //! |---|---|---|
 //! | `node_id` | yes | this device's `NodeId`, 32 hex chars |
-//! | `peer` | yes | the peer's `NodeId`, 32 hex chars |
+//! | `peer` | bt only | the peer's `NodeId`, 32 hex chars; on bus, the allowlist of one (`None` = any bus peer) |
 //! | `log_path` | yes | the LogStore log file |
 //! | `socket_path` | yes | the IPC Unix socket |
+//! | `transport` | no (`bt`) | `"bt"` or `"bus"` |
+//! | `bus_socket` | bus only | the bus daemon's Unix socket |
 //! | `poll_interval_ms` | no (20) | exchange poll cadence |
 //! | `trusted_clock` | no (unset) | `"system"` to trust the system clock; the only accepted value |
 //! | `peer_time_window_ms` | no (10000) | how long to collect peer time estimates before adopting the latest |
@@ -50,66 +53,14 @@
 use std::error::Error;
 use std::path::Path;
 
-use tines::trust::{adopt_wall_clock, system_wall_ms, DEFAULT_PEER_TIME_WINDOW_MS};
+use tines::config::{Config, TransportKind, TrustedClock};
+use tines::transport::HostTransport;
+use tines::trust::{adopt_wall_clock, system_wall_ms};
 use tines::{serve, HostClock};
 use tines_bt::{BluerRadio, BtTransport};
+use tines_bus::BusTransport;
 use tines_core::{Node, NodeId};
 use tines_store::LogStore;
-
-/// On-disk configuration for a running service. Unknown keys are rejected.
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Config {
-    /// This device's advertised `NodeId`, 32 lowercase hex chars.
-    node_id: String,
-    /// The peer's advertised `NodeId`, 32 lowercase hex chars.
-    peer: String,
-    /// Absolute path to the LogStore append-only log.
-    log_path: String,
-    /// Unix-domain socket path the IPC listens on.
-    socket_path: String,
-    /// Exchange poll interval in milliseconds. The real default belongs to the
-    /// builder; 20 ms keeps the link responsive without burning idle cycles.
-    #[serde(default = "default_poll_interval_ms")]
-    poll_interval_ms: u64,
-    /// Trust the system clock for the host's wall time, instead of deriving it
-    /// from a peer's observation. Set to `"system"` when the machine's clock is
-    /// reliable — an RTC, or a GPS/NTP-disciplined clock — the operator asserts
-    /// it rather than tines detecting it. Left unset, tines falls back to a
-    /// peer observation, and, with none available, stays quarantined. Any
-    /// other value is a config error.
-    #[serde(default)]
-    trusted_clock: Option<TrustedClock>,
-    /// How long, from the first plausible peer estimate, to keep collecting
-    /// estimates before adopting the latest (spec decision J).
-    #[serde(default = "default_peer_time_window_ms")]
-    peer_time_window_ms: u64,
-    /// The `unknown_downtime_age_ms` broadcast floor passed to LogStore while
-    /// the wall clock is unknown (the fold's unknown-downtime branch). Optional;
-    /// leave the LogStore default (`24h`) when unset.
-    ///
-    /// The floor must stay below the host's trim `max_age_ms`. That bound waits
-    /// for host hardening — the trim defaults are still empty — so this check is
-    /// not validated until then.
-    #[serde(default)]
-    unknown_downtime_age_ms: Option<u64>,
-}
-
-/// The accepted values of `trusted_clock`.
-#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum TrustedClock {
-    /// Trust the system clock (`"system"`).
-    System,
-}
-
-fn default_poll_interval_ms() -> u64 {
-    20
-}
-
-fn default_peer_time_window_ms() -> u64 {
-    DEFAULT_PEER_TIME_WINDOW_MS
-}
 
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cfg_path = std::env::args()
@@ -117,14 +68,17 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .ok_or("usage: tines <config.json>")?;
     let config: Config = serde_json::from_str(&std::fs::read_to_string(cfg_path)?)
         .map_err(|e| format!("invalid config: {e}"))?;
+    config
+        .validate()
+        .map_err(|e| format!("invalid config: {e}"))?;
 
     let me = parse_node_id(&config.node_id)?;
-    let peer = parse_node_id(&config.peer)?;
 
-    // LogStore is the Store (S); BtTransport wraps it as the Transport (T).
-    // unknown_downtime_age_ms (the broadcast floor while the wall clock is
-    // unknown) is optional; leave the LogStore default when unset.
-    // Peer estimates outside the plausible range don't count (decision J).
+    // LogStore is the Store (S); HostTransport wraps BLE or the bus as the
+    // Transport (T). unknown_downtime_age_ms (the broadcast floor while the
+    // wall clock is unknown) is optional; leave the LogStore default when
+    // unset. Peer estimates outside the plausible range don't count
+    // (decision J).
     let builder = LogStore::builder(Path::new(&config.log_path))
         .plausible_wall_ms(tines::trust::PLAUSIBLE_WALL_MS);
     let builder = match config.unknown_downtime_age_ms {
@@ -136,8 +90,26 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .open(clock.now())
         .map_err(|e| format!("failed to open log store: {e:?}"))?;
 
-    let radio = BluerRadio::new(me, peer);
-    let transport = BtTransport::new(me, peer, radio);
+    // bt: the single configured peer (validation guarantees it). bus: the
+    // configured peer is the allowlist of one; None means any bus peer.
+    let transport = match config.transport.unwrap_or(TransportKind::Bt) {
+        TransportKind::Bt => {
+            let peer = parse_node_id(config.peer.as_deref().expect("validated"))?;
+            let radio = BluerRadio::new(me, peer);
+            HostTransport::Bt(BtTransport::new(me, peer, radio))
+        }
+        TransportKind::Bus => {
+            let allowlist = match &config.peer {
+                Some(p) => Some(parse_node_id(p)?),
+                None => None,
+            };
+            HostTransport::Bus(BusTransport::new(
+                me,
+                allowlist,
+                config.bus_socket.as_deref().expect("validated"),
+            )?)
+        }
+    };
     // `serve` runs the exchange inline (a poll loop fed by the socket read
     // timeouts) on this same thread, so observations and beliefs flow over the
     // transport, not just over IPC. The node isn't `Send` (the BLE transport
@@ -211,51 +183,4 @@ fn node_hex(id: NodeId) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Config, TrustedClock};
-
-    const BASE: &str = r#""node_id": "00000000000000000000000000000001",
-        "peer": "00000000000000000000000000000002",
-        "log_path": "/var/lib/tines/log",
-        "socket_path": "/run/tines.sock""#;
-
-    fn parse(extra: &str) -> Result<Config, serde_json::Error> {
-        serde_json::from_str(&format!("{{{BASE}{extra}}}"))
-    }
-
-    #[test]
-    fn defaults() {
-        let c = parse("").expect("minimal config");
-        assert_eq!(c.poll_interval_ms, 20);
-        assert_eq!(c.peer_time_window_ms, 10_000);
-        assert_eq!(c.trusted_clock, None);
-        assert_eq!(c.unknown_downtime_age_ms, None);
-    }
-
-    #[test]
-    fn trusted_clock_system_is_accepted() {
-        let c = parse(r#", "trusted_clock": "system""#).expect("system");
-        assert_eq!(c.trusted_clock, Some(TrustedClock::System));
-    }
-
-    #[test]
-    fn trusted_clock_unknown_value_is_rejected() {
-        assert!(parse(r#", "trusted_clock": "System""#).is_err());
-        assert!(parse(r#", "trusted_clock": "rtc""#).is_err());
-        assert!(parse(r#", "trusted_clock": "systme""#).is_err());
-    }
-
-    #[test]
-    fn unknown_field_is_rejected() {
-        assert!(parse(r#", "trusted_clok": "system""#).is_err());
-    }
-
-    #[test]
-    fn peer_time_window_is_configurable() {
-        let c = parse(r#", "peer_time_window_ms": 2500"#).expect("window");
-        assert_eq!(c.peer_time_window_ms, 2_500);
-    }
 }
