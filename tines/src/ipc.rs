@@ -3,8 +3,9 @@
 //! The [`serve`] fn hosts a tines [`Node`] and speaks a tiny
 //! request/response protocol to each connecting peer. A single instance is the
 //! control plane for its device; external tools (or another tines Node, in
-//! later tasks) drive the node through four operations: `observe`, `belief`,
-//! `events`, and `status`.
+//! later tasks) drive the node through six operations: `observe`, `belief`,
+//! `events`, `status`, and `list` (the fleet console adds addressed `observe`
+//! and contact/drop reporting to the `events` response).
 //!
 //! # Wire format
 //!
@@ -39,7 +40,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::time::Duration;
 
-use tines_core::{Node, NodeEvent, Store, Transport, TrimPolicy};
+use tines_core::{Node, NodeEvent, NodeId, Store, Transport, TrimPolicy};
 use tines_store::LogStore;
 
 use crate::trust::{adopt_wall_clock, PeerTimeWindow};
@@ -52,6 +53,9 @@ const MAX_FRAME: usize = 1 << 20; // 1 MiB cap on a single JSON frame
 /// of its accept loop.
 const POLL_CAP: u64 = 64;
 
+/// Max entries a `List` response returns; `truncated` reports when more exist.
+pub const LIST_CAP: usize = 1024;
+
 /// A confirmed delivery handed out by the IPC `events` request.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct EventOut {
@@ -59,6 +63,50 @@ pub struct EventOut {
     pub id: String,
     /// Hex of the `NodeId` of the peer that acknowledged.
     pub peer: String,
+}
+
+/// A contact change handed out by the IPC `events` request: a transport
+/// `Contact` (`joined: true`) or `Lost` (`joined: false`) for one peer.
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub struct ContactOut {
+    /// Hex of the peer's `NodeId`.
+    pub peer: String,
+    /// `true` for a new contact, `false` for a loss.
+    pub joined: bool,
+}
+
+/// A counted drop handed out by the IPC `events` request.
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub struct DropOut {
+    /// Hex of the peer the dropped frame came from, or `None` for the
+    /// overflow slot (which has no address to name).
+    pub peer: Option<String>,
+    /// The drop reason, debug-formatted (e.g. `"VersionMismatch { version: 255 }"`).
+    pub reason: String,
+    /// The number of frames folded into this counter since the last drain.
+    pub count: u32,
+}
+
+/// One stored observation handed out by the IPC `list` request.
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub struct ObservationOut {
+    /// Hex of the `ObservationId`.
+    pub id: String,
+    /// Hex of the observer's `NodeId`.
+    pub observer: String,
+    /// Hex of the topic.
+    pub topic: String,
+    /// Hex of the payload.
+    pub payload: String,
+    /// Hex of the destination, or `None` for a broadcast.
+    pub to: Option<String>,
+    /// The addressed lifetime in ms, or `None` for a broadcast.
+    pub lifetime_ms: Option<u64>,
+    /// How old the observation is, in ms (see `Observation::age_ms`).
+    pub age_ms: u64,
+    /// The observer's wall-clock time, ms since the Unix epoch, or `None`
+    /// when the observer had no trusted clock.
+    pub observed_at: Option<u64>,
 }
 
 /// A belief returned by the IPC `belief` request.
@@ -82,16 +130,26 @@ pub enum Request {
         topic: String,
         /// Hex of the observation payload.
         payload: String,
+        /// Hex of the destination `NodeId` for an addressed observation.
+        /// Must be set together with `lifetime_ms`.
+        #[serde(default)]
+        to: Option<String>,
+        /// The addressed lifetime in ms. Must be set together with `to`.
+        #[serde(default)]
+        lifetime_ms: Option<u64>,
     },
     /// Read the latest belief for `topic`.
     Belief {
         /// Hex of the topic bytes to query.
         topic: String,
     },
-    /// Drain outstanding confirmed deliveries and drop counters.
+    /// Drain outstanding confirmed deliveries, contact changes, and counted
+    /// drops.
     Events,
     /// Report the node's identity and log depth.
     Status,
+    /// List every stored observation (capped at [`LIST_CAP`]).
+    List,
 }
 
 /// An IPC response. See the module docs for the wire format.
@@ -108,10 +166,17 @@ pub enum Response {
         /// The stored belief, or `None` if the topic is unknown.
         obs: Option<BeliefOut>,
     },
-    /// Confirmed deliveries drained from the exchange.
+    /// Confirmed deliveries, contact changes, and counted drops drained from
+    /// the exchange.
     Events {
         /// The drained confirmed deliveries.
         events: Vec<EventOut>,
+        /// The drained contact changes (joined or lost), in order.
+        #[serde(default)]
+        contacts: Vec<ContactOut>,
+        /// The drained counted drops.
+        #[serde(default)]
+        drops: Vec<DropOut>,
     },
     /// The node's `id`, next tines `next_seq`, and observations `stored`.
     Status {
@@ -121,6 +186,14 @@ pub enum Response {
         next_seq: u64,
         /// Number of observations in the store.
         stored: u32,
+    },
+    /// Every stored observation, up to [`LIST_CAP`] entries.
+    List {
+        /// The stored observations.
+        observations: Vec<ObservationOut>,
+        /// `true` when more observations exist than fit in
+        /// [`LIST_CAP`] entries.
+        truncated: bool,
     },
     /// The request was malformed or rejected.
     Error {
@@ -147,10 +220,15 @@ pub fn handle<S, T>(
 ) -> Response
 where
     S: Store + 'static,
-    T: Transport,
+    T: Transport<Addr = NodeId>,
 {
     match req {
-        Request::Observe { topic, payload } => {
+        Request::Observe {
+            topic,
+            payload,
+            to,
+            lifetime_ms,
+        } => {
             let topic = match decode_hex(&topic) {
                 Ok(t) => t,
                 Err(e) => return error(e),
@@ -159,7 +237,26 @@ where
                 Ok(t) => t,
                 Err(e) => return error(e),
             };
-            match node.observe(&topic, &payload, observed_at, now) {
+            let result = match (to, lifetime_ms) {
+                (None, None) => node.observe(&topic, &payload, observed_at, now),
+                (Some(to), Some(lifetime_ms)) => {
+                    let to = match decode_hex(&to) {
+                        Ok(t) => t,
+                        Err(e) => return error(e),
+                    };
+                    let to: NodeId = match to.try_into() {
+                        Ok(id) => id,
+                        Err(_) => {
+                            return error("to must be a 16-byte NodeId (32 hex chars)");
+                        }
+                    };
+                    node.observe_to(to, lifetime_ms, &topic, &payload, observed_at, now)
+                }
+                // An addressed observation needs both a destination and a
+                // lifetime; half-addressed is almost certainly a client bug.
+                _ => return error("to and lifetime_ms must be set together"),
+            };
+            match result {
                 Ok(id) => Response::Observe {
                     id: encode_hex(&id),
                 },
@@ -183,30 +280,76 @@ where
             }
         }
         Request::Events => {
-            let events = node
-                .drain_events()
-                .into_iter()
-                .filter_map(|ev| match ev {
-                    NodeEvent::Delivered { peer, id } => Some(EventOut {
+            let mut events = Vec::new();
+            let mut contacts = Vec::new();
+            let mut drops = Vec::new();
+            for ev in node.drain_events() {
+                match ev {
+                    NodeEvent::Delivered { peer, id } => events.push(EventOut {
                         id: encode_hex(&id),
                         peer: encode_hex(&peer),
                     }),
-                    // Dropped frames are surfaced to the operator via stderr
-                    // (they are the whole point of D3), not the `events`
-                    // response, so they filter out here.
+                    NodeEvent::Contact { addr } => contacts.push(ContactOut {
+                        peer: encode_hex(&addr),
+                        joined: true,
+                    }),
+                    NodeEvent::Lost { addr } => contacts.push(ContactOut {
+                        peer: encode_hex(&addr),
+                        joined: false,
+                    }),
+                    // Drops surface here AND on stderr (they are the whole
+                    // point of D3; the stderr line stays for `tines` logs).
                     NodeEvent::Dropped {
                         addr,
                         reason,
                         count,
                     } => {
                         eprintln!("tines: drop: {reason:?} (count={count}, addr={addr:?})");
-                        None
+                        drops.push(DropOut {
+                            peer: addr.map(|a| encode_hex(&a)),
+                            reason: format!("{reason:?}"),
+                            count,
+                        });
                     }
                     // `NodeEvent` is non-exhaustive: ignore any future variant.
-                    _ => None,
-                })
-                .collect();
-            Response::Events { events }
+                    _ => {}
+                }
+            }
+            Response::Events {
+                events,
+                contacts,
+                drops,
+            }
+        }
+        Request::List => {
+            let mut ids = Vec::with_capacity(LIST_CAP.min(node.store().len()));
+            let mut truncated = false;
+            node.store().for_each_id(&mut |id| {
+                if ids.len() < LIST_CAP {
+                    ids.push(*id);
+                } else {
+                    truncated = true;
+                }
+            });
+            let mut observations = Vec::with_capacity(ids.len());
+            for id in &ids {
+                if let Some(obs) = node.store().get(id, now) {
+                    observations.push(ObservationOut {
+                        id: encode_hex(&obs.id()),
+                        observer: encode_hex(&obs.observer),
+                        topic: encode_hex(&obs.topic),
+                        payload: encode_hex(&obs.payload),
+                        to: obs.dest.as_ref().map(|d| encode_hex(&d.to)),
+                        lifetime_ms: obs.dest.as_ref().map(|d| d.lifetime_ms),
+                        age_ms: obs.age_ms,
+                        observed_at: obs.observed_at,
+                    });
+                }
+            }
+            Response::List {
+                observations,
+                truncated,
+            }
         }
         Request::Status => Response::Status {
             id: encode_hex(&node.id()),
@@ -232,7 +375,7 @@ struct HostState {
 // [`serve`], fed by the socket read timeouts.
 fn poll_exchange<T>(node: &mut Node<LogStore, T>, host: &mut HostState)
 where
-    T: Transport + 'static,
+    T: Transport<Addr = NodeId> + 'static,
 {
     while node.poll(host.clock.now()) > 0 && host.rounds < POLL_CAP {
         host.rounds += 1;
@@ -308,7 +451,7 @@ pub fn serve<T>(
     peer_time_window_ms: u64,
 ) -> std::io::Result<()>
 where
-    T: Transport + 'static,
+    T: Transport<Addr = NodeId> + 'static,
 {
     let socket_path = socket_path.as_ref().to_path_buf();
     // Clear a stale socket file left by a previous run so bind() can't fail.
@@ -370,7 +513,7 @@ fn serve_stream<T>(
     host: &mut HostState,
 ) -> io::Result<()>
 where
-    T: Transport + 'static,
+    T: Transport<Addr = NodeId> + 'static,
 {
     loop {
         match read_request(stream) {

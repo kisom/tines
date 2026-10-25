@@ -266,6 +266,8 @@ fn observe_and_belief_over_socket() {
         &Request::Observe {
             topic: hex_encode(&topic()),
             payload: hex_encode(&payload()),
+            to: None,
+            lifetime_ms: None,
         },
     );
     let id = match read_response(&mut stream) {
@@ -311,7 +313,7 @@ fn events_over_socket() {
 
     rpc(&mut stream, &Request::Events);
     match read_response(&mut stream) {
-        Response::Events { events } => {
+        Response::Events { events, .. } => {
             assert_eq!(events.len(), 1, "expected one confirmed delivery");
             assert_eq!(events[0].id, hex_encode(&x), "event id matches observed id");
             assert_eq!(events[0].peer, hex_encode(&peer), "event came from peer");
@@ -329,6 +331,8 @@ fn handle_bad_hex_is_error() {
         Request::Observe {
             topic: "z".into(),
             payload: "ff".into(),
+            to: None,
+            lifetime_ms: None,
         },
         None,
         0,
@@ -348,8 +352,14 @@ fn confirmed_delivery_direct_probe() {
     node.poll(0);
     node.poll(0);
     let evs = node.drain_events();
-    assert_eq!(evs.len(), 1, "one confirmed delivery after observe+ack");
+    // The mock's first poll surfaces a Contact (now a NodeEvent) ahead of the
+    // confirmed delivery.
+    assert_eq!(evs.len(), 2, "contact event then confirmed delivery");
     match &evs[0] {
+        NodeEvent::Contact { addr } => assert_eq!(*addr, [7; 16]),
+        other => panic!("expected a Contact event, got {other:?}"),
+    }
+    match &evs[1] {
         NodeEvent::Delivered { peer, id } => {
             assert_eq!(*id, x);
             assert_eq!(*peer, [7; 16]);
@@ -589,6 +599,8 @@ fn f2_propagation_between_instances() {
         &Request::Observe {
             topic: hex_encode(&topic()),
             payload: hex_encode(&payload()),
+            to: None,
+            lifetime_ms: None,
         },
     );
     let obs = match read_response(&mut stream_a) {
@@ -694,6 +706,8 @@ fn b_stamp(
         &Request::Observe {
             topic: hex_encode(&topic()),
             payload: hex_encode(format!("probe-{n}").as_bytes()),
+            to: None,
+            lifetime_ms: None,
         },
     );
     let id = match read_response(&mut stream) {
@@ -894,4 +908,276 @@ fn forged_estimate_does_not_hide_an_honest_one() {
 #[test]
 fn below_floor_observed_at_is_not_adopted() {
     assert_not_adopted("floor", 1_000_000_000_000);
+}
+
+// --- Widened IPC (fleet console): addressed observe, List, contact/drop events
+
+/// An addressed `Observe` (both `to` and `lifetime_ms` set) returns the id and
+/// the observation shows up in `List` with matching addressing.
+#[test]
+fn observe_addressed_roundtrip() {
+    let dir = unique_dir("addressed");
+    let mut node = build_node([3; 16], &dir);
+    let to = [4u8; 16];
+
+    let resp = handle(
+        &mut node,
+        Request::Observe {
+            topic: hex_encode(&topic()),
+            payload: hex_encode(&payload()),
+            to: Some(hex_encode(&to)),
+            lifetime_ms: Some(60_000),
+        },
+        None,
+        0,
+    );
+    let id = match resp {
+        Response::Observe { id } => id,
+        other => panic!("expected Observe, got {other:?}"),
+    };
+
+    match handle(&mut node, Request::List, None, 0) {
+        Response::List {
+            observations,
+            truncated,
+        } => {
+            assert!(!truncated);
+            assert_eq!(observations.len(), 1);
+            let o = &observations[0];
+            assert_eq!(o.id, id);
+            assert_eq!(o.observer, hex_encode(&[3u8; 16]));
+            assert_eq!(o.topic, hex_encode(&topic()));
+            assert_eq!(o.payload, hex_encode(&payload()));
+            assert_eq!(o.to.as_deref(), Some(hex_encode(&to).as_str()));
+            assert_eq!(o.lifetime_ms, Some(60_000));
+        }
+        other => panic!("expected List, got {other:?}"),
+    }
+}
+
+/// Exactly one of `to` / `lifetime_ms` set is an error, in either direction.
+#[test]
+fn observe_half_addressed_is_error() {
+    let dir = unique_dir("half");
+    let mut node = build_node([3; 16], &dir);
+
+    for (to, lifetime) in [(Some(hex_encode(&[4u8; 16])), None), (None, Some(1u64))] {
+        let resp = handle(
+            &mut node,
+            Request::Observe {
+                topic: hex_encode(&topic()),
+                payload: hex_encode(&payload()),
+                to,
+                lifetime_ms: lifetime,
+            },
+            None,
+            0,
+        );
+        match resp {
+            Response::Error { message } => {
+                assert!(
+                    message.contains("must be set together"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+}
+
+/// `List` returns every stored observation (broadcast and addressed) with
+/// correct fields.
+#[test]
+fn list_returns_all_observations() {
+    let dir = unique_dir("listall");
+    let mut node = build_node([3; 16], &dir);
+
+    let _ = handle(
+        &mut node,
+        Request::Observe {
+            topic: hex_encode(&topic()),
+            payload: hex_encode(b"broadcast"),
+            to: None,
+            lifetime_ms: None,
+        },
+        None,
+        0,
+    );
+    let _ = handle(
+        &mut node,
+        Request::Observe {
+            topic: hex_encode(&topic()),
+            payload: hex_encode(b"addressed"),
+            to: Some(hex_encode(&[4u8; 16])),
+            lifetime_ms: Some(1_000),
+        },
+        None,
+        0,
+    );
+
+    match handle(&mut node, Request::List, None, 0) {
+        Response::List {
+            observations,
+            truncated,
+        } => {
+            assert!(!truncated);
+            assert_eq!(observations.len(), 2, "both observations listed");
+            let broadcast = observations
+                .iter()
+                .find(|o| o.payload == hex_encode(b"broadcast"))
+                .expect("broadcast present");
+            assert_eq!(broadcast.to, None);
+            assert_eq!(broadcast.lifetime_ms, None);
+            assert_eq!(broadcast.topic, hex_encode(&topic()));
+            assert_eq!(broadcast.observer, hex_encode(&[3u8; 16]));
+            let addressed = observations
+                .iter()
+                .find(|o| o.payload == hex_encode(b"addressed"))
+                .expect("addressed present");
+            assert_eq!(
+                addressed.to.as_deref(),
+                Some(hex_encode(&[4u8; 16]).as_str())
+            );
+            assert_eq!(addressed.lifetime_ms, Some(1_000));
+        }
+        other => panic!("expected List, got {other:?}"),
+    }
+}
+
+/// `List` caps at `LIST_CAP` entries and reports truncation when more exist.
+#[test]
+fn list_caps_at_list_cap() {
+    let dir = unique_dir("listcap");
+    let mut node = build_node([3; 16], &dir);
+
+    for _ in 0..(tines::LIST_CAP + 1) {
+        let resp = handle(
+            &mut node,
+            Request::Observe {
+                topic: hex_encode(&topic()),
+                payload: hex_encode(b"x"),
+                to: None,
+                lifetime_ms: None,
+            },
+            None,
+            0,
+        );
+        assert!(matches!(resp, Response::Observe { .. }));
+    }
+
+    match handle(&mut node, Request::List, None, 0) {
+        Response::List {
+            observations,
+            truncated,
+        } => {
+            assert_eq!(observations.len(), tines::LIST_CAP);
+            assert!(truncated, "more observations exist than fit");
+        }
+        other => panic!("expected List, got {other:?}"),
+    }
+}
+
+/// The transport's first `Contact` surfaces in `Events.contacts` as
+/// `joined: true`, alongside an empty `events` (no deliveries yet).
+#[test]
+fn events_include_contacts() {
+    let dir = unique_dir("contacts");
+    let socket = dir.join("ipc.sock");
+    let peer = [7; 16];
+    let mut node = build_node(peer, &dir);
+    node.poll(0); // the mock's first poll surfaces the Contact
+
+    let serve_path = socket.clone();
+    let _handle =
+        thread::spawn(move || serve(node, serve_path, HostClock::start(), 20, WINDOW_MS).unwrap());
+    let mut stream = connect(&socket);
+
+    rpc(&mut stream, &Request::Events);
+    match read_response(&mut stream) {
+        Response::Events {
+            events,
+            contacts,
+            drops,
+        } => {
+            assert!(events.is_empty(), "no deliveries before any ack");
+            assert_eq!(drops.len(), 0, "nothing was dropped");
+            assert_eq!(contacts.len(), 1, "one contact surfaced");
+            assert_eq!(contacts[0].peer, hex_encode(&peer));
+            assert!(contacts[0].joined);
+        }
+        other => panic!("expected Events, got {other:?}"),
+    }
+}
+
+/// `Lost` surfaces as `joined: false`, and a garbage frame surfaces in
+/// `drops` with its reason (while the stderr line stays in the service).
+#[test]
+fn events_include_lost_and_drops() {
+    let dir = unique_dir("lost");
+    let peer = [7; 16];
+    let mut node = build_node(peer, &dir);
+
+    node.poll(0); // Contact -> NodeEvent::Contact
+    node.transport_mut().pending.push_back(Event::Lost(peer));
+    node.poll(0); // Lost -> NodeEvent::Lost
+    node.transport_mut().pending.push_back(Event::Frame(
+        peer,
+        FrameBuf::from_slice(&[0xff; 8]).expect("small garbage frame fits"),
+    ));
+    node.poll(0); // garbage -> counted drop
+
+    match handle(&mut node, Request::Events, None, 0) {
+        Response::Events {
+            events,
+            contacts,
+            drops,
+        } => {
+            assert!(events.is_empty());
+            assert_eq!(contacts.len(), 2, "contact then loss");
+            assert!(contacts[0].joined);
+            assert_eq!(contacts[0].peer, hex_encode(&peer));
+            assert!(!contacts[1].joined, "the lost contact is closed");
+            assert_eq!(contacts[1].peer, hex_encode(&peer));
+
+            assert_eq!(drops.len(), 1, "one counted drop");
+            assert_eq!(drops[0].peer.as_deref(), Some(hex_encode(&peer).as_str()));
+            assert!(
+                drops[0].reason.contains("VersionMismatch"),
+                "the drop names its reason: {}",
+                drops[0].reason
+            );
+            assert_eq!(drops[0].count, 1);
+        }
+        other => panic!("expected Events, got {other:?}"),
+    }
+}
+
+/// The existing `events` field still reports confirmed deliveries exactly as
+/// before the widening (the mock auto-ack path).
+#[test]
+fn existing_events_field_unchanged() {
+    let dir = unique_dir("unchanged");
+    let socket = dir.join("ipc.sock");
+    let peer = [7; 16];
+    let mut node = build_node(peer, &dir);
+
+    let x = node.observe(&topic(), &payload(), None, 0).unwrap();
+    node.poll(0);
+    node.poll(0);
+    node.poll(0);
+
+    let serve_path = socket.clone();
+    let _handle =
+        thread::spawn(move || serve(node, serve_path, HostClock::start(), 20, WINDOW_MS).unwrap());
+    let mut stream = connect(&socket);
+
+    rpc(&mut stream, &Request::Events);
+    match read_response(&mut stream) {
+        Response::Events { events, .. } => {
+            assert_eq!(events.len(), 1, "one confirmed delivery");
+            assert_eq!(events[0].id, hex_encode(&x));
+            assert_eq!(events[0].peer, hex_encode(&peer));
+        }
+        other => panic!("expected Events, got {other:?}"),
+    }
 }
