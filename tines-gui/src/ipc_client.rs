@@ -119,14 +119,28 @@ fn write_frame(stream: &mut UnixStream, body: &[u8]) -> io::Result<()> {
 }
 
 /// Read one `[u32 LE len][body]` frame from the stream.
-fn read_frame(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
+///
+/// Mirrors the service's reader: a length prefix above [`MAX_FRAME`] is a
+/// protocol violation (`InvalidData`) rather than an allocation, so a torn
+/// or hostile frame kills the connection (worker re-dials) instead of the
+/// process.
+fn read_frame(stream: &mut impl Read) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame {len} bytes exceeds {MAX_FRAME}"),
+        ));
+    }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf)?;
     Ok(buf)
 }
+
+/// 1 MiB cap on a single JSON frame, matching the service's own reader.
+const MAX_FRAME: usize = 1 << 20;
 
 /// The worker loop: dial, serve requests in order, redial forever.
 fn worker(
@@ -194,5 +208,29 @@ fn worker(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_frame_accepts_a_valid_frame() {
+        let body = b"{\"ok\":true}";
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        frame.extend_from_slice(body);
+        assert_eq!(read_frame(&mut &frame[..]).unwrap(), body);
+    }
+
+    #[test]
+    fn read_frame_rejects_an_oversized_len_prefix() {
+        // A torn stream could yield any u32; the cap keeps it from becoming
+        // an allocation.
+        let mut frame = ((MAX_FRAME as u32) + 1).to_le_bytes().to_vec();
+        frame.extend_from_slice(&[0u8; 8]);
+        let err = read_frame(&mut &frame[..]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
