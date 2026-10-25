@@ -8,5 +8,7 @@
 #![deny(missing_docs)]
 
 pub mod config;
+pub mod docker;
+pub mod fleet;
 pub mod ipc_client;
 pub mod theme;
