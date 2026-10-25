@@ -1,0 +1,3 @@
+# The root .gitignore's `/target` is anchored to the repo root; this
+# standalone crate's target dir needs its own ignore.
+/target
