@@ -3,7 +3,11 @@
 - **Assessed:** `master` at `3b1a644` (tines-core / tines-store / tines-bt /
   tines-ros2 / tines 0.3.0, fleet-deployment milestone mostly landed)
 - **Date:** 2026-10-19
-- **Updated:** 2026-10-21 at `411daa0` (`feat/tines-core-1-0`), after the
+- **Updated:** 2026-10-25, at `2a917088` (`feat/fleet-console`), after the
+  fleet console work: F3's single-peer limit is now BT-only (the new bus
+  transport drops it, as a test medium); F11 gains the widened IPC; F20
+  (bus daemon) added. Earlier updates: 2026-10-21 at
+  `411daa0` (`feat/tines-core-1-0`), after the
   tines-core 1.0 review fixes landed. Earlier update: 2026-10-20 at
   `89041ea`, after the fleet fixes. The findings keep their original text;
   each fixed one ends with a **Fixed** or **Partly fixed** line. §6 adds
@@ -240,6 +244,11 @@ for a poll loop, `docs/superpowers/plans/2026-10-18-tines-fleet-deployment.md:20
   - No BLE security level is requested (unchanged; 1.1).
   - No two-radio check of the SeqPacket path is recorded yet.
     tines-bt/README.md gives the procedure but no result.
+  - *At `2a917088` (fleet console):* the new bus transport (tines-bus)
+    drops the single-peer limit — bus peers reach any id registered with
+    the daemon. That is a **test medium** for simulated fleets over host
+    Unix sockets, not a radio deployment; on real radios the single-peer
+    limit stands until the allowlist work lands.
 
 **Later (1.1):** authenticate the link (spec §2b). Advertised NodeIds are
 unauthenticated, so the binding only becomes meaningful once there's a
@@ -420,6 +429,11 @@ re-queues what was already sent.
   an idle client blocks everyone. An `accept` error ends the daemon. An
   oversized frame (> 1 MiB) gets an error reply without consuming its body,
   which desynchronizes the stream (contrary to the module docs).
+- *At `2a917088` (fleet console):* the IPC widened — `Observe` gained
+  `to`/`lifetime_ms`, and `List` and `Events` were added — without
+  changing this posture. The new request kinds validate their inputs, cap
+  their outputs (`List` truncates with a flag), and answer a bad request
+  with an `Error` response, never a panic or a partial write.
 - **Fix:**
   - Create the socket in a `0700` runtime directory with mode `0600` (or a
     group-restricted mode).
@@ -626,6 +640,38 @@ authenticates that estimate.
   `time-sync.target`). Signing and verification in 1.1 close the forged
   case.
 
+### F20 — The bus daemon is a host attack surface (Medium, A3)
+
+*Added 2026-10-25, with the fleet console's bus transport (tines-bus).*
+The bus daemon (`tines-busd`) stands in for the radio in simulated fleets:
+N service containers dial one daemon over host Unix sockets and exchange
+tines frames through it. It is host-local infrastructure and was built
+with the same distrust of input as the IPC server:
+
+- **Registration is explicit.** A client registers its `NodeId` before
+  sending data, and the daemon drops (and counts) any envelope whose
+  `from` isn't that socket's registered id, or whose `to` isn't a
+  registered id.
+- **Envelopes are length-capped** at `MAX_FRAME + 32` header bytes
+  (`MAX_PAYLOAD`); an oversized length header is a protocol violation that
+  closes the connection.
+- **The daemon decodes nothing beyond the 32-byte routing header.** Frame
+  contents are forwarded verbatim, so a malformed frame is the receiving
+  node's problem, exactly as on the radio.
+- **The fleet directory is `0700`** (tines-gui `config::fleet_dir` and
+  per-node dirs), so node sockets, logs and configs under it are private
+  to the owning user.
+
+- **Effect (A3):** another local user can neither read nor join a fleet
+  (directory permissions), nor spoof frames through the daemon (the
+  registration check). Root can do anything on the host, as always. The
+  daemon is bench equipment: it carries no encryption and authenticates
+  nothing, and must not become a deployment transport.
+- **Open:** the daemon rate-limits nothing. A buggy or hostile local
+  client can flood envelopes at the fan-out rate. Accepted for the test
+  medium; F10-style quotas would be the fix if the daemon ever left the
+  bench.
+
 ## 7. Threats by STRIDE, mapped to findings
 
 | | Threat | Status today | Findings | Planned mitigation |
@@ -708,6 +754,7 @@ agreed fuzz budget hasn't been run and recorded yet.
 | F10–F12 | Host hardening, before a robot leaves the lab | `docs/superpowers/specs/2026-10-19-tines-host-hardening.md` | Open |
 | F6, F8, F9, F13 | tines-core 1.0 | `docs/superpowers/specs/2026-10-18-tines-1-0-design.md` §10 | Fixed (§1); F13's Reassembler displacement accepted |
 | F19 | Hosts and tines-store (decision J, plausibility bounds); authentication in 1.1 | 1.0 spec §9, decision J; §2a | Partly mitigated (§1) |
+| F20 | Fleet console: the bus daemon's posture (registration, caps, 0700 dirs) is built in; per-peer rate limits are open | fleet console design | Mitigated by design (§6) |
 | F7, F14, §8 | 1.1 (threat model, link authentication, signing) | 1.0 spec §2a, §2b | Open |
 | F15, F16 | Accepted for now | — | — |
 

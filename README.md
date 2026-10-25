@@ -560,8 +560,9 @@ A robot runs either the service or the ROS2 node, not both: each owns its
   - Connections produce `Contact` and `Lost` events. See
     [`tines-bt/README.md`](tines-bt/README.md).
 - **`tines`**: the standalone service, for robots without ROS2.
-  - It runs the exchange on a poll loop and answers `Observe`, `Belief`,
-    `Events` and `Status` requests on a Unix socket.
+  - It runs the exchange on a poll loop and answers `Observe` (broadcast or
+    addressed), `Belief`, `Events`, `List` and `Status` requests on a Unix
+    socket.
   - It's configured by a JSON file (below). Library users call
     `tines::serve(node, socket_path, clock, poll_interval_ms,
     peer_time_window_ms)`.
@@ -578,9 +579,11 @@ typo can't silently fall back to a default.
 | Key                       | Default      | Meaning |
 |---------------------------|--------------|---------|
 | `node_id`                 | required     | this robot's `NodeId`, 32 hex chars |
-| `peer`                    | required     | the one peer's `NodeId`, 32 hex chars |
+| `peer`                    | bt only      | the one peer's `NodeId`, 32 hex chars |
 | `log_path`                | required     | the `LogStore` log file |
 | `socket_path`             | required     | the IPC Unix socket |
+| `transport`               | `"bt"`       | `"bt"` for BLE, or `"bus"` for the host bus transport |
+| `bus_socket`              | bus only     | the bus daemon's Unix socket |
 | `poll_interval_ms`        | 20           | exchange poll cadence |
 | `trusted_clock`           | unset        | `"system"` to trust the system clock; the only accepted value |
 | `peer_time_window_ms`     | 10000        | how long to collect peer time estimates before adopting the latest |
@@ -635,7 +638,8 @@ Peer time is unauthenticated until 1.1, and an adopted time isn't corrected
 while the host runs; see F19 in [`THREAT_MODEL.md`](THREAT_MODEL.md).
 
 **Current limits** (tracked in [`THREAT_MODEL.md`](THREAT_MODEL.md)):
-- The service talks to one configured `peer`.
+- On the BT transport the service talks to one configured `peer`; the bus
+  transport (simulated fleets) reaches any peer registered with the daemon.
 - The hosts don't flush on a timer or at shutdown. The service flushes after
   64 productive poll rounds, and both hosts flush when they adopt trusted
   time.
@@ -643,6 +647,44 @@ while the host runs; see F19 in [`THREAT_MODEL.md`](THREAT_MODEL.md).
   permissions, ROS2 isolation) hasn't landed.
 
 The two-device BLE check in `tines-bt/README.md` hasn't been recorded yet.
+
+## The fleet console (lab desktop)
+
+`tines-gui/` (a standalone crate outside the workspace, like `fuzz/`) is
+the desktop console: an orchestrator that runs a whole fleet in containers.
+It is never a node host — the GUI embeds no `Node` and no radio runs in the
+GUI process; every node lives in a container the GUI drives over the
+service IPC.
+
+- **Launcher** (`tines-gui` with no arguments): create a fleet, add nodes,
+  start/stop containers, open a node window.
+- **Node window** (`tines-gui --node <dir> <container-id> bt|sim`): one
+  window per container — a status strip, observation send (broadcast or
+  addressed, with a lifetime), belief read, and a live events feed
+  (contacts, drops). It speaks the service IPC; nothing else.
+- **Modes.** BT mode runs one privileged container with the host's
+  Bluetooth adapter passed through, so that node reaches real robots. Sim
+  mode runs N containers over the bus transport (below), with no radio.
+- Fleet state lives under
+  `$XDG_STATE_HOME/tines-console/fleets/<fleet>/`, created `0700`: one
+  directory per node with its config, log and IPC socket.
+
+### The bus transport
+
+`tines-bus` (a workspace member) is a host-only transport for simulated
+fleets: a hub-and-spoke daemon (`tines-busd`) that containers dial over
+Unix sockets. Its `Addr` is the `NodeId`, like the BT transport.
+
+- A client registers its `NodeId` with the daemon, then sends data
+  envelopes carrying a 32-byte routing header (`from`, `to`). The daemon
+  drops any envelope whose `from` isn't that socket's registered id or
+  whose `to` isn't registered, and forwards the frame verbatim — it never
+  decodes frame contents.
+- Envelopes are length-capped; an oversized one is a protocol violation.
+- The bus is a **test medium**, not a deployment transport: no encryption,
+  no authentication beyond the registration check. The service picks it
+  with `transport = "bus"` plus `bus_socket`, which also drops the BT
+  transport's single-peer limit — any registered peer is reachable.
 
 ## Crate layout
 
@@ -658,8 +700,13 @@ tines/
   tines-store/  std: LogStore, the persistent append-only backend.
   tines-bt/     std: the BLE transport (BlueZ via bluer).
   tines/        std: the standalone service with Unix-socket IPC.
+  tines-bus/    std: the host bus transport — a hub-and-spoke Unix-socket
+                daemon (`tines-busd`) for simulated fleets.
   tines-ros2/   std: the ROS2 node (rclrs behind the `ros2` feature).
 ```
+
+`tines-gui/` sits outside the workspace (like `fuzz/`): the desktop fleet
+console. Build it with `cargo test --manifest-path tines-gui/Cargo.toml`.
 
 The public constants, in `tines_core::consts`, are the wire constants. They
 are frozen for wire v1: changing one is a `WIRE_VERSION` bump.

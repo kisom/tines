@@ -190,9 +190,9 @@ fixed in core; see `THREAT_MODEL.md`.
 
 ## Hosts 0.4.0 — Unreleased
 
-`tines`, `tines-store`, `tines-bt`, `tines-ros2` and `tines-sim` move to 0.4.0
-and depend on `tines-core = "1"`. Like tines-core 1.0.0, nothing here is
-tagged or published yet.
+`tines`, `tines-store`, `tines-bt`, `tines-bus`, `tines-ros2` and
+`tines-sim` move to 0.4.0 and depend on `tines-core = "1"`. Like tines-core
+1.0.0, nothing here is tagged or published yet.
 
 The 0.3.0 release shipped only `tines-core` and `tines-sim`. The four other
 host crates were added afterwards, during the fleet milestone, and carried the
@@ -339,14 +339,53 @@ milestone's host work (F2–F5, F17).
 
 ### Known issues
 
-- The service talks to exactly one configured `peer`. The multi-peer
-  allowlist the fleet-fixes spec describes isn't wired up (F3).
+- The service talks to exactly one configured `peer` on the BT transport.
+  The multi-peer allowlist the fleet-fixes spec describes isn't wired up
+  (F3). The new bus transport drops the limit, as a test medium only.
 - Neither host flushes on a timer or at shutdown (F18).
   - The service trims and flushes only after 64 poll rounds that each stored
     something new.
   - tines-ros2 flushes only when it adopts trusted time, and never trims.
 - Peer time is unauthenticated until 1.1. An adopted time isn't corrected
   while the host runs (F19).
+
+### Fleet console (unreleased, on `feat/fleet-console`)
+
+The desktop console for driving a containerized fleet, and the host pieces
+it rides on:
+
+- **`tines-bus`** (new workspace crate): a host-only transport over a
+  hub-and-spoke Unix-socket daemon (`tines-busd`). `Addr = NodeId`, like
+  the BT transport. A client registers its `NodeId`, then sends data
+  envelopes carrying a 32-byte routing header (`from`, `to`); the daemon
+  drops any envelope whose `from` isn't that socket's registered id or
+  whose `to` isn't registered, and forwards the frame verbatim. Envelopes
+  are length-capped. A bus peer loses the BT transport's single-peer
+  limit — any registered peer is reachable. It is a test medium for
+  simulated fleets, not a deployment transport.
+- **Transport choice in the service** (tines): config `transport` is
+  `"bt"` (default) or `"bus"`, with `bus_socket` naming the daemon's
+  socket. `HostTransport` wraps both, so the service runs BLE or the bus
+  from the same config file.
+- **Widened IPC** (tines): `Observe` gains `to` / `lifetime_ms` for
+  addressed observations (both set together or neither); new `List`
+  (observation ids, with a `truncated` flag at the cap) and `Events`
+  (contacts, drops and drop counts) requests. The new request kinds keep
+  the existing error posture: a bad request gets an `Error` response,
+  never a panic or a partial write.
+- **Decision C** (core): the additive `NodeEvent::Contact` /
+  `NodeEvent::Lost` variants, so hosts see peers come and go. `Contact`
+  fires only for a newly added peer; idle eviction stays silent. The only
+  sanctioned core change for the console.
+- **Fleet console** (`tines-gui`, standalone crate outside the workspace):
+  a launcher (create a fleet, add nodes, start/stop containers, open node
+  windows) and a per-container node window (status strip, observation
+  send, belief read, events feed) driving the service IPC. BT mode runs a
+  privileged container with the host adapter passed through; sim mode runs
+  N containers over the bus daemon. Fleet state lives under
+  `$XDG_STATE_HOME/tines-console/fleets/<fleet>/`, created `0700`.
+- **Runtime image** (`Dockerfile.tines`): the two-stage container for the
+  service plus `tines-busd`; the GUI drives docker as a CLI subprocess.
 
 ## 0.3.0 — 2026-10-18
 
