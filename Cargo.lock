@@ -1485,6 +1485,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tines-bus"
+version = "0.4.0"
+dependencies = [
+ "tines-core",
+]
+
+[[package]]
 name = "tines-core"
 version = "1.0.0"
 dependencies = [

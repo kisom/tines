@@ -1,0 +1,15 @@
+[package]
+name = "tines-bus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bus transport for tines: exchange wire frames between nodes over a host IPC bus (Unix sockets), identity-preserving (Addr = NodeId)."
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/tines-bus"
+keywords = ["robotics", "gossip", "delay-tolerant", "ipc", "unix-socket"]
+categories = ["science::robotics", "network-programming"]
+
+[dependencies]
+tines-core = { path = "../tines-core", version = "1" }
