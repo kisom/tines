@@ -99,6 +99,26 @@ pub enum NodeEvent<A> {
         /// The number of frames folded into this counter since the last drain.
         count: u32,
     },
+    /// A new contact started with the peer at `addr` (a first `Contact`
+    /// event for an addr we were not already tracking). A repeat `Contact`
+    /// for a known peer restarts the contact silently. Idle eviction (F8)
+    /// does not emit this.
+    ///
+    /// `addr` is the transport address; for both the BLE and bus transports
+    /// it IS the peer's [`NodeId`]. Best-effort telemetry: when the event
+    /// queue is full, an incoming contact is dropped rather than evicting
+    /// queued events.
+    Contact {
+        /// The wire address of the peer the contact started with.
+        addr: A,
+    },
+    /// The peer at `addr` was lost: a transport `Lost` event for a peer we
+    /// were tracking. A `Lost` for an unknown addr, and F8 idle eviction,
+    /// emit nothing.
+    Lost {
+        /// The wire address of the peer that was lost.
+        addr: A,
+    },
 }
 
 /// The `Exchange`'s counted-drop table: up to [`consts::DROP_TABLE_CAP`]
@@ -323,7 +343,9 @@ pub(crate) struct Exchange<A> {
     /// record.
     bcast_sent: Vec<(ObservationId, A), { consts::BCAST_SENT_CAP }>,
     /// One [`NodeEvent::Delivered`] per broadcast id a peer has confirmed,
-    /// pushed drop-oldest when full. Drain through [`Exchange::drain_events`].
+    /// plus one [`NodeEvent::Contact`]/[`NodeEvent::Lost`] per contact
+    /// change, pushed drop-oldest when full. Drain through
+    /// [`Exchange::drain_events`].
     events: Vec<NodeEvent<A>, { consts::EVENT_QUEUE_CAP }>,
     /// Counted drops: distinct `(addr, DropReason)` pairs, each with a
     /// saturating count, plus a single overflow counter; reported through
@@ -375,11 +397,15 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
     ) -> Option<Observation> {
         match ev {
             Event::Contact(addr) => {
-                self.add_peer(addr, now);
+                if self.add_peer(addr.clone(), now) {
+                    self.push_event(NodeEvent::Contact { addr });
+                }
                 None
             }
             Event::Lost(addr) => {
-                self.remove_peer(&addr);
+                if self.remove_peer(&addr) {
+                    self.push_event(NodeEvent::Lost { addr });
+                }
                 None
             }
             Event::Frame(addr, bytes) => self.on_frame(addr, &bytes, store, now),
@@ -829,13 +855,24 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         &self.peers
     }
 
-    /// Drains the [`NodeEvent`]s — confirmed deliveries plus counted drops —
-    /// for [`crate::Node::drain_events`].
+    /// Pushes an event onto the delivery queue with drop-oldest overflow
+    /// (F13): when the queue is full the OLDEST event is evicted so the
+    /// freshest telemetry survives (a bare `push` would drop the newest).
+    fn push_event(&mut self, ev: NodeEvent<A>) {
+        if self.events.is_full() {
+            let _ = self.events.remove(0);
+        }
+        let _ = self.events.push(ev);
+    }
+
+    /// Drains the [`NodeEvent`]s — contacts and losses, confirmed deliveries,
+    /// plus counted drops — for [`crate::Node::drain_events`].
     ///
-    /// Returns confirmed deliveries first, oldest first, then one
+    /// Returns queued events first, oldest first (contacts/losses and
+    /// deliveries share the queue in the order they happened), then one
     /// [`NodeEvent::Dropped`] per non-zero counter, emptying the drop table.
-    /// Sized to hold the entire delivery queue plus the whole drop table and
-    /// its overflow slot, so a full delivery queue never evicts a counted drop.
+    /// Sized to hold the entire event queue plus the whole drop table and
+    /// its overflow slot, so a full queue never evicts a counted drop.
     pub(crate) fn drain_events(
         &mut self,
     ) -> Vec<NodeEvent<A>, { consts::EVENT_QUEUE_CAP + consts::DROP_TABLE_CAP + 1 }> {
@@ -862,18 +899,25 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
     /// starts a new contact too: the F6 pin and the per-contact records
     /// (bounces, broadcast receipts) reset.
     /// A repeat `Contact` also restarts the peer's idle clock.
-    fn add_peer(&mut self, addr: A, now: Tick) {
+    ///
+    /// Returns `true` only when a new [`Peer`] was actually added to the
+    /// table (the contact is "new" for the console's event feed). A repeat
+    /// contact, and a contact that cannot be added because the table is
+    /// full ([`consts::MAX_PEERS`]), return `false`.
+    fn add_peer(&mut self, addr: A, now: Tick) -> bool {
         self.evict_idle(now);
         self.forget_contact(&addr);
         if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == addr) {
             peer.id = None;
             peer.added_at = now;
             peer.last_inbound = None;
-            return;
+            return false;
         }
         if self.peers.len() < consts::MAX_PEERS {
             let _ = self.peers.push(Peer::new(addr, now));
+            return true;
         }
+        false
     }
 
     /// F8: removes, as if Lost, every peer with no inbound frame (or, if it
@@ -894,10 +938,13 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
         }
     }
 
-    fn remove_peer(&mut self, addr: &A) {
-        if let Some(idx) = self.peers.iter().position(|p| p.addr == *addr) {
+    fn remove_peer(&mut self, addr: &A) -> bool {
+        let removed = if let Some(idx) = self.peers.iter().position(|p| p.addr == *addr) {
             self.peers.remove(idx);
-        }
+            true
+        } else {
+            false
+        };
         // F13: purge the removed peer's pending acks (only its own) so their
         // ids are never acked again under this contact.
         self.acks.retain_other(addr);
@@ -906,6 +953,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
             self.ack_undo = None;
         }
         self.forget_contact(addr);
+        removed
     }
 
     /// Drops the per-contact records for `addr` — bounce suppression and
@@ -1047,10 +1095,7 @@ impl<A: Clone + PartialEq + core::fmt::Debug> Exchange<A> {
                 // delivery queue is full, drop the OLDEST Delivered rather than
                 // the newest (a bare `push` drops the newest) so the freshest
                 // confirmed deliveries survive overflow (F13).
-                if self.events.is_full() {
-                    let _ = self.events.remove(0);
-                }
-                let _ = self.events.push(NodeEvent::Delivered {
+                self.push_event(NodeEvent::Delivered {
                     peer: from,
                     id: *id,
                 });
@@ -2981,6 +3026,7 @@ mod tests {
         let b_id = b.id();
         store.insert(b, 0).unwrap();
         deliver_to(&mut ex, &mut store, 1, b_id);
+        let _ = ex.drain_events(); // clear the contact event
         assert!(!store.is_released(&b_id));
 
         let ids = heapless::Vec::from_slice(&[b_id]).unwrap();
@@ -3126,6 +3172,7 @@ mod tests {
         store.insert(b, 0).unwrap();
         // Dispatch the broadcast to a different peer (addr 2), not addr 1.
         deliver_to(&mut ex, &mut store, 2, b_id);
+        let _ = ex.drain_events(); // clear the contact event
 
         // Peer 1 (addr 1) claims to hold b_id though it never did.
         let ids = heapless::Vec::from_slice(&[b_id]).unwrap();
@@ -3154,6 +3201,7 @@ mod tests {
         store.insert(b, 0).unwrap();
         deliver_to(&mut ex, &mut store, 1, a_id);
         deliver_to(&mut ex, &mut store, 1, b_id);
+        let _ = ex.drain_events(); // clear the contact event
 
         let ack_for = |ids: heapless::Vec<ObservationId, { consts::ACK_IDS_CAP }>| Frame::Ack {
             from: peer,
@@ -3195,6 +3243,7 @@ mod tests {
         let b_id = b.id();
         store.insert(b, 0).unwrap();
         deliver_to(&mut ex, &mut store, 1, b_id);
+        let _ = ex.drain_events(); // clear the contact event
 
         let ids = heapless::Vec::from_slice(&[b_id]).unwrap();
         let ack = Frame::Ack { from: peer, ids };
@@ -3357,6 +3406,7 @@ mod tests {
             match ev {
                 NodeEvent::Delivered { .. } => delivered += 1,
                 NodeEvent::Dropped { .. } => dropped += 1,
+                NodeEvent::Contact { .. } | NodeEvent::Lost { .. } => {}
             }
         }
         assert_eq!(
@@ -3365,6 +3415,105 @@ mod tests {
             "every queued delivery survives a full queue"
         );
         assert_eq!(dropped, 1, "the counted drop is reported alongside them");
+    }
+
+    /// A first `Contact` for an addr emits one [`NodeEvent::Contact`] naming
+    /// it; a repeat `Contact` for a known peer restarts the contact silently.
+    #[test]
+    fn contact_for_new_peer_emits_event() {
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        ex.on_event(Event::Contact(1), &mut store, 0);
+
+        let events = ex.drain_events();
+        assert_eq!(events.len(), 1, "a new contact emits one event");
+        assert_eq!(events[0], NodeEvent::Contact { addr: 1 });
+
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        assert!(
+            ex.drain_events().is_empty(),
+            "a repeat contact for a known peer emits nothing"
+        );
+    }
+
+    /// `Lost` for a peer we were tracking emits [`NodeEvent::Lost`]; `Lost`
+    /// for an unknown addr emits nothing.
+    #[test]
+    fn lost_for_known_peer_emits_event() {
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        let _ = ex.drain_events(); // clear the contact event
+
+        ex.on_event(Event::Lost(1), &mut store, 0);
+        let events = ex.drain_events();
+        assert_eq!(events.len(), 1, "losing a known peer emits one event");
+        assert_eq!(events[0], NodeEvent::Lost { addr: 1 });
+
+        ex.on_event(Event::Lost(2), &mut store, 0);
+        assert!(
+            ex.drain_events().is_empty(),
+            "losing an unknown peer emits nothing"
+        );
+    }
+
+    /// F8 idle eviction removes the peer but is not a transport contact
+    /// event: it must stay silent in the event feed.
+    #[test]
+    fn idle_eviction_emits_nothing() {
+        let mut ex = Exchange::new(ME);
+        let mut store = MemStore::new();
+        ex.on_event(Event::Contact(1), &mut store, 0);
+        let _ = ex.drain_events();
+
+        let mut buf = [0u8; consts::MAX_FRAME];
+        let _ = ex.next_frame(
+            &store,
+            consts::MAX_FRAME,
+            consts::PEER_IDLE_MS + 1,
+            &mut buf,
+        );
+        assert!(
+            ex.drain_events().is_empty(),
+            "idle eviction is not a contact event"
+        );
+    }
+
+    /// A full event queue evicts the OLDEST event for an incoming contact
+    /// (F13): contact telemetry is best-effort, queued deliveries survive.
+    #[test]
+    fn contact_event_rides_the_drop_oldest_queue() {
+        let mut store = MemStore::new();
+        let mut ex = Exchange::<u8>::new(ME);
+        for seq in 0..consts::EVENT_QUEUE_CAP as u64 {
+            ex.events
+                .push(NodeEvent::Delivered {
+                    peer: [7; 16],
+                    id: [seq as u8; 16],
+                })
+                .unwrap();
+        }
+
+        ex.on_event(Event::Contact(1), &mut store, 0);
+
+        let drained = ex.drain_events();
+        assert_eq!(
+            drained.len(),
+            consts::EVENT_QUEUE_CAP,
+            "the queue stays at capacity"
+        );
+        let first = match &drained[0] {
+            NodeEvent::Delivered { id, .. } => *id,
+            other => panic!("expected the first event to be a Delivered, got {other:?}"),
+        };
+        assert_eq!(
+            first, [1u8; 16],
+            "the oldest Delivered (seq 0) was evicted for the contact"
+        );
+        match drained.last().unwrap() {
+            NodeEvent::Contact { addr } => assert_eq!(*addr, 1),
+            other => panic!("expected the newest event to be the Contact, got {other:?}"),
+        }
     }
 
     /// Once the drop-counter table is full, the next drop folds into a single
@@ -3392,7 +3541,9 @@ mod tests {
             match ev {
                 NodeEvent::Dropped { addr: Some(..), .. } => reported += 1,
                 NodeEvent::Dropped { addr: None, .. } => overflow += 1,
-                NodeEvent::Delivered { .. } => {}
+                NodeEvent::Delivered { .. }
+                | NodeEvent::Contact { .. }
+                | NodeEvent::Lost { .. } => {}
             }
         }
         assert_eq!(
@@ -3466,6 +3617,7 @@ mod tests {
         let mut ex = Exchange::new(ME);
         let mut store = MemStore::new();
         ex.on_event(Event::Contact(1), &mut store, 0);
+        let _ = ex.drain_events(); // clear the contact event
         ex.on_event(Event::Frame(1, hello(a, 1)), &mut store, 0);
         assert_eq!(ex.peers()[0].id, Some(a));
 
@@ -3552,6 +3704,7 @@ mod tests {
         let b_id = b.id();
         store.insert(b, 0).unwrap();
         deliver_to(&mut ex, &mut store, 1, b_id);
+        let _ = ex.drain_events(); // clear the contact event
 
         let ack = Frame::Ack {
             from: peer,
