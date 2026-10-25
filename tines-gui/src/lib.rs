@@ -11,4 +11,5 @@ pub mod config;
 pub mod docker;
 pub mod fleet;
 pub mod ipc_client;
+pub mod launcher;
 pub mod theme;

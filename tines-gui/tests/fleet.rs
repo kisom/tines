@@ -1,47 +1,15 @@
 //! Fleet layout and node-config tests. The bus daemon is a fake `tines-busd`
-//! seeded onto PATH (the real binary isn't on PATH for unit tests): it
-//! records its argv and creates the socket file, so the fleet's spawn
-//! protocol is what's under test — the real daemon is covered by tines-bus's
-//! own suite and Task 4's e2e.
+//! seeded onto PATH (see `common`; the real binary isn't on PATH for unit
+//! tests): it creates the socket file named by argv[1], so the fleet's
+//! spawn protocol is what's under test — the real daemon is covered by
+//! tines-bus's own suite and Task 4's e2e.
+
+mod common;
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use tines_gui::fleet::{Fleet, Mode};
-
-/// One shared scratch setup for every test in this binary: a temp dir that
-/// becomes both XDG_STATE_HOME (fleet dirs) and a PATH dir holding the fake
-/// `tines-busd`. Env is process-global, so it is set exactly once before any
-/// test touches fleet_dir.
-fn setup() -> &'static PathBuf {
-    static DIR: OnceLock<PathBuf> = OnceLock::new();
-    DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("tines-gui-fleet-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // Fake tines-busd: touch the socket named by argv[1], then stay alive.
-        let fake = dir.join("tines-busd");
-        std::fs::write(&fake, "#!/bin/sh\ntouch \"$1\"\nsleep 60\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let path = format!(
-            "{}:{}",
-            dir.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-        // SAFETY: set once, before any fleet_dir call; this process is a
-        // test binary that exits afterwards, so nothing else observes it.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &dir);
-            std::env::set_var("PATH", path);
-        }
-        dir
-    })
-}
 
 fn fleet_name(tag: &str) -> String {
     format!(
@@ -52,7 +20,7 @@ fn fleet_name(tag: &str) -> String {
 
 #[test]
 fn fleet_dir_layout() {
-    setup();
+    common::env_with_fake_busd();
     let fleet = Fleet::create(&fleet_name("layout")).expect("fleet creates");
     let dir = tines_gui::config::fleet_dir(&fleet_name("layout"));
     let meta = std::fs::metadata(&dir).expect("fleet dir exists");
@@ -75,7 +43,7 @@ fn fleet_dir_layout() {
 
 #[test]
 fn add_node_bus_config_mounts_data() {
-    setup();
+    common::env_with_fake_busd();
     let fleet_name = fleet_name("bus");
     let fleet = Fleet::create(&fleet_name).expect("fleet creates");
     let spec = fleet
@@ -95,7 +63,7 @@ fn add_node_bus_config_mounts_data() {
 
 #[test]
 fn add_node_bt_config_has_peer() {
-    setup();
+    common::env_with_fake_busd();
     let fleet_name = fleet_name("bt");
     let fleet = Fleet::create(&fleet_name).expect("fleet creates");
     let peer = "22".repeat(16);
@@ -114,7 +82,7 @@ fn add_node_bt_config_has_peer() {
 
 #[test]
 fn generated_id_roundtrips() {
-    setup();
+    common::env_with_fake_busd();
     let fleet_name = fleet_name("gen");
     let fleet = Fleet::create(&fleet_name).expect("fleet creates");
     let spec = fleet

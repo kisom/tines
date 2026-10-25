@@ -39,6 +39,26 @@ impl OmarchyTheme {
         }
     }
 
+    /// Apply the palette: egui visuals plus an opaque background fill so
+    /// the window is never transparent on Wayland. Call every frame.
+    pub fn apply(&self, ctx: &egui::Context) {
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = self.background;
+        visuals.window_fill = self.background;
+        visuals.window_stroke = egui::Stroke::NONE;
+        visuals.override_text_color = Some(self.foreground);
+        visuals.selection.bg_fill = self.accent;
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, self.accent);
+        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, self.accent);
+        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, self.accent);
+        ctx.set_visuals(visuals);
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Background,
+            egui::Id::new("tines-gui-bg"),
+        ));
+        painter.rect_filled(ctx.content_rect(), 0.0, self.background);
+    }
+
     /// Watch the omarchy `current` theme dir (recursively) and call
     /// `on_change` whenever it changes — the caller repaints from there.
     /// Returns an error only if the watcher cannot be installed.
