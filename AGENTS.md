@@ -67,6 +67,11 @@ call `poll()` in its loop, and `observe()` when it sees something.
 - `tines-core` is `#![no_std]`; `alloc` is a cargo feature (default on). With
   `--no-default-features` it must build for `thumbv7em-none-eabihf`. Only
   `MemStore` may require `alloc`.
+- Decision C (fleet console, approved 2026-10-24): the only sanctioned core
+  change — the additive `NodeEvent::Contact` / `NodeEvent::Lost` variants,
+  so hosts can see peers come and go. `Contact` fires only for a newly
+  added peer; idle eviction stays silent. Everything else in core stays
+  frozen for 1.0.
 - No async, no threads, no I/O, and no panic on untrusted input in core. Every
   frame from the wire is untrusted: malformed bytes are dropped, never
   unwrapped.
@@ -146,8 +151,14 @@ tines/
   tines-store/  std: LogStore, the persistent append-only backend
   tines-bt/     std: BLE transport over BlueZ (bluer)
   tines/        std: standalone service, Unix-socket JSON IPC
+  tines-bus/    std: host bus transport — hub-and-spoke Unix-socket daemon
+                (`tines-busd`) for simulated fleets
   tines-ros2/   std: ROS2 node; rclrs behind the `ros2` feature
 ```
+
+`tines-gui/` sits outside the workspace (like `fuzz/`): a standalone crate
+with its own manifest and lockfile — the desktop fleet console. It's gated
+by `scripts/ci.sh` separately from the workspace crates.
 
 Only `tines-core` is headed for 1.0; the host crates stay 0.x (1.0 spec, D4).
 They're std-only and may use threads and I/O, but they're still the trust
