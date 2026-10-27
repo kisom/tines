@@ -14,6 +14,8 @@ protocol that runs over whatever datagram link the robot has. The name is from
 Vinge's *A Fire Upon the Deep*: the Tines only form a mind when close enough to
 hear each other.
 
+![1page](docs/images/tines-systems-data.png)
+
 ## Contents
 
 - [Design at a glance](#design-at-a-glance)
